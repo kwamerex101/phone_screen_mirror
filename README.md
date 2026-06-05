@@ -23,7 +23,6 @@ orientation**, and tap/drag coordinates adapt automatically — verified in both
 portrait and landscape.
 
 <p align="center"><img src="assets/device-portrait.png" alt="iMirror — portrait" height="460"></p>
-<p align="center"><img src="assets/device-landscape.png" alt="iMirror — landscape" width="680"></p>
 
 ## Requirements
 
