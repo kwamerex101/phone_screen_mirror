@@ -8,6 +8,7 @@ guard — in isolation.
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 
 import pytest
@@ -197,3 +198,88 @@ def test_wait_for_polls_then_succeeds(mod, monkeypatch):
     monkeypatch.setattr(m.time, "sleep", lambda *_: None)
     out = m.ios_wait_for("Later", timeout_s=10)
     assert "3 check(s)" in out
+
+
+# ---- run recording & report ----------------------------------------------------
+
+def test_recording_off_by_default(mod, wda):
+    """Actions outside a run leave no trace and write nothing."""
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_tap(1, 2)
+    assert mod._run["active"] is False
+    assert mod._run["steps"] == []
+
+
+def test_run_note_requires_active_run(mod):
+    with pytest.raises(RuntimeError, match="No active run"):
+        mod.ios_run_note("hi")
+
+
+def test_finish_requires_active_run(mod):
+    with pytest.raises(RuntimeError, match="No active run"):
+        mod.ios_finish_run()
+
+
+def test_run_note_validates_status(mod, wda, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}))
+    mod.ios_start_run("x")
+    with pytest.raises(RuntimeError, match="info / pass / fail"):
+        mod.ios_run_note("bad", status="maybe")
+
+
+def test_full_run_records_and_renders_report(mod, wda, monkeypatch, tmp_path):
+    import base64
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    png = b"\x89PNG\r\n\x1a\nfakebytes"
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/status", (200, {"value": {
+        "device": "iPhone 15", "os": {"version": "17.4"}}}))
+    wda.script("/screenshot", (200, {"value": base64.b64encode(png).decode()}))
+
+    out = mod.ios_start_run("login flow")
+    assert "recording run" in out
+    assert mod._run["active"] is True
+
+    mod.ios_tap(10, 20)
+    mod.ios_screenshot()           # saved to the run dir + recorded
+    mod.ios_run_note("logged in", status="pass")
+    report = mod.ios_finish_run()
+
+    # run stopped, report exists, png persisted
+    assert mod._run["active"] is False
+    assert report.endswith("report.html")
+    run_dir = mod._run["dir"]
+    assert os.path.exists(os.path.join(run_dir, "001.png")) or \
+           os.path.exists(os.path.join(run_dir, "002.png"))
+
+    htmltext = open(report, encoding="utf-8").read()
+    assert "login flow" in htmltext
+    assert "iPhone 15" in htmltext and "17.4" in htmltext
+    assert "logged in" in htmltext
+    assert base64.b64encode(png).decode() in htmltext   # screenshot embedded
+    assert "PASS" in htmltext
+
+
+def test_failed_note_marks_report_fail(mod, wda, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}))
+    mod.ios_start_run("broken")
+    mod.ios_run_note("button missing", status="fail")
+    report = mod.ios_finish_run()
+    htmltext = open(report, encoding="utf-8").read()
+    assert "1 failures" in htmltext
+    assert ">FAIL<" in htmltext
+
+
+def test_start_run_survives_status_failure(mod, monkeypatch, tmp_path):
+    """A flaky /status during start must not abort recording."""
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+
+    def boom(method, path, body=None):
+        raise RuntimeError("status down")
+
+    monkeypatch.setattr(mod, "_req", boom)
+    mod.ios_start_run("resilient")
+    assert mod._run["active"] is True
+    assert mod._run["device"] is None
