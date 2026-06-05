@@ -2,3 +2,6 @@
 build/
 *.mp4
 tools/
+
+# python venv
+.venv/

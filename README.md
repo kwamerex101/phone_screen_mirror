@@ -131,6 +131,14 @@ Supply-chain risk is treated as a first-class constraint:
 - WebDriverAgent has no auth on the wire, so it is reached over **loopback only**;
   the go-ios host identity (`selfIdentity.plist`) is gitignored.
 
+## MCP server (drive the phone from Claude)
+
+[`mcp-server/`](mcp-server/) is an MCP server that lets an MCP client (e.g. Claude)
+control the device directly — screenshot, tap, swipe, type, hardware buttons,
+find-and-tap by text, accessibility source. Handy for testing flows on a real
+device without clicking the Mac UI. It talks to the same loopback WDA the app
+brings up (run the app + green dot first). See [mcp-server/README.md](mcp-server/README.md).
+
 ## Packaging / distribution
 
 ```bash
