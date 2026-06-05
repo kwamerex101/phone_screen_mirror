@@ -5,13 +5,23 @@ let package = Package(
     name: "iMirror",
     platforms: [.macOS(.v14)],
     targets: [
+        // Pure, framework-light logic (geometry + WDA response parsing) so it can
+        // be unit-tested without AppKit/AVFoundation.
+        .target(
+            name: "iMirrorCore",
+            path: "Sources/iMirrorCore",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
         .executableTarget(
             name: "iMirror",
+            dependencies: ["iMirrorCore"],
             path: "Sources/iMirror",
-            // Swift 5 language mode: avoids Swift 6 strict-concurrency churn for the MVP.
-            // No third-party dependencies — Apple system frameworks only (AVFoundation,
-            // CoreMediaIO, AppKit). Nothing to vendor or scan.
             swiftSettings: [.swiftLanguageMode(.v5)]
-        )
+        ),
+        .testTarget(
+            name: "iMirrorCoreTests",
+            dependencies: ["iMirrorCore"],
+            path: "Tests/iMirrorCoreTests"
+        ),
     ]
 )

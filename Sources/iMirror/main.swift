@@ -14,6 +14,7 @@ import AppKit
 import AVFoundation
 import CoreImage
 import CoreMediaIO
+import iMirrorCore
 
 // MARK: - Enable CoreMediaIO screen-capture (DAL) devices
 
@@ -512,7 +513,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         }
         previewView.onDrag = { [weak self] viewPath in
             guard let self, self.controlEnabled else { return }
-            let devicePath = self.downsample(viewPath, max: 24)
+            let devicePath = downsample(viewPath, max: 24)
                 .compactMap { self.devicePoint(fromViewPoint: $0) }
             guard devicePath.count >= 2 else { return }
             self.wda?.drag(path: devicePath)
@@ -523,29 +524,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         }
     }
 
-    /// Evenly thin a path to at most `max` points (keeps first + last) so a long
-    /// drag doesn't produce an oversized WDA action payload.
-    private func downsample(_ points: [CGPoint], max: Int) -> [CGPoint] {
-        guard points.count > max, max >= 2 else { return points }
-        let stride = Double(points.count - 1) / Double(max - 1)
-        var out: [CGPoint] = []
-        for i in 0..<max { out.append(points[Int((Double(i) * stride).rounded())]) }
-        return out
-    }
-
-    /// Map a click in the preview (view coords, y-up) to a device point in WDA
-    /// logical points (y-down). Uses the preview layer's own rect conversion so
-    /// letterboxing and orientation are handled by AVFoundation.
+    /// Map a click in the preview to a device point. The preview layer's own rect
+    /// conversion handles letterboxing + orientation; mapToDevice (in iMirrorCore)
+    /// does the normalize + y-flip and is unit-tested.
     private func devicePoint(fromViewPoint p: CGPoint) -> CGPoint? {
         guard let size = wda?.deviceSize else { return nil }
         let videoRect = previewView.previewLayer.layerRectConverted(
             fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
-        guard videoRect.width > 1, videoRect.height > 1 else { return nil }
-        let nx = (p.x - videoRect.minX) / videoRect.width
-        let nyUp = (p.y - videoRect.minY) / videoRect.height
-        guard nx >= 0, nx <= 1, nyUp >= 0, nyUp <= 1 else { return nil }   // outside video
-        let ny = 1 - nyUp   // view is y-up, device is y-down
-        return CGPoint(x: nx * size.width, y: ny * size.height)
+        return mapToDevice(viewPoint: p, videoRect: videoRect, deviceSize: size)
     }
 
     // MARK: WDA health monitor (auto-connect + auto-reconnect)

@@ -16,6 +16,7 @@
 // cleanly (a shared/pooled socket yields NSURLErrorNetworkConnectionLost).
 
 import Foundation
+import iMirrorCore
 
 final class WDAClient {
     /// Result of a health probe.
@@ -44,8 +45,7 @@ final class WDAClient {
         send("POST", "/session", body) { [weak self] _, json, error in
             guard let self else { return }
             if let error { completion(.failure(error)); return }
-            let value = (json?["value"] as? [String: Any]) ?? json ?? [:]
-            guard let sid = (value["sessionId"] as? String) ?? (json?["sessionId"] as? String) else {
+            guard let sid = WDAParse.sessionId(json) else {
                 completion(.failure(WDAError.badResponse("no sessionId")))
                 return
             }
@@ -58,13 +58,10 @@ final class WDAClient {
         guard let sid = sessionId else { completion(.failure(WDAError.notConnected)); return }
         send("GET", "/session/\(sid)/window/size", nil) { [weak self] _, json, error in
             if let error { completion(.failure(error)); return }
-            let v = (json?["value"] as? [String: Any]) ?? json ?? [:]
-            guard let w = (v["width"] as? NSNumber)?.doubleValue,
-                  let h = (v["height"] as? NSNumber)?.doubleValue else {
+            guard let size = WDAParse.windowSize(json) else {
                 completion(.failure(WDAError.badResponse("no window size")))
                 return
             }
-            let size = CGSize(width: w, height: h)
             self?.deviceSize = size
             completion(.success(size))
         }
@@ -80,10 +77,8 @@ final class WDAClient {
             send("GET", "/session/\(sid)/window/size", nil) { [weak self] code, json, error in
                 guard let self else { return }
                 if error == nil, let code, (200..<300).contains(code),
-                   let v = (json?["value"] as? [String: Any]),
-                   let w = (v["width"] as? NSNumber)?.doubleValue,
-                   let h = (v["height"] as? NSNumber)?.doubleValue {
-                    self.deviceSize = CGSize(width: w, height: h)
+                   let size = WDAParse.windowSize(json) {
+                    self.deviceSize = size
                     completion(.alive)
                 } else {
                     self.sessionId = nil                       // session gone
@@ -97,9 +92,7 @@ final class WDAClient {
 
     private func statusReady(_ completion: @escaping (Bool) -> Void) {
         send("GET", "/status", nil) { _, json, error in
-            if error != nil { completion(false); return }
-            let v = json?["value"] as? [String: Any]
-            completion((v?["ready"] as? Bool) ?? false)
+            completion(error == nil && WDAParse.ready(json))
         }
     }
 

@@ -82,15 +82,15 @@ final class ManagedProcess {
         // go-ios writes selfIdentity.plist + pair records into its cwd; the app's
         // default cwd is "/" (read-only), so point it at a writable dir.
         p.currentDirectoryURL = workDir
-        // Capture child output to /tmp for diagnostics (append across respawns).
-        let logPath = "/tmp/imirror-\(label).log"
-        if !FileManager.default.fileExists(atPath: logPath) {
-            FileManager.default.createFile(atPath: logPath, contents: nil)
-        }
-        if let fh = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-            fh.seekToEndOfFile()
-            p.standardOutput = fh
-            p.standardError = fh
+        // Child output is discarded by default. Set IMIRROR_DEBUG=1 to capture it
+        // to <workDir>/<label>.log (truncated per spawn, so it stays bounded).
+        if ProcessInfo.processInfo.environment["IMIRROR_DEBUG"] != nil {
+            let logURL = workDir.appendingPathComponent("\(label).log")
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
+            if let fh = try? FileHandle(forWritingTo: logURL) {
+                p.standardOutput = fh
+                p.standardError = fh
+            }
         } else {
             p.standardOutput = FileHandle.nullDevice
             p.standardError = FileHandle.nullDevice
