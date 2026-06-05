@@ -62,7 +62,8 @@ def _record(action: str, detail: str = "", screenshot: str | None = None,
 
 # ---- HTTP helpers (fresh connection per request) -------------------------------
 
-def _req(method: str, path: str, body: dict | None = None) -> tuple[int, dict[str, Any]]:
+def _req(method: str, path: str, body: dict | None = None,
+         timeout: float = 15) -> tuple[int, dict[str, Any]]:
     data = json.dumps(body).encode() if body is not None else None
     # WDA's CocoaHTTPServer occasionally drops a connection mid-exchange
     # (RemoteDisconnected / reset). Retry such transient failures a couple times.
@@ -72,7 +73,7 @@ def _req(method: str, path: str, body: dict | None = None) -> tuple[int, dict[st
             WDA + path, data=data, method=method,
             headers={"Content-Type": "application/json", "Connection": "close"})
         try:
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 raw = r.read()
                 return r.status, (json.loads(raw) if raw else {})
         except urllib.error.HTTPError as e:
@@ -214,8 +215,10 @@ def ios_source() -> str:
     for asserting that expected UI is present. The output can be large; prefer a
     screenshot for a quick look and use this when you need exact element text.
     """
-    # /source is a sessionless WDA route.
-    code, j = _req("GET", "/source")
+    # /source is a sessionless WDA route. On a complex screen WDA can take far
+    # longer than a tap to serialise the whole tree (seen >15s, ~160 KB on a
+    # real device), so give it a generous timeout.
+    code, j = _req("GET", "/source", timeout=60)
     if code >= 400:
         raise RuntimeError(f"WDA error (HTTP {code}) on /source: {j}")
     src = j.get("value", "")
