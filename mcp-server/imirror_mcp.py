@@ -114,6 +114,23 @@ def _pointer(steps: list[dict]) -> dict:
                          "parameters": {"pointerType": "touch"}, "actions": steps}]}
 
 
+def _find_element(text: str, _retry: bool = True) -> str | None:
+    """Return the element id of the first element whose label/name/value matches
+    `text`, or None if no such element is on screen. Recreates the session once
+    on a stale 404.
+    """
+    sid = _ensure_session()
+    safe = text.replace("'", "\\'")
+    predicate = f"label == '{safe}' OR name == '{safe}' OR value == '{safe}'"
+    code, j = _req("POST", f"/session/{sid}/element",
+                   {"using": "predicate string", "value": predicate})
+    if code == 404 and _retry:
+        _session["id"] = None
+        return _find_element(text, _retry=False)
+    return (j.get("value") or {}).get("ELEMENT") or \
+           (j.get("value") or {}).get("element-6066-11e4-a52e-4f735466cecf")
+
+
 # ---- Read-only tools -----------------------------------------------------------
 
 @mcp.tool()
@@ -248,20 +265,32 @@ def ios_find_and_tap(text: str) -> str:
     titled "Settings"). Fails with a clear message if no matching element is
     found — fall back to ios_source to inspect, or ios_tap with coordinates.
     """
-    sid = _ensure_session()
-    safe = text.replace("'", "\\'")
-    predicate = f"label == '{safe}' OR name == '{safe}' OR value == '{safe}'"
-    code, j = _req("POST", f"/session/{sid}/element",
-                   {"using": "predicate string", "value": predicate})
-    if code == 404:
-        _session["id"] = None
-        return ios_find_and_tap(text)
-    eid = (j.get("value") or {}).get("ELEMENT") or \
-          (j.get("value") or {}).get("element-6066-11e4-a52e-4f735466cecf")
+    eid = _find_element(text)
     if not eid:
         raise RuntimeError(f"No element matching '{text}'. Use ios_source to inspect.")
+    sid = _ensure_session()
     _req("POST", f"/session/{sid}/element/{eid}/click", {})
     return f"tapped element '{text}'"
+
+
+@mcp.tool()
+def ios_wait_for(text: str, timeout_s: float = 10.0) -> str:
+    """Wait until an element with the given visible label/name/value appears.
+
+    Polls the screen until a matching element is present or `timeout_s` elapses.
+    Use after an action that triggers a transition (navigation, a network load) so
+    later taps don't race the UI. Raises if the element never appears in time.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    attempts = 0
+    while True:
+        attempts += 1
+        if _find_element(text):
+            return f"found '{text}' after {attempts} check(s)"
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"'{text}' did not appear within {timeout_s}s. Use ios_source to inspect.")
+        time.sleep(0.5)
 
 
 if __name__ == "__main__":

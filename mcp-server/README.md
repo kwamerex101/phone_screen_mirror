@@ -22,6 +22,7 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 | `ios_type(text)` | type into the focused field (`\n`=return, `\b`=backspace) |
 | `ios_press_button(name)` | `home` / `volumeUp` / `volumeDown` |
 | `ios_find_and_tap(text)` | find an element by visible label/name and tap it |
+| `ios_wait_for(text, timeout_s)` | poll until an element with that label/name appears |
 | `ios_source` | accessibility hierarchy (XML) of the current screen |
 
 ## Setup
@@ -56,6 +57,15 @@ wait for the green dot, and the tools are live.
 
 Override the target (default `http://127.0.0.1:8100`) with `IMIRROR_WDA` — it must
 stay on loopback.
+
+## Tests
+
+The unit tests stub the HTTP layer, so no device or WebDriverAgent is needed:
+
+```bash
+mcp-server/.venv/bin/pip install pytest
+mcp-server/.venv/bin/python -m pytest mcp-server/test_imirror_mcp.py
+```
 
 ## Security
 
