@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- iMirror is NOT sandboxed (it spawns go-ios + binds a loopback relay). -->
+    <!-- Camera device access is required to receive the iPhone's screen via the -->
+    <!-- CoreMediaIO capture device. -->
+    <key>com.apple.security.device.camera</key>
+    <true/>
+    <!-- Allow spawning the bundled go-ios helper under hardened runtime. -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <false/>
+</dict>
+</plist>
