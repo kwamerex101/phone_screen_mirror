@@ -4,7 +4,8 @@ Mirror a USB-connected iPhone to a macOS window **and control it from the Mac** 
 while the phone stays physically usable (unlike Apple's "iPhone Mirroring", which
 locks the device).
 
-- **Video** — live mirror, record to mp4, full-resolution PNG screenshots.
+- **Video + audio** — live mirror, optional phone-audio playback (muted by
+  default), record to mp4, full-resolution PNG screenshots.
 - **Control** — tap, drag/scroll, type, Home, driven from the preview.
 - **Self-managed** — launch the app and it brings the control channel up itself
   (no Xcode, no sudo, no terminal). A toolbar health dot + auto-reconnect.
@@ -146,8 +147,9 @@ with the App Sandbox; distribute the notarized DMG directly.
 
 ## Status / limitations
 
-- **Working:** video mirror, record, screenshot, and control (tap, drag/scroll,
-  type incl. backspace/return/tab, Home).
+- **Working:** video mirror, audio playback (Sound toggle — muted by default to
+  avoid echo with the phone's own speaker), record, screenshot, and control (tap,
+  drag/scroll, type incl. backspace/return/tab, Home).
 - **macOS only** by design. Cross-platform would mean the libusb /
   `quicktime_video_hack` path — a different architecture.
 - **Latency:** video ~60–150 ms (USB capture); control adds a WDA round-trip

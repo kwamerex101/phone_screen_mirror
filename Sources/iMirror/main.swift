@@ -125,6 +125,7 @@ private extension NSToolbarItem.Identifier {
     static let device     = NSToolbarItem.Identifier("device")
     static let record     = NSToolbarItem.Identifier("record")
     static let screenshot = NSToolbarItem.Identifier("screenshot")
+    static let audio      = NSToolbarItem.Identifier("audio")
     static let health     = NSToolbarItem.Identifier("health")
     static let control    = NSToolbarItem.Identifier("control")
     static let home       = NSToolbarItem.Identifier("home")
@@ -144,12 +145,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private let healthButton = NSButton()
     private var recordItem: NSToolbarItem!
     private var screenshotItem: NSToolbarItem!
+    private var audioItem: NSToolbarItem!
     private var controlItem: NSToolbarItem!
     private var homeItem: NSToolbarItem!
 
     private let session = AVCaptureSession()
     private let movieOutput = AVCaptureMovieFileOutput()
     private let videoDataOutput = AVCaptureVideoDataOutput()
+    private let audioPreview = AVCaptureAudioPreviewOutput()
+    private var audioOn = false                 // muted by default (avoid echo with the phone)
     private let frameGrabber = FrameGrabber()
     private let ciContext = CIContext()
     private var currentInput: AVCaptureDeviceInput?
@@ -293,11 +297,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     // MARK: NSToolbarDelegate
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.device, .record, .screenshot, .flexibleSpace, .health, .control, .home]
+        [.device, .record, .screenshot, .audio, .flexibleSpace, .health, .control, .home]
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.device, .record, .screenshot, .health, .control, .home, .flexibleSpace, .space]
+        [.device, .record, .screenshot, .audio, .health, .control, .home, .flexibleSpace, .space]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier,
@@ -318,6 +322,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             screenshotItem = actionItem(.screenshot, "Screenshot", "camera.viewfinder",
                                         #selector(takeScreenshot), enabled: false)
             return screenshotItem
+
+        case .audio:
+            audioItem = actionItem(.audio, "Sound", "speaker.slash.fill",
+                                   #selector(toggleAudio), enabled: false)
+            return audioItem
 
         case .health:
             let item = NSToolbarItem(itemIdentifier: .health)
@@ -367,6 +376,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         videoDataOutput.alwaysDiscardsLateVideoFrames = true
         videoDataOutput.setSampleBufferDelegate(frameGrabber, queue: frameGrabber.queue)
         if session.canAddOutput(videoDataOutput) { session.addOutput(videoDataOutput) }
+        audioPreview.volume = 0   // muted until the user enables sound
+        if session.canAddOutput(audioPreview) { session.addOutput(audioPreview) }
         session.commitConfiguration()
         refreshDevices()
         if !session.isRunning {
@@ -403,6 +414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             devicePopUp.isEnabled = false
             recordItem?.isEnabled = false
             screenshotItem?.isEnabled = false
+            audioItem?.isEnabled = false
             switchToDevice(nil)
             return
         }
@@ -438,6 +450,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
                     setStatus("Mirroring \(device.localizedName) — phone stays usable.")
                     recordItem?.isEnabled = true
                     screenshotItem?.isEnabled = true
+                    audioItem?.isEnabled = true
                 } else {
                     setStatus("Cannot add \(device.localizedName) to session.")
                 }
@@ -502,6 +515,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         } catch {
             setStatus("Screenshot save failed: \(error.localizedDescription)")
         }
+    }
+
+    // MARK: Audio
+
+    @objc private func toggleAudio() {
+        audioOn.toggle()
+        audioPreview.volume = audioOn ? 1 : 0
+        audioItem?.image = symbol(audioOn ? "speaker.wave.2.fill" : "speaker.slash.fill",
+                                  audioOn ? "Sound on" : "Sound off")
+        setStatus(audioOn
+            ? "Sound on — phone audio plays through this Mac."
+            : "Sound muted.")
     }
 
     // MARK: Control (WDA)
