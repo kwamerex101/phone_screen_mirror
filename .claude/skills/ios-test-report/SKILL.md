@@ -35,8 +35,9 @@ not ready, tell the user to start the app rather than retrying blindly.
    with the `IMIRROR_RUNS_DIR` env var).
 
 3. **Drive the flow.** Use the normal tools — `ios_tap`, `ios_swipe`, `ios_type`,
-   `ios_find_and_tap`, `ios_press_button`, `ios_wait_for`. Each is logged
-   automatically while the run is active.
+   `ios_find_and_tap`, `ios_press_button`, `ios_wait_for`, `ios_orientation`. Each
+   is logged automatically while the run is active. After `ios_orientation` flips
+   the device, call `ios_window_size` again before computing tap coordinates.
    - **Screenshot at every meaningful state change** (`ios_screenshot`): after a
      navigation, before/after a submit, on the final screen. These are the report.
    - Use `ios_wait_for(text)` after transitions so screenshots aren't taken mid-load.
@@ -52,7 +53,10 @@ not ready, tell the user to start the app rather than retrying blindly.
    Take a screenshot **before** a `fail` note so the report shows the bad state.
 
 5. **Finish.** Call `ios_finish_run()`. It writes `report.html` to the run
-   directory and returns the path. Recording stops.
+   directory, stitches the screenshots into a looping `timelapse.gif` at the top
+   of the report (pass `video="mp4"` for a video tag, or `video="none"` to skip),
+   and returns the path. Recording stops. The timelapse needs `ffmpeg` and ≥2
+   screenshots; if it's skipped the report still renders.
 
 6. **Report back.** Give the user the returned path as a clickable link and a
    one-line verdict (PASS/FAIL + step/screenshot counts). Don't paste the HTML.
