@@ -23,10 +23,11 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 | `ios_press_button(name)` | `home` / `volumeUp` / `volumeDown` |
 | `ios_find_and_tap(text)` | find an element by visible label/name and tap it |
 | `ios_wait_for(text, timeout_s)` | poll until an element with that label/name appears |
+| `ios_orientation(set_to)` | get orientation, or set `PORTRAIT` / `LANDSCAPE` |
 | `ios_source` | accessibility hierarchy (XML) of the current screen |
 | `ios_start_run(label)` | begin recording a test run (opt-in) |
 | `ios_run_note(text, status)` | add a checkpoint — `info` / `pass` / `fail` |
-| `ios_finish_run()` | write a self-contained HTML report and stop recording |
+| `ios_finish_run(video)` | write the HTML report (+ `gif`/`mp4` timelapse) and stop recording |
 
 ## Setup
 
@@ -73,7 +74,12 @@ unaffected.
    each `ios_screenshot` is saved to the run directory.
 3. `ios_run_note("home screen shown", status="pass")` — mark checkpoints
    (`info` / `pass` / `fail`; any `fail` flips the report verdict to FAIL).
-4. `ios_finish_run()` — writes `report.html` and returns its path.
+4. `ios_finish_run()` — writes `report.html` and returns its path. By default it
+   also stitches the run's screenshots into a looping `timelapse.gif` shown atop
+   the report (pass `video="mp4"` or `video="none"`). The timelapse needs `ffmpeg`
+   on `PATH` and ≥2 screenshots; otherwise the report is still written with a note
+   that it was skipped. Screenshots are embedded in the HTML; the timelapse is
+   saved beside it, so a video-bearing report is the whole run folder.
 
 Runs are stored under `~/.imirror/runs/<timestamp>-<label>/` (override the base
 with the `IMIRROR_RUNS_DIR` env var). The bundled **`ios-test-report` skill**

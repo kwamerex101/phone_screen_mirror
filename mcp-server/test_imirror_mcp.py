@@ -244,7 +244,7 @@ def test_full_run_records_and_renders_report(mod, wda, monkeypatch, tmp_path):
     mod.ios_tap(10, 20)
     mod.ios_screenshot()           # saved to the run dir + recorded
     mod.ios_run_note("logged in", status="pass")
-    report = mod.ios_finish_run()
+    report = mod.ios_finish_run(video="none")
 
     # run stopped, report exists, png persisted
     assert mod._run["active"] is False
@@ -266,7 +266,7 @@ def test_failed_note_marks_report_fail(mod, wda, monkeypatch, tmp_path):
     wda.script("/status", (200, {"value": {}}))
     mod.ios_start_run("broken")
     mod.ios_run_note("button missing", status="fail")
-    report = mod.ios_finish_run()
+    report = mod.ios_finish_run(video="none")
     htmltext = open(report, encoding="utf-8").read()
     assert "1 failures" in htmltext
     assert ">FAIL<" in htmltext
@@ -283,3 +283,108 @@ def test_start_run_survives_status_failure(mod, monkeypatch, tmp_path):
     mod.ios_start_run("resilient")
     assert mod._run["active"] is True
     assert mod._run["device"] is None
+
+
+# ---- orientation ---------------------------------------------------------------
+
+def test_orientation_get(mod, wda):
+    import json
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/orientation", (200, {"value": "PORTRAIT"}))
+    assert json.loads(mod.ios_orientation()) == {"orientation": "PORTRAIT"}
+
+
+def test_orientation_set_then_get(mod, wda):
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/orientation", (200, {"value": {}}), (200, {"value": "LANDSCAPE"}))
+    mod.ios_orientation("landscape")           # lowercase is normalized
+    posts = [b for m, p, b in wda.calls if m == "POST" and p.endswith("/orientation")]
+    assert posts == [{"orientation": "LANDSCAPE"}]
+
+
+def test_orientation_rejects_bad(mod, wda):
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    with pytest.raises(RuntimeError, match="set_to must be one of"):
+        mod.ios_orientation("sideways")
+
+
+# ---- timelapse -----------------------------------------------------------------
+
+def _start_with_two_shots(mod, wda, tmp_path, monkeypatch):
+    import base64
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    png = b"\x89PNG\r\n\x1a\nfake"
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/status", (200, {"value": {}}))
+    wda.script("/screenshot",
+               (200, {"value": base64.b64encode(png).decode()}),
+               (200, {"value": base64.b64encode(png).decode()}))
+    mod.ios_start_run("clip")
+    mod.ios_screenshot()
+    mod.ios_screenshot()
+
+
+def test_finish_invalid_video(mod, wda, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}))
+    mod.ios_start_run("x")
+    with pytest.raises(RuntimeError, match="video must be one of"):
+        mod.ios_finish_run(video="webm")
+
+
+def test_timelapse_embedded_when_ffmpeg_succeeds(mod, wda, monkeypatch, tmp_path):
+    _start_with_two_shots(mod, wda, tmp_path, monkeypatch)
+    run_dir = mod._run["dir"]
+
+    def fake_ffmpeg(args):                       # last arg is the output path
+        with open(args[-1], "wb") as f:
+            f.write(b"GIF89a-fake")
+    monkeypatch.setattr(mod, "_ffmpeg", fake_ffmpeg)
+
+    report = mod.ios_finish_run(video="gif")
+    htmltext = open(report, encoding="utf-8").read()
+    assert '<img class="clip" src="timelapse.gif"' in htmltext
+    assert os.path.exists(os.path.join(run_dir, "timelapse.gif"))
+    # scratch files cleaned up
+    assert not os.path.exists(os.path.join(run_dir, "_frames.txt"))
+    assert not os.path.exists(os.path.join(run_dir, "_palette.png"))
+
+
+def test_timelapse_mp4_uses_video_tag(mod, wda, monkeypatch, tmp_path):
+    _start_with_two_shots(mod, wda, tmp_path, monkeypatch)
+    monkeypatch.setattr(mod, "_ffmpeg",
+                        lambda args: open(args[-1], "wb").write(b"\x00mp4"))
+    report = mod.ios_finish_run(video="mp4")
+    assert '<video class="clip" src="timelapse.mp4"' in open(report).read()
+
+
+def test_timelapse_skipped_when_too_few_shots(mod, wda, monkeypatch, tmp_path):
+    import base64
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}))
+    wda.script("/screenshot",
+               (200, {"value": base64.b64encode(b"\x89PNGx").decode()}))
+    mod.ios_start_run("one")
+    mod.ios_screenshot()
+    report = mod.ios_finish_run(video="gif")
+    assert "fewer than 2 screenshots" in open(report).read()
+
+
+def test_timelapse_skipped_when_ffmpeg_missing(mod, wda, monkeypatch, tmp_path):
+    _start_with_two_shots(mod, wda, tmp_path, monkeypatch)
+    monkeypatch.setattr(mod.shutil, "which", lambda _: None)
+    report = mod.ios_finish_run(video="gif")
+    assert "ffmpeg not found" in open(report).read()
+
+
+def test_timelapse_handles_ffmpeg_failure(mod, wda, monkeypatch, tmp_path):
+    import subprocess
+    _start_with_two_shots(mod, wda, tmp_path, monkeypatch)
+
+    def boom(args):
+        raise subprocess.CalledProcessError(1, "ffmpeg")
+    monkeypatch.setattr(mod, "_ffmpeg", boom)
+
+    report = mod.ios_finish_run(video="gif")     # must not raise
+    assert "ffmpeg failed" in open(report).read()
+    assert mod._run["active"] is False

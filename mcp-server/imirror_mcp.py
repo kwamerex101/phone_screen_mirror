@@ -24,6 +24,8 @@ import http.client
 import json
 import os
 import re
+import shutil
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -325,6 +327,26 @@ def ios_wait_for(text: str, timeout_s: float = 10.0) -> str:
         time.sleep(0.5)
 
 
+@mcp.tool()
+def ios_orientation(set_to: str = "") -> str:
+    """Get the device orientation, or set it.
+
+    Call with no argument to read the current orientation. Pass `set_to` =
+    PORTRAIT or LANDSCAPE to rotate the device first. Returns the (resulting)
+    orientation as JSON. After rotating, screen dimensions swap — call
+    ios_window_size again before computing tap coordinates.
+    """
+    if set_to:
+        val = set_to.upper()
+        allowed = {"PORTRAIT", "LANDSCAPE"}
+        if val not in allowed:
+            raise RuntimeError(f"set_to must be one of {sorted(allowed)}")
+        _session_post("/orientation", {"orientation": val})
+        _record("orientation", f"set {val}")
+    j = _session_get("/orientation")
+    return json.dumps({"orientation": j.get("value")})
+
+
 # ---- Test-run recording & report -----------------------------------------------
 
 @mcp.tool()
@@ -375,23 +397,92 @@ def ios_run_note(text: str, status: str = "info") -> str:
 
 
 @mcp.tool()
-def ios_finish_run() -> str:
-    """Finish the active run and write a self-contained HTML report.
+def ios_finish_run(video: str = "gif") -> str:
+    """Finish the active run and write an HTML report.
 
     Renders the recorded timeline — actions, notes, and embedded screenshots — to
     report.html in the run directory and returns its path. Stops recording. Raises
     if no run is active.
+
+    `video` stitches the run's screenshots into a looping timelapse shown at the
+    top of the report: "gif" (default), "mp4", or "none". Needs ffmpeg on PATH and
+    at least two screenshots; if either is missing the report is still written, with
+    a note that the timelapse was skipped. The clip is saved beside report.html
+    (so a video-bearing report is a folder, not a single file); screenshots stay
+    embedded in the HTML regardless.
     """
     if not _run["active"]:
         raise RuntimeError("No active run. Call ios_start_run first.")
+    video = video.lower()
+    if video not in {"none", "gif", "mp4"}:
+        raise RuntimeError("video must be one of none / gif / mp4")
+    clip, clip_note = _make_timelapse(video)
     path = os.path.join(_run["dir"], "report.html")
     with open(path, "w", encoding="utf-8") as f:
-        f.write(_render_report(ended=time.time()))
+        f.write(_render_report(ended=time.time(), clip=clip, clip_note=clip_note))
     _run["active"] = False
     return path
 
 
-def _render_report(ended: float) -> str:
+def _make_timelapse(fmt: str) -> tuple[str | None, str]:
+    """Stitch the run's screenshots into a timelapse. Returns (filename, note);
+    filename is None when nothing was produced and note explains why."""
+    shots = [s["screenshot"] for s in _run["steps"] if s["screenshot"]]
+    if fmt == "none":
+        return None, ""
+    if len(shots) < 2:
+        return None, "timelapse skipped: fewer than 2 screenshots"
+    if not shutil.which("ffmpeg"):
+        return None, "timelapse skipped: ffmpeg not found on PATH"
+
+    run_dir = _run["dir"]
+    listfile = os.path.join(run_dir, "_frames.txt")
+    palette = os.path.join(run_dir, "_palette.png")
+    hold = 1.2                                    # seconds each frame is held
+
+    def _entry(name: str) -> str:                 # escape ' for concat syntax
+        return "file '%s'" % name.replace("'", "'\\''")
+
+    lines = []
+    for name in shots:
+        lines.append(_entry(name))
+        lines.append(f"duration {hold}")
+    lines.append(_entry(shots[-1]))               # concat needs the last file twice
+    with open(listfile, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    out = f"timelapse.{fmt}"
+    out_path = os.path.join(run_dir, out)
+    scale = "scale=480:-1:flags=lanczos"
+    # Entries are bare relative names (NNN.png), so concat's default safe mode
+    # accepts them — no -safe 0, which keeps path traversal out of the listfile.
+    concat = ["-f", "concat", "-i", listfile]
+    try:
+        if fmt == "gif":
+            _ffmpeg(concat + ["-vf", f"{scale},palettegen", palette])
+            _ffmpeg(concat + ["-i", palette,
+                              "-lavfi", f"{scale}[x];[x][1:v]paletteuse", out_path])
+        else:  # mp4 — force even dimensions for yuv420p
+            _ffmpeg(concat + ["-vsync", "vfr", "-pix_fmt", "yuv420p",
+                              "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", out_path])
+    except (subprocess.CalledProcessError, OSError) as e:
+        return None, f"timelapse skipped: ffmpeg failed ({e})"
+    finally:
+        for tmp in (listfile, palette):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    if os.path.exists(out_path):
+        return out, ""
+    return None, "timelapse skipped: ffmpeg produced no output"
+
+
+def _ffmpeg(args: list[str]) -> None:
+    subprocess.run(["ffmpeg", "-y", *args], check=True, capture_output=True)
+
+
+def _render_report(ended: float, clip: str | None = None, clip_note: str = "") -> str:
     steps = _run["steps"]
     started = _run["started"] or ended
     fails = sum(1 for s in steps if s["action"] == "note" and s["note"] == "fail")
@@ -433,9 +524,19 @@ def _render_report(ended: float) -> str:
         f"{len(steps)} steps · {shots} screenshots · {fails} failures",
     ]))
     body = "\n".join(blocks) or '<p class="detail">No steps were recorded.</p>'
+
+    clip_html = ""
+    if clip and clip.endswith(".mp4"):
+        clip_html = (f'<video class="clip" src="{html.escape(clip)}" '
+                     f'controls loop muted playsinline></video>')
+    elif clip:                                    # gif
+        clip_html = f'<img class="clip" src="{html.escape(clip)}" alt="run timelapse">'
+    elif clip_note:
+        clip_html = f'<p class="clip-note">{html.escape(clip_note)}</p>'
+
     return _REPORT_TEMPLATE.format(
-        title=title, overall=overall,
-        overall_cls=("bad" if fails else "ok"), meta=meta, body=body)
+        title=title, overall=overall, overall_cls=("bad" if fails else "ok"),
+        meta=meta, clip=clip_html, body=body)
 
 
 _REPORT_TEMPLATE = """<!doctype html>
@@ -469,6 +570,9 @@ _REPORT_TEMPLATE = """<!doctype html>
   .shot {{ margin-top:8px; max-width:100%; border-radius:8px; border:1px solid #0002;
           display:block; }}
   .missing {{ color:#dc2626; font-size:13px; }}
+  .clip {{ display:block; width:100%; max-width:480px; margin:16px auto 0;
+          border-radius:10px; border:1px solid #0002; }}
+  .clip-note {{ color:#6b7280; font-size:13px; font-style:italic; }}
 </style></head>
 <body>
 <header>
@@ -476,6 +580,7 @@ _REPORT_TEMPLATE = """<!doctype html>
   <div class="meta-top">{meta}</div>
 </header>
 <main>
+{clip}
 {body}
 </main></body></html>"""
 
