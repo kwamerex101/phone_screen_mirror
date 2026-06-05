@@ -16,6 +16,15 @@ CoreMediaIO, Network). Control rides on two vetted, source-built tools —
 [`WebDriverAgent`](https://github.com/appium/WebDriverAgent) — that live under
 `tools/` (gitignored) and are bundled into the `.app` at package time.
 
+## Screenshots
+
+iPhone mirrored live to the Mac. The capture follows the phone's **physical
+orientation**, and tap/drag coordinates adapt automatically — verified in both
+portrait and landscape.
+
+<p align="center"><img src="assets/device-portrait.png" alt="iMirror — portrait" height="460"></p>
+<p align="center"><img src="assets/device-landscape.png" alt="iMirror — landscape" width="680"></p>
+
 ## Requirements
 
 - macOS 14+ (built/tested on macOS 26, Xcode 26, Swift 6.3)
