@@ -29,13 +29,15 @@ class FakeWDA:
 
     def __init__(self):
         self.calls: list[tuple[str, str, dict | None]] = []
+        self.timeouts: list[float | None] = []
         self.replies: dict[str, list[tuple[int, dict]]] = {}
 
     def script(self, key: str, *responses: tuple[int, dict]):
         self.replies[key] = list(responses)
 
-    def __call__(self, method, path, body=None):
+    def __call__(self, method, path, body=None, timeout=None):
         self.calls.append((method, path, body))
+        self.timeouts.append(timeout)
         # Prefer an exact path match, then a suffix match (e.g. ".../actions"),
         # then a plain substring — so "/session" doesn't shadow "/session/s/actions".
         for match in (lambda k: k == path, path.endswith, lambda k: k in path):
@@ -107,6 +109,15 @@ def test_source_truncates_large_output(mod, wda):
     out = mod.ios_source()
     assert out.endswith("… (truncated)")
     assert len(out) < 25000
+
+
+def test_source_uses_long_timeout(mod, wda):
+    """A heavy accessibility tree can take >15s; ios_source must not use the
+    default short timeout (regression: real device timed out at 15s)."""
+    wda.script("/source", (200, {"value": "<XCUIElementTypeApplication/>"}))
+    mod.ios_source()
+    src_idx = next(i for i, (_, p, _) in enumerate(wda.calls) if p == "/source")
+    assert wda.timeouts[src_idx] is not None and wda.timeouts[src_idx] >= 60
 
 
 def test_screenshot_decodes_base64(mod, wda):
