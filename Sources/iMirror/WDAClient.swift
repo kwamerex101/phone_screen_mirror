@@ -41,7 +41,13 @@ final class WDAClient {
     /// Creates a WDA session (system-wide, no specific app) and fetches the
     /// device's logical screen size in points.
     func connect(completion: @escaping (Result<CGSize, Error>) -> Void) {
-        let body: [String: Any] = ["capabilities": ["alwaysMatch": [:], "firstMatch": [[:]]]]
+        // shouldWaitForQuiescence:false is the single biggest latency win — measured
+        // on-device, it drops a swipe's /actions round-trip from ~1300ms to ~10-200ms.
+        // By default XCUITest blocks each gesture until the UI is "quiescent" (~1.2s
+        // after a scroll's animation). We don't need that wait: the user watches the
+        // live mirror, and agents can pass settle_ms when they need a stable frame.
+        let body: [String: Any] = ["capabilities": [
+            "alwaysMatch": ["shouldWaitForQuiescence": false], "firstMatch": [[:]]]]
         send("POST", "/session", body) { [weak self] _, json, error in
             guard let self else { return }
             if let error { completion(.failure(error)); return }
@@ -50,8 +56,22 @@ final class WDAClient {
                 return
             }
             self.sessionId = sid
+            self.applyFastGestureSettings(sid: sid)
             self.fetchWindowSize(completion: completion)
         }
+    }
+
+    /// Disable XCUITest's idle/animation wait so gestures return promptly. THE big
+    /// latency win, measured on-device: a swipe over animating content drops from
+    /// ~13s to ~1s, and a static-list swipe from ~1.3s toward the ~10ms floor.
+    /// (XCUITest otherwise blocks each gesture until the app goes "idle"; over
+    /// autoplaying video it never does, so it waits out the full timeout.)
+    /// Best-effort, fire-and-forget — the WDA `appium/settings` route, set per
+    /// session right after connect. The shouldWaitForQuiescence capability is
+    /// ignored by this WDA build, so this endpoint is the working lever.
+    private func applyFastGestureSettings(sid: String) {
+        send("POST", "/session/\(sid)/appium/settings",
+             ["settings": ["waitForIdleTimeout": 0, "animationCoolOffTimeout": 0]]) { _, _, _ in }
     }
 
     private func fetchWindowSize(completion: @escaping (Result<CGSize, Error>) -> Void) {
@@ -108,19 +128,36 @@ final class WDAClient {
         ]))
     }
 
-    /// Drag through a path of device points (one continuous gesture). Following
-    /// the real path — rather than a straight start→end line — makes scrolling
-    /// and swipes track the cursor faithfully.
-    func drag(path: [CGPoint], totalMs: Int = 300) {
-        guard let sid = sessionId, let first = path.first else { return }
+    /// Move through a path of device points (one continuous gesture).
+    ///
+    /// `flick = false` → faithful slow drag: replay the whole path so content tracks
+    /// the cursor (precise dragging, picking, slow scrub).
+    ///
+    /// `flick = true` → one quick straight swipe (first→last) for a snappy scroll.
+    ///
+    /// IMPORTANT: WDA/XCUITest injects *synthetic* touches that do not carry liftoff
+    /// velocity, so iOS scroll **momentum never triggers** — measured directly: a
+    /// ~18,000 pt/s swipe coasts no further than a slow one. Scrolling is therefore a
+    /// discrete 1:1 jump per gesture; a fast swipe only animates quicker, it doesn't
+    /// glide. To cover distance we amplify the swipe length upstream (scroll gain),
+    /// not the velocity. (Apple's iPhone-Mirroring smoothness comes from realtime HID
+    /// injection + native momentum — a layer WDA can't reach.)
+    func drag(path: [CGPoint], flick: Bool = false, totalMs: Int = 300) {
+        guard let sid = sessionId, let first = path.first, let last = path.last else { return }
         var steps: [[String: Any]] = [
             ["type": "pointerMove", "duration": 0, "x": first.x, "y": first.y],
             ["type": "pointerDown", "button": 0],
         ]
-        let segments = max(1, path.count - 1)
-        let perSegment = max(8, totalMs / segments)
-        for p in path.dropFirst() {
-            steps.append(["type": "pointerMove", "duration": perSegment, "x": p.x, "y": p.y])
+        if flick {
+            // 150ms = ~9 XCUITest interpolation frames: a visible slide, not a
+            // teleport. (Velocity is irrelevant — WDA can't trigger momentum.)
+            steps.append(["type": "pointerMove", "duration": 150, "x": last.x, "y": last.y])
+        } else {
+            let segments = max(1, path.count - 1)
+            let perSegment = max(8, totalMs / segments)
+            for p in path.dropFirst() {
+                steps.append(["type": "pointerMove", "duration": perSegment, "x": p.x, "y": p.y])
+            }
         }
         steps.append(["type": "pointerUp", "button": 0])
         sendInput("/session/\(sid)/actions", pointer(steps))
@@ -135,11 +172,45 @@ final class WDAClient {
         sendInput("/wda/homescreen", [:])
     }
 
+    /// True while a gesture POST (/actions) is outstanding. Concurrent gestures are
+    /// dropped rather than queued: serial HTTP round-trips would land hundreds of ms
+    /// after the hand stopped, reading as sticky lag — and an in-flight flick's iOS
+    /// momentum already covers the user's intent.
+    private var gestureInFlight = false
+    /// Read-only view for the health monitor so it can skip probing mid-gesture.
+    /// Set/cleared only on DispatchQueue.main — main-thread access only.
+    var isGestureInFlight: Bool { gestureInFlight }
+
+    /// Gesture request timeout: short enough to recover fast if WDA wedges, long
+    /// enough not to cancel a legitimately slow swipe on a heavy/throttled screen.
+    private let gestureTimeoutSec: TimeInterval = 4.0
+
     /// Sends an input request; a 404 means the session expired — drop it so the
-    /// next health probe recreates it transparently.
+    /// next health probe recreates it transparently. "Gesture" posts (/actions and
+    /// the home-screen press) use the short timeout and a single-in-flight guard so
+    /// they can't overlap and stall WDA; taps go through /actions too, so they're
+    /// covered. Keys are not gestures.
     private func sendInput(_ path: String, _ body: [String: Any]) {
-        send("POST", path, body) { [weak self] code, _, _ in
-            if code == 404 { self?.sessionId = nil }
+        let isGesture = path.hasSuffix("/actions") || path == "/wda/homescreen"
+        if isGesture {
+            if gestureInFlight {
+                NSLog("[iMirror] gesture dropped — one already in flight: \(path)")
+                return
+            }
+            gestureInFlight = true
+            // Backstop only — the request completion (below) is the real clear. It
+            // MUST exceed the gesture request timeout, or it races a still-executing
+            // gesture and lets a second one fire concurrently, which stalls WDA
+            // (single XCUITest queue) and trips the health probe into a false .down.
+            DispatchQueue.main.asyncAfter(deadline: .now() + gestureTimeoutSec + 2) { [weak self] in
+                self?.gestureInFlight = false
+            }
+        }
+        send("POST", path, body, timeout: isGesture ? gestureTimeoutSec : 8) { [weak self] code, _, _ in
+            DispatchQueue.main.async {
+                if isGesture { self?.gestureInFlight = false }
+                if code == 404 { self?.sessionId = nil }
+            }
         }
     }
 
@@ -155,6 +226,7 @@ final class WDAClient {
     // MARK: HTTP core (fresh connection per request)
 
     private func send(_ method: String, _ path: String, _ body: [String: Any]?,
+                      timeout: TimeInterval = 8,
                       completion: @escaping (Int?, [String: Any]?, Error?) -> Void) {
         var req = URLRequest(url: base.appendingPathComponent(path))
         req.httpMethod = method
@@ -163,7 +235,7 @@ final class WDAClient {
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         }
         let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 8
+        cfg.timeoutIntervalForRequest = timeout
         cfg.waitsForConnectivity = false
         cfg.httpMaximumConnectionsPerHost = 1
         let oneShot = URLSession(configuration: cfg)

@@ -198,7 +198,31 @@ final class Transport {
             NSLog("iMirror: go-ios not found — relying on external WDA bring-up")
             return
         }
+        // A previous instance that crashed (rather than quit cleanly) can leave a
+        // go-ios child reparented to launchd — most often the tunnel, which then
+        // holds the device's RSD state and port 60105 so a fresh tunnel can't
+        // bind. Those orphans are invisible to our ManagedProcess handles, so
+        // restartChain() can never kill them and WDA loops on red forever. Sweep
+        // them before bringing up a clean chain.
+        sweepStrayProcesses()
         startChildren()
+    }
+
+    /// Kill stray go-ios children left over from a previous app instance, matched
+    /// by our own binary path so unrelated processes are never touched. Only safe
+    /// to call when our own handles are stopped/nil — otherwise it would kill the
+    /// children we just spawned.
+    private func sweepStrayProcesses() {
+        guard let bin = goios else { return }
+        for sub in ["tunnel", "runwda", "forward"] {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+            p.arguments = ["-f", "\(bin.path) \(sub)"]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            do { try p.run(); p.waitUntilExit() }
+            catch { NSLog("iMirror: sweep of stray \(sub) failed: \(error.localizedDescription)") }
+        }
     }
 
     /// Start the go-ios children in order: tunnel first, then (after it has had
@@ -235,7 +259,12 @@ final class Transport {
         forward?.stop(); wda?.stop(); tunnel?.stop()
         forward = nil; wda = nil; tunnel = nil
         DispatchQueue.global().asyncAfter(deadline: .now() + 4) { [weak self] in
-            self?.startChildren()
+            guard let self else { return }
+            // Our handles are stopped; reap any child that outlived its handle
+            // (e.g. a tunnel reparented to launchd) so the fresh chain owns a
+            // clean device + port 60105.
+            self.sweepStrayProcesses()
+            self.startChildren()
         }
     }
 }

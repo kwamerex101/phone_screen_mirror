@@ -38,9 +38,11 @@ class FakeWDA:
     def __call__(self, method, path, body=None, timeout=None):
         self.calls.append((method, path, body))
         self.timeouts.append(timeout)
-        # Prefer an exact path match, then a suffix match (e.g. ".../actions"),
-        # then a plain substring — so "/session" doesn't shadow "/session/s/actions".
-        for match in (lambda k: k == path, path.endswith, lambda k: k in path):
+        # Match by exact path, then by suffix (".../actions", ".../window/size").
+        # No loose substring match: that let "/session" shadow both
+        # "/session/s/actions" and the "/session/s/appium/settings" call that
+        # _ensure_session now fires, consuming the wrong scripted reply.
+        for match in (lambda k: k == path, path.endswith):
             for key in sorted(self.replies, key=len, reverse=True):
                 if self.replies[key] and match(key):
                     return self.replies[key].pop(0)
@@ -317,6 +319,106 @@ def test_orientation_rejects_bad(mod, wda):
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     with pytest.raises(RuntimeError, match="set_to must be one of"):
         mod.ios_orientation("sideways")
+
+
+# ---- scroll tools --------------------------------------------------------------
+
+def _swipe_points(wda):
+    """Extract (from_pt, to_pt) from the last /actions pointer gesture."""
+    body = next(b for m, p, b in reversed(wda.calls) if p.endswith("/actions"))
+    steps = body["actions"][0]["actions"]
+    frm = next(s for s in steps if s["type"] == "pointerMove" and s["duration"] == 0)
+    to = [s for s in steps if s["type"] == "pointerMove" and s["duration"] > 0][-1]
+    return (frm["x"], frm["y"]), (to["x"], to["y"])
+
+
+def test_ios_scroll_down_swipes_up(mod, wda):
+    import json
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/window/size", (200, {"value": {"width": 430, "height": 932}}))
+    out = json.loads(mod.ios_scroll("down", distance_pct=40))
+    (fx, fy), (tx, ty) = _swipe_points(wda)
+    # "down" content => finger moves UP (from below centre to above centre)
+    assert fx == tx == 215
+    assert fy > ty, "down-scroll must swipe the finger upward"
+    assert out["distance_pts"] > 0
+
+
+def test_ios_scroll_up_swipes_down(mod, wda):
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/window/size", (200, {"value": {"width": 430, "height": 932}}))
+    mod.ios_scroll("up", distance_pct=40)
+    (fx, fy), (tx, ty) = _swipe_points(wda)
+    assert ty > fy, "up-scroll must swipe the finger downward"
+
+
+def test_ios_scroll_distance_floored(mod, wda):
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/window/size", (200, {"value": {"width": 430, "height": 932}}))
+    mod.ios_scroll("down", distance_pct=1)            # floored to 15%
+    (_, fy), (_, ty) = _swipe_points(wda)
+    assert abs(fy - ty) >= 932 * 0.15 - 1
+
+
+def test_ios_scroll_rejects_bad_direction(mod, wda):
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/window/size", (200, {"value": {"width": 430, "height": 932}}))
+    with pytest.raises(RuntimeError, match="direction must be one of"):
+        mod.ios_scroll("sideways")
+
+
+def test_ios_scroll_clamps_to_bounds(mod, wda):
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/window/size", (200, {"value": {"width": 430, "height": 932}}))
+    mod.ios_scroll("down", distance_pct=100, y_pct=50)  # would overshoot screen
+    (_, fy), (_, ty) = _swipe_points(wda)
+    assert 1 <= fy <= 931 and 1 <= ty <= 931
+
+
+def test_ios_scroll_to_found_without_scrolling(mod, monkeypatch):
+    import json
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: "e1")
+    called = []
+    monkeypatch.setattr(mod, "_scroll_once", lambda *a, **k: called.append(1))
+    out = json.loads(mod.ios_scroll_to("Privacy"))
+    assert out == {"found": True, "swipes": 0}
+    assert called == []                               # already visible → no scroll
+
+
+def test_ios_scroll_to_scrolls_then_finds(mod, monkeypatch):
+    import json
+    seq = [None, None, "e1"]
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: seq.pop(0))
+    monkeypatch.setattr(mod, "_scroll_once", lambda *a, **k: None)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+    out = json.loads(mod.ios_scroll_to("Privacy", max_swipes=10))
+    assert out == {"found": True, "swipes": 2}
+
+
+def test_ios_scroll_to_raises_after_cap(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: None)
+    scrolls = []
+    monkeypatch.setattr(mod, "_scroll_once", lambda *a, **k: scrolls.append(1))
+    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+    with pytest.raises(RuntimeError, match="not found after 3 swipes"):
+        mod.ios_scroll_to("Ghost", max_swipes=3)
+    assert len(scrolls) == 3                           # capped at max_swipes
+
+
+def test_swipe_settle_sleeps(mod, wda, monkeypatch):
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    slept = []
+    monkeypatch.setattr(mod.time, "sleep", lambda s: slept.append(s))
+    mod.ios_swipe(1, 2, 3, 4, settle_ms=300)
+    assert slept == [0.3]
+
+
+def test_window_size_cached(mod, wda):
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/window/size", (200, {"value": {"width": 430, "height": 932}}))
+    mod._win_size(); mod._win_size()
+    n = sum(1 for m, p, _ in wda.calls if p.endswith("/window/size"))
+    assert n == 1                                      # second call served from cache
 
 
 # ---- timelapse -----------------------------------------------------------------

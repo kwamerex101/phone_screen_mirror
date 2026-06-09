@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -99,12 +100,26 @@ def _req(method: str, path: str, body: dict | None = None,
 def _ensure_session() -> str:
     if _session["id"]:
         return _session["id"]  # type: ignore[return-value]
+    # shouldWaitForQuiescence:false slashes gesture latency — measured on-device, a
+    # swipe's /actions drops from ~1300ms to ~10-200ms (XCUITest otherwise blocks each
+    # gesture until the UI settles). Use settle_ms on scroll/swipe when a following
+    # screenshot/source needs a stable, post-animation frame.
     code, j = _req("POST", "/session",
-                   {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}})
+                   {"capabilities": {"alwaysMatch": {"shouldWaitForQuiescence": False},
+                                     "firstMatch": [{}]}})
     sid = (j.get("value") or {}).get("sessionId") or j.get("sessionId")
     if not sid:
         raise RuntimeError(f"WDA session create failed (HTTP {code}): {j}")
     _session["id"] = sid
+    # Disable XCUITest's idle/animation wait — the big latency win (a swipe over
+    # animating content drops ~13s -> ~1s, static lists ~1.3s -> near-instant).
+    # Best-effort; the capability above is ignored by this WDA build, but this
+    # per-session settings route is honored.
+    try:
+        _req("POST", f"/session/{sid}/appium/settings",
+             {"settings": {"waitForIdleTimeout": 0, "animationCoolOffTimeout": 0}}, timeout=5)
+    except Exception:
+        pass
     return sid
 
 
@@ -135,6 +150,71 @@ def _session_get(subpath: str, _retry: bool = True) -> dict[str, Any]:
 def _pointer(steps: list[dict]) -> dict:
     return {"actions": [{"type": "pointer", "id": "finger1",
                          "parameters": {"pointerType": "touch"}, "actions": steps}]}
+
+
+# Serialise gesture (/actions) posts across threads. WDA has a single XCUITest
+# queue; two overlapping gestures stall it and can wedge the wire. With several
+# agents (or test threads) sharing one MCP server, the lock prevents that.
+_gesture_lock = threading.Lock()
+
+
+def _gesture(steps: list[dict]) -> None:
+    if not _gesture_lock.acquire(timeout=5):
+        raise RuntimeError("WDA gesture lock timeout — another gesture is stuck")
+    try:
+        _session_post("/actions", _pointer(steps))
+    finally:
+        _gesture_lock.release()
+
+
+# Logical screen size, cached briefly so scroll helpers don't re-query every call.
+_window_cache: dict[str, Any] = {"size": None, "t": 0.0}
+
+
+def _win_size() -> tuple[float, float]:
+    now = time.monotonic()
+    cached = _window_cache["size"]
+    if cached and now - _window_cache["t"] < 30:
+        return cached
+    j = _session_get("/window/size")
+    v = j.get("value", j)
+    size = (float(v["width"]), float(v["height"]))
+    _window_cache.update(size=size, t=now)
+    return size
+
+
+def _scroll_geom(direction: str, distance_pct: float,
+                 x_pct: float, y_pct: float) -> tuple[float, float, float, float, float]:
+    """Compute swipe endpoints for a scroll. `direction` is the CONTENT/reading
+    direction: "down" reveals content further down the page (the finger swipes up),
+    matching how people and agents say "scroll down". Returns (fx, fy, tx, ty, dist)."""
+    w, h = _win_size()
+    pct = max(15.0, float(distance_pct))
+    cx, cy = w * x_pct / 100.0, h * y_pct / 100.0
+    sv, sh = h * pct / 100.0, w * pct / 100.0
+    d = direction.lower()
+    if d == "down":    fx, fy, tx, ty = cx, cy + sv / 2, cx, cy - sv / 2
+    elif d == "up":    fx, fy, tx, ty = cx, cy - sv / 2, cx, cy + sv / 2
+    elif d == "left":  fx, fy, tx, ty = cx + sh / 2, cy, cx - sh / 2, cy
+    elif d == "right": fx, fy, tx, ty = cx - sh / 2, cy, cx + sh / 2, cy
+    else:
+        raise RuntimeError("direction must be one of up / down / left / right")
+    clamp = lambda v, m: min(max(v, 1.0), m - 1.0)
+    fx, tx = clamp(fx, w), clamp(tx, w)
+    fy, ty = clamp(fy, h), clamp(ty, h)
+    return fx, fy, tx, ty, ((tx - fx) ** 2 + (ty - fy) ** 2) ** 0.5
+
+
+def _scroll_once(direction: str, distance_pct: float, x_pct: float,
+                 y_pct: float, duration_ms: int) -> tuple[float, float, float, float, float]:
+    fx, fy, tx, ty, dist = _scroll_geom(direction, distance_pct, x_pct, y_pct)
+    _gesture([
+        {"type": "pointerMove", "duration": 0, "x": fx, "y": fy},
+        {"type": "pointerDown", "button": 0},
+        {"type": "pointerMove", "duration": max(1, duration_ms), "x": tx, "y": ty},
+        {"type": "pointerUp", "button": 0},
+    ])
+    return fx, fy, tx, ty, dist
 
 
 def _find_element(text: str, _retry: bool = True) -> str | None:
@@ -237,30 +317,85 @@ def ios_tap(x: float, y: float) -> str:
 
     Origin is top-left. Example: center of a 430×932 portrait screen is (215, 466).
     """
-    _session_post("/actions", _pointer([
+    _gesture([
         {"type": "pointerMove", "duration": 0, "x": x, "y": y},
         {"type": "pointerDown", "button": 0},
         {"type": "pause", "duration": 40},
         {"type": "pointerUp", "button": 0},
-    ]))
+    ])
     _record("tap", f"({x}, {y})")
     return f"tapped ({x}, {y})"
 
 
 @mcp.tool()
 def ios_swipe(from_x: float, from_y: float, to_x: float, to_y: float,
-              duration_ms: int = 250) -> str:
+              duration_ms: int = 250, settle_ms: int = 0) -> str:
     """Swipe/drag from one point to another (logical points). Use for scrolling,
-    paging, and drag gestures. Larger duration_ms = slower drag (less inertia).
+    paging, and drag gestures. Larger duration_ms = slower drag.
+
+    Note: scrolling on a real device has NO inertial momentum via WebDriverAgent —
+    a swipe moves content ~1:1 and stops on release, so use a longer swipe to cover
+    more distance, not a faster one. /actions returns when the gesture wire is sent,
+    not when the iOS animation settles (~200-350ms); pass settle_ms (e.g. 300) to
+    wait before a following ios_source / ios_screenshot so you don't capture mid-scroll.
     """
-    _session_post("/actions", _pointer([
+    _gesture([
         {"type": "pointerMove", "duration": 0, "x": from_x, "y": from_y},
         {"type": "pointerDown", "button": 0},
         {"type": "pointerMove", "duration": max(1, duration_ms), "x": to_x, "y": to_y},
         {"type": "pointerUp", "button": 0},
-    ]))
+    ])
+    if settle_ms > 0:
+        time.sleep(settle_ms / 1000.0)
     _record("swipe", f"({from_x},{from_y}) -> ({to_x},{to_y})")
     return f"swiped ({from_x},{from_y}) -> ({to_x},{to_y})"
+
+
+@mcp.tool()
+def ios_scroll(direction: str, distance_pct: float = 40, x_pct: float = 50,
+               y_pct: float = 50, duration_ms: int = 300, settle_ms: int = 300) -> str:
+    """Scroll the screen in a direction by a fraction of the screen.
+
+    `direction` is the CONTENT direction: "down" reveals content further down the
+    page, "up" goes back toward the top, "left"/"right" for horizontal scrollers.
+    `distance_pct` is how far to scroll as a percent of the screen dimension
+    (floored at 15; ~85 ≈ a full page). `x_pct`/`y_pct` place the swipe (e.g. scroll
+    a specific pane). Waits `settle_ms` after so a following screenshot/source is
+    stable. Returns JSON with the actual from/to points and distance in points.
+
+    There is no momentum: distance is set by the swipe length, not its speed.
+    """
+    fx, fy, tx, ty, dist = _scroll_once(direction, distance_pct, x_pct, y_pct, duration_ms)
+    if settle_ms > 0:
+        time.sleep(settle_ms / 1000.0)
+    _record("scroll", f"{direction} {distance_pct:g}%")
+    return json.dumps({"from_pt": [round(fx, 1), round(fy, 1)],
+                       "to_pt": [round(tx, 1), round(ty, 1)],
+                       "distance_pts": round(dist, 1)})
+
+
+@mcp.tool()
+def ios_scroll_to(text: str, direction: str = "down", max_swipes: int = 10,
+                  distance_pct: float = 35, settle_ms: int = 350) -> str:
+    """Scroll until an element with the given visible label/name/value is on screen.
+
+    Repeatedly scrolls `direction` (content direction; default "down") up to
+    `max_swipes` times (hard-capped at 20), checking after each whether `text` is
+    present. Returns JSON {"found": true, "swipes": n} as soon as it appears, or
+    raises if it never does. Use to bring a known row/button into view before
+    tapping it. Each step waits `settle_ms` so the check sees a settled screen.
+    """
+    cap = min(max_swipes, 20)
+    if max_swipes > 20:
+        _record("scroll_to", f"max_swipes {max_swipes} capped at 20")
+    for n in range(cap + 1):
+        if _find_element(text):
+            return json.dumps({"found": True, "swipes": n})
+        if n == cap:
+            break
+        _scroll_once(direction, distance_pct, 50, 50, 300)
+        time.sleep(settle_ms / 1000.0)
+    raise RuntimeError(f"Element '{text}' not found after {cap} swipes ({direction}).")
 
 
 @mcp.tool()
