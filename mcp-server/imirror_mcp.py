@@ -22,6 +22,7 @@ import base64
 import html
 import http.client
 import json
+import math
 import os
 import re
 import shutil
@@ -535,6 +536,23 @@ def ios_run_note(text: str, status: str = "info") -> str:
 
 
 @mcp.tool()
+def ios_run_section(title: str) -> str:
+    """Start a named section in the active run (e.g. a test area or scenario).
+
+    Sections give the report a "what was tested" structure: every step and note
+    recorded after this call is grouped under `title`, the report's table of
+    contents lists each section with its own pass/fail rollup, and the summary
+    counts them. Call it at the start of each logical area you test. Steps recorded
+    before the first section land in an implicit opening section, so existing flows
+    keep working unchanged. Raises if no run is active.
+    """
+    if not _run["active"]:
+        raise RuntimeError("No active run. Call ios_start_run first.")
+    _record("section", detail=title)
+    return f"section: {title}"
+
+
+@mcp.tool()
 def ios_finish_run(video: str = "gif") -> str:
     """Finish the active run and write an HTML report.
 
@@ -620,38 +638,163 @@ def _ffmpeg(args: list[str]) -> None:
     subprocess.run(["ffmpeg", "-y", *args], check=True, capture_output=True)
 
 
+def _screenshot_img(name: str, alt: str) -> str:
+    """Embed a run screenshot as a clickable base64 <img>, or a missing marker."""
+    try:
+        with open(os.path.join(_run["dir"], name), "rb") as fh:
+            uri = "data:image/png;base64," + base64.b64encode(fh.read()).decode()
+        return (f'<a href="{uri}" target="_blank">'
+                f'<img class="shot" src="{uri}" alt="{html.escape(alt)}"></a>')
+    except OSError:
+        return '<span class="missing">[screenshot missing]</span>'
+
+
+def _donut_svg(passes: int, fails: int) -> str:
+    """Inline SVG pass/fail donut (no JS, no external libs). Green ring with a red
+    arc proportional to failures; centre shows the pass rate."""
+    total = passes + fails
+    r, circ = 42.0, 2 * math.pi * 42.0
+    if total == 0:
+        center, sub = "—", "no checks"
+        arc = ""
+    else:
+        rate = round(passes / total * 100)
+        center, sub = f"{rate}%", "passed"
+        fail_len = circ * (fails / total)
+        arc = (f'<circle class="d-fail" cx="50" cy="50" r="42" '
+               f'stroke-dasharray="{fail_len:.2f} {circ:.2f}" '
+               f'transform="rotate(-90 50 50)"></circle>')
+    return (
+        f'<svg class="donut" viewBox="0 0 100 100" role="img" '
+        f'aria-label="{passes} passed, {fails} failed">'
+        f'<circle class="d-track" cx="50" cy="50" r="42"></circle>{arc}'
+        f'<text class="d-num" x="50" y="48">{center}</text>'
+        f'<text class="d-sub" x="50" y="64">{sub}</text></svg>'
+    )
+
+
+def _stat_card(value: str, label: str, cls: str = "") -> str:
+    return (f'<div class="stat {cls}"><div class="stat-v">{value}</div>'
+            f'<div class="stat-l">{label}</div></div>')
+
+
+def _action_bars(steps: list[dict]) -> str:
+    """Horizontal bar chart of action counts (excludes section markers)."""
+    counts: dict[str, int] = {}
+    for s in steps:
+        if s["action"] == "section":
+            continue
+        counts[s["action"]] = counts.get(s["action"], 0) + 1
+    if not counts:
+        return ""
+    top = max(counts.values())
+    rows = []
+    for act, n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
+        pct = round(n / top * 100)
+        rows.append(
+            f'<div class="bar-row"><span class="bar-lbl">{html.escape(act)}</span>'
+            f'<span class="bar-track"><span class="bar-fill" style="width:{pct}%"></span></span>'
+            f'<span class="bar-n">{n}</span></div>'
+        )
+    return '<div class="bars">' + "".join(rows) + "</div>"
+
+
+def _render_step(s: dict, started: float) -> str:
+    off = s["t"] - started
+    badge = ""
+    if s["action"] == "note":
+        cls = {"pass": "ok", "fail": "bad"}.get(s["note"], "info")
+        badge = f'<span class="badge {cls}">{html.escape(s["note"])}</span>'
+    img = _screenshot_img(s["screenshot"], f'step {s["i"]}') if s["screenshot"] else ""
+    return (
+        f'<div class="step" id="step-{s["i"]}">'
+        f'<div class="meta"><span class="i">#{s["i"]}</span>'
+        f'<span class="act">{html.escape(s["action"])}</span>'
+        f'<span class="off">+{off:.1f}s</span>{badge}</div>'
+        f'<div class="detail">{html.escape(s["detail"])}</div>{img}</div>'
+    )
+
+
+def _split_sections(steps: list[dict]) -> list[dict]:
+    """Group steps into sections by `section` markers. Steps before the first
+    marker fall into an implicit opening section so older flows still render."""
+    sections: list[dict] = []
+    cur: dict | None = None
+
+    def open_section(title: str) -> dict:
+        sec = {"title": title, "steps": [], "passes": 0, "fails": 0}
+        sections.append(sec)
+        return sec
+
+    for s in steps:
+        if s["action"] == "section":
+            cur = open_section(s["detail"] or "Section")
+            continue
+        if cur is None:
+            cur = open_section(_run["label"] or "Run")
+        cur["steps"].append(s)
+        if s["action"] == "note" and s["note"] == "pass":
+            cur["passes"] += 1
+        elif s["action"] == "note" and s["note"] == "fail":
+            cur["fails"] += 1
+    return sections
+
+
 def _render_report(ended: float, clip: str | None = None, clip_note: str = "") -> str:
     steps = _run["steps"]
     started = _run["started"] or ended
     fails = sum(1 for s in steps if s["action"] == "note" and s["note"] == "fail")
+    passes = sum(1 for s in steps if s["action"] == "note" and s["note"] == "pass")
     shots = sum(1 for s in steps if s["screenshot"])
+    action_steps = sum(1 for s in steps if s["action"] != "section")
     overall = "FAIL" if fails else "PASS"
+    overall_cls = "bad" if fails else "ok"
 
-    blocks = []
-    for s in steps:
-        off = s["t"] - started
-        img = ""
-        if s["screenshot"]:
-            p = os.path.join(_run["dir"], s["screenshot"])
-            try:
-                with open(p, "rb") as fh:
-                    b64 = base64.b64encode(fh.read()).decode()
-                uri = f"data:image/png;base64,{b64}"
-                img = (f'<a href="{uri}" target="_blank">'
-                       f'<img class="shot" src="{uri}" alt="step {s["i"]}"></a>')
-            except OSError:
-                img = '<span class="missing">[screenshot missing]</span>'
-        badge = ""
-        if s["action"] == "note":
-            cls = {"pass": "ok", "fail": "bad"}.get(s["note"], "info")
-            badge = f'<span class="badge {cls}">{html.escape(s["note"])}</span>'
-        blocks.append(
-            f'<div class="step">'
-            f'<div class="meta"><span class="i">#{s["i"]}</span>'
-            f'<span class="act">{html.escape(s["action"])}</span>'
-            f'<span class="off">+{off:.1f}s</span>{badge}</div>'
-            f'<div class="detail">{html.escape(s["detail"])}</div>{img}</div>'
+    sections = _split_sections(steps)
+
+    def sec_status(sec: dict) -> tuple[str, str]:
+        if sec["fails"]:
+            return "FAIL", "bad"
+        if sec["passes"]:
+            return "PASS", "ok"
+        return "—", "info"
+
+    # Table of contents + section bodies (anchored).
+    toc_rows, body_blocks = [], []
+    for n, sec in enumerate(sections, 1):
+        label, cls = sec_status(sec)
+        sid = f"sec-{n}"
+        counts = (f'{sec["passes"]} pass · {sec["fails"]} fail · '
+                  f'{len(sec["steps"])} steps')
+        toc_rows.append(
+            f'<li><a href="#{sid}"><span class="toc-t">{html.escape(sec["title"])}</span>'
+            f'<span class="toc-c">{counts}</span>'
+            f'<span class="badge {cls}">{label}</span></a></li>'
         )
+        inner = "\n".join(_render_step(s, started) for s in sec["steps"]) \
+            or '<p class="detail">No steps in this section.</p>'
+        body_blocks.append(
+            f'<section class="sec" id="{sid}">'
+            f'<h2>{html.escape(sec["title"])}'
+            f'<span class="badge {cls}">{label}</span></h2>{inner}</section>'
+        )
+    toc = ('<nav class="toc"><h2>What was tested</h2><ol>'
+           + "\n".join(toc_rows) + "</ol></nav>") if toc_rows else ""
+    body = "\n".join(body_blocks) or '<p class="detail">No steps were recorded.</p>'
+
+    # Failures-first panel.
+    fail_panel = ""
+    if fails:
+        items = []
+        for n, sec in enumerate(sections, 1):
+            for s in sec["steps"]:
+                if s["action"] == "note" and s["note"] == "fail":
+                    items.append(
+                        f'<li><a href="#step-{s["i"]}">'
+                        f'<span class="fp-sec">{html.escape(sec["title"])}</span>'
+                        f'{html.escape(s["detail"])}</a></li>')
+        fail_panel = ('<section class="fail-panel"><h2>Failures</h2><ol>'
+                      + "".join(items) + "</ol></section>")
 
     title = html.escape(_run["label"] or "test")
     meta = " · ".join(filter(None, [
@@ -659,9 +802,8 @@ def _render_report(ended: float, clip: str | None = None, clip_note: str = "") -
         f"iOS {html.escape(_run['ios'])}" if _run["ios"] else "",
         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)),
         f"{ended - started:.1f}s",
-        f"{len(steps)} steps · {shots} screenshots · {fails} failures",
+        f"{action_steps} steps · {shots} screenshots · {fails} failures",
     ]))
-    body = "\n".join(blocks) or '<p class="detail">No steps were recorded.</p>'
 
     clip_html = ""
     if clip and clip.endswith(".mp4"):
@@ -672,55 +814,139 @@ def _render_report(ended: float, clip: str | None = None, clip_note: str = "") -
     elif clip_note:
         clip_html = f'<p class="clip-note">{html.escape(clip_note)}</p>'
 
-    return _REPORT_TEMPLATE.format(
-        title=title, overall=overall, overall_cls=("bad" if fails else "ok"),
-        meta=meta, clip=clip_html, body=body)
+    cards = "".join([
+        _stat_card(str(action_steps), "Steps"),
+        _stat_card(str(shots), "Screenshots"),
+        _stat_card(str(passes), "Passes", "ok"),
+        _stat_card(str(fails), "Failures", "bad" if fails else ""),
+        _stat_card(str(len(sections)), "Sections"),
+        _stat_card(f"{ended - started:.0f}s", "Duration"),
+    ])
+    summary = (
+        '<section class="summary">'
+        f'<div class="sum-chart">{_donut_svg(passes, fails)}</div>'
+        f'<div class="sum-stats">{cards}</div>'
+        f'<div class="sum-bars">{_action_bars(steps)}</div>'
+        '</section>'
+    )
 
-
-_REPORT_TEMPLATE = """<!doctype html>
+    return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>iMirror test report — {title}</title>
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font: 15px/1.5 -apple-system, system-ui, sans-serif; margin: 0;
-         background: #f6f7f9; color: #1c1e21; }}
-  @media (prefers-color-scheme: dark) {{ body {{ background:#16181c; color:#e6e6e6; }}
-    header, .step {{ background:#22252b !important; }} }}
-  header {{ background:#fff; padding:24px 32px; border-bottom:1px solid #0001; }}
-  h1 {{ margin:0 0 6px; font-size:20px; }}
-  .meta-top {{ color:#6b7280; font-size:13px; }}
-  .badge {{ font-size:12px; font-weight:600; padding:2px 8px; border-radius:999px;
-           margin-left:8px; vertical-align:middle; }}
-  .badge.ok {{ background:#16a34a22; color:#16a34a; }}
-  .badge.bad {{ background:#dc262622; color:#dc2626; }}
-  .badge.info {{ background:#3b82f622; color:#3b82f6; }}
-  main {{ max-width:760px; margin:24px auto; padding:0 16px; }}
-  .step {{ background:#fff; border:1px solid #0001; border-radius:10px;
-          padding:14px 16px; margin:0 0 14px; }}
-  .meta {{ display:flex; align-items:center; gap:10px; font-size:13px; color:#6b7280; }}
-  .i {{ font-weight:700; color:#9ca3af; }}
-  .act {{ font-weight:600; color:inherit; text-transform:uppercase; letter-spacing:.04em;
-         font-size:12px; }}
-  .off {{ margin-left:auto; font-variant-numeric:tabular-nums; }}
-  .detail {{ margin:6px 0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace;
-            font-size:13px; word-break:break-word; }}
-  .shot {{ margin-top:8px; max-width:100%; border-radius:8px; border:1px solid #0002;
-          display:block; }}
-  .missing {{ color:#dc2626; font-size:13px; }}
-  .clip {{ display:block; width:100%; max-width:480px; margin:16px auto 0;
-          border-radius:10px; border:1px solid #0002; }}
-  .clip-note {{ color:#6b7280; font-size:13px; font-style:italic; }}
-</style></head>
+<style>{_REPORT_CSS}</style></head>
 <body>
-<header>
-  <h1>{title} <span class="badge {overall_cls}">{overall}</span></h1>
-  <div class="meta-top">{meta}</div>
+<header class="cover">
+  <div class="cover-main">
+    <p class="eyebrow">iMirror test report</p>
+    <h1>{title} <span class="badge {overall_cls}">{overall}</span></h1>
+    <div class="meta-top">{meta}</div>
+  </div>
+  {clip_html}
 </header>
 <main>
-{clip}
+{summary}
+{fail_panel}
+{toc}
 {body}
 </main></body></html>"""
+
+
+_REPORT_CSS = """
+  :root { color-scheme: light dark; --card:#fff; --line:#0001; --muted:#6b7280;
+          --ok:#16a34a; --bad:#dc2626; --info:#3b82f6; --accent:#6366f1; }
+  @media (prefers-color-scheme: dark) {
+    :root { --card:#22252b; --line:#ffffff14; --muted:#9aa3b2; } }
+  body { font: 15px/1.5 -apple-system, system-ui, sans-serif; margin: 0;
+         background: #f6f7f9; color: #1c1e21; }
+  @media (prefers-color-scheme: dark) { body { background:#16181c; color:#e6e6e6; } }
+  h1 { margin:0 0 6px; font-size:24px; }
+  h2 { font-size:15px; margin:0 0 12px; display:flex; align-items:center; gap:10px; }
+  a { color:inherit; text-decoration:none; }
+  .eyebrow { margin:0 0 4px; font-size:11px; letter-spacing:.12em; text-transform:uppercase;
+             color:var(--accent); font-weight:700; }
+  .meta-top { color:var(--muted); font-size:13px; }
+  .badge { font-size:11px; font-weight:700; padding:2px 9px; border-radius:999px;
+           vertical-align:middle; letter-spacing:.03em; }
+  .badge.ok { background:#16a34a22; color:var(--ok); }
+  .badge.bad { background:#dc262622; color:var(--bad); }
+  .badge.info { background:#9ca3af22; color:var(--muted); }
+  h1 .badge { font-size:13px; margin-left:8px; }
+  /* Cover */
+  .cover { background:linear-gradient(135deg,#6366f1,#8b5cf6); color:#fff;
+           padding:40px 32px; display:flex; gap:28px; align-items:center;
+           justify-content:space-between; flex-wrap:wrap; }
+  .cover .eyebrow { color:#ffffffcc; }
+  .cover .meta-top { color:#ffffffd8; }
+  .cover .badge.ok { background:#fff; color:var(--ok); }
+  .cover .badge.bad { background:#fff; color:var(--bad); }
+  .cover .clip { margin:0; max-width:200px; box-shadow:0 8px 28px #0003; }
+  main { max-width:860px; margin:24px auto; padding:0 16px; }
+  /* Summary */
+  .summary { background:var(--card); border:1px solid var(--line); border-radius:14px;
+             padding:22px; margin:0 0 18px; display:grid;
+             grid-template-columns:160px 1fr; gap:24px; align-items:center; }
+  .sum-bars { grid-column:1 / -1; }
+  .donut { width:150px; height:150px; }
+  .d-track { fill:none; stroke:#16a34a33; stroke-width:11; }
+  .d-fail  { fill:none; stroke:var(--bad); stroke-width:11; stroke-linecap:round; }
+  .donut .d-num { fill:currentColor; font-size:22px; font-weight:700; text-anchor:middle; }
+  .donut .d-sub { fill:var(--muted); font-size:9px; text-anchor:middle;
+                  text-transform:uppercase; letter-spacing:.1em; }
+  .sum-stats { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+  .stat { background:#00000005; border:1px solid var(--line); border-radius:10px;
+          padding:12px 14px; }
+  @media (prefers-color-scheme: dark) { .stat { background:#ffffff08; } }
+  .stat-v { font-size:22px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .stat-l { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; }
+  .stat.ok .stat-v { color:var(--ok); } .stat.bad .stat-v { color:var(--bad); }
+  .bars { display:flex; flex-direction:column; gap:7px; }
+  .bar-row { display:flex; align-items:center; gap:10px; font-size:12px; }
+  .bar-lbl { width:120px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;
+             font-size:11px; text-align:right; }
+  .bar-track { flex:1; height:8px; background:#00000010; border-radius:99px; overflow:hidden; }
+  .bar-fill { display:block; height:100%; background:var(--accent); border-radius:99px; }
+  .bar-n { width:28px; font-variant-numeric:tabular-nums; }
+  /* Failures panel */
+  .fail-panel { background:#dc26260d; border:1px solid #dc262633; border-radius:14px;
+                padding:18px 22px; margin:0 0 18px; }
+  .fail-panel h2 { color:var(--bad); }
+  .fail-panel ol { margin:0; padding-left:18px; }
+  .fail-panel li { margin:4px 0; }
+  .fail-panel .fp-sec { font-weight:700; margin-right:6px; }
+  .fail-panel a:hover { text-decoration:underline; }
+  /* TOC */
+  .toc { background:var(--card); border:1px solid var(--line); border-radius:14px;
+         padding:18px 22px; margin:0 0 18px; }
+  .toc ol { list-style:none; margin:0; padding:0; counter-reset:s; }
+  .toc li a { display:flex; align-items:center; gap:12px; padding:9px 0;
+              border-bottom:1px solid var(--line); }
+  .toc li:last-child a { border-bottom:0; }
+  .toc li a:before { counter-increment:s; content:counter(s); font-weight:700;
+                     color:var(--muted); min-width:18px; }
+  .toc-t { font-weight:600; flex:1; }
+  .toc-c { color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; }
+  .toc a:hover .toc-t { color:var(--accent); }
+  /* Sections + steps */
+  .sec { margin:0 0 26px; scroll-margin-top:16px; }
+  .sec > h2 { position:sticky; top:0; background:#f6f7f9; padding:8px 0; z-index:1; }
+  @media (prefers-color-scheme: dark) { .sec > h2 { background:#16181c; } }
+  .step { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:14px 16px; margin:0 0 12px; scroll-margin-top:60px; }
+  .meta { display:flex; align-items:center; gap:10px; font-size:13px; color:var(--muted); }
+  .i { font-weight:700; color:#9ca3af; }
+  .act { font-weight:600; color:inherit; text-transform:uppercase; letter-spacing:.04em;
+         font-size:12px; }
+  .off { margin-left:auto; font-variant-numeric:tabular-nums; }
+  .detail { margin:6px 0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size:13px; word-break:break-word; }
+  .shot { margin-top:8px; max-width:100%; border-radius:8px; border:1px solid #0002;
+          display:block; }
+  .missing { color:var(--bad); font-size:13px; }
+  .clip { display:block; width:100%; max-width:480px; margin:16px auto 0;
+          border-radius:10px; border:1px solid #0002; }
+  .clip-note { color:var(--muted); font-size:13px; font-style:italic; }
+"""
 
 
 if __name__ == "__main__":
