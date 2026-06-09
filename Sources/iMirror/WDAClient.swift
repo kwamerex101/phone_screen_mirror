@@ -108,43 +108,29 @@ final class WDAClient {
         ]))
     }
 
-    /// Drag through a path of device points (one continuous gesture).
+    /// Move through a path of device points (one continuous gesture).
     ///
-    /// `flick = false` → faithful slow drag: replay the whole path so the content
-    /// tracks the cursor (precise dragging, picking, slow scrub).
+    /// `flick = false` → faithful slow drag: replay the whole path so content tracks
+    /// the cursor (precise dragging, picking, slow scrub).
     ///
-    /// `flick = true` → throw a single fast straight swipe (first→last over a short
-    /// duration). The high pointer velocity makes iOS run its *own* scroll momentum
-    /// — the buttery deceleration you get from a finger flick — instead of us
-    /// replaying every point at real-time speed. This is the key smoothness lever
-    /// within WDA's scripted-gesture model (it can't stream realtime touch like
-    /// Apple's private iPhone-Mirroring HID path).
+    /// `flick = true` → one quick straight swipe (first→last) for a snappy scroll.
+    ///
+    /// IMPORTANT: WDA/XCUITest injects *synthetic* touches that do not carry liftoff
+    /// velocity, so iOS scroll **momentum never triggers** — measured directly: a
+    /// ~18,000 pt/s swipe coasts no further than a slow one. Scrolling is therefore a
+    /// discrete 1:1 jump per gesture; a fast swipe only animates quicker, it doesn't
+    /// glide. To cover distance we amplify the swipe length upstream (scroll gain),
+    /// not the velocity. (Apple's iPhone-Mirroring smoothness comes from realtime HID
+    /// injection + native momentum — a layer WDA can't reach.)
     func drag(path: [CGPoint], flick: Bool = false, totalMs: Int = 300) {
         guard let sid = sessionId, let first = path.first, let last = path.last else { return }
         var steps: [[String: Any]] = [
             ["type": "pointerMove", "duration": 0, "x": first.x, "y": first.y],
             ["type": "pointerDown", "button": 0],
         ]
-        let dist = hypot(last.x - first.x, last.y - first.y)
-        if flick && dist >= 50 {
-            // Velocity-flick: a short swipe at a constant target velocity so iOS runs
-            // its OWN scroll momentum. Duration is proportional to distance (constant
-            // velocity), and three interpolation steps give the iOS velocity estimator
-            // enough samples to read the speed — a single step reads as near-zero.
-            //
-            // NOTE: pointerMove `duration` is XCUITest's W3C *interpolation* (move)
-            // time, not a sleep — valid on WDA >= 2022 (bundled is v9.9.0). A sleep-
-            // semantics build would teleport the pointer, collapsing the flick to a tap.
-            let targetVelocity = 1500.0                       // device pt/s
-            let durationMs = max(60, Int(dist / targetVelocity * 1000))
-            let per = max(8, durationMs / 3)
-            for f in [0.33, 0.66, 1.0] {
-                steps.append(["type": "pointerMove", "duration": per,
-                              "x": first.x + (last.x - first.x) * f,
-                              "y": first.y + (last.y - first.y) * f])
-            }
+        if flick {
+            steps.append(["type": "pointerMove", "duration": 80, "x": last.x, "y": last.y])
         } else {
-            // Faithful slow drag: replay the whole path so content tracks the cursor.
             let segments = max(1, path.count - 1)
             let perSegment = max(8, totalMs / segments)
             for p in path.dropFirst() {

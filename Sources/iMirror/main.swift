@@ -86,9 +86,10 @@ final class PreviewView: NSView {
     }
 
     /// True when the trailing ~80ms of travel is fast enough to read as a flick — so
-    /// the gesture is thrown as a quick swipe and iOS applies its own scroll momentum
-    /// instead of us replaying the slow path 1:1. The 80ms window matches iOS's own
-    /// gesture-velocity window and survives a single coalesced (~16ms) event.
+    /// the gesture is sent as one quick swipe (snappy scroll jump) rather than a
+    /// faithful 1:1 path replay (precise drag). The 80ms window survives a single
+    /// coalesced (~16ms) event. (WDA can't produce inertial momentum — see
+    /// WDAClient.drag — so a flick just scrolls fast, it doesn't coast.)
     private func releaseIsFlick() -> Bool {
         guard let b = dragSamples.last, dragSamples.count >= 2 else { return false }
         var i = dragSamples.count - 1
@@ -112,9 +113,10 @@ final class PreviewView: NSView {
     }
 
     /// Two-finger trackpad scroll. Accumulate the finger distance and emit one quick
-    /// swipe when the user lifts (phase .ended) so the device runs its own momentum;
-    /// OS inertial frames are ignored. A legacy mouse wheel (no precise deltas, no
-    /// phase) instead emits an immediate nudge per tick. Direction is normalised via
+    /// swipe when the user lifts (phase .ended); the Mac's own inertial frames are
+    /// ignored (the phone can't reproduce momentum, so a coasting tail would just be
+    /// extra 1:1 swipes). A legacy mouse wheel (no precise deltas, no phase) instead
+    /// emits an immediate nudge per tick. Direction is normalised via
     /// isDirectionInvertedFromDevice (the authoritative Natural-Scroll flag): dy > 0
     /// means the finger moved up, dx > 0 means it moved right.
     override func scrollWheel(with event: NSEvent) {
@@ -612,12 +614,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             let videoRect = self.previewView.previewLayer.layerRectConverted(
                 fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
             guard videoRect.width > 1, videoRect.height > 1 else { return }
-            // Scale view-space scroll distance into device points and throw it as a
-            // flick for momentum. `gain` stacks on top of the view→device scale
-            // (~2.4x), so it's modest here and live-tunable via the UserDefaults key
-            // "imirror.scrollGain" (the panel's suggested 18 didn't account for that
-            // scale — start low and tune on device).
-            let gain = Swift.max(0.2, UserDefaults.standard.object(forKey: "imirror.scrollGain") as? Double ?? 2.0)
+            // Scale view-space scroll distance into device points and send one fast
+            // swipe. Since the phone can't add inertia, `gain` amplifies the swipe
+            // length so a small trackpad push still travels a useful distance — it
+            // stacks on the view→device scale (~2.4x) and is live-tunable via the
+            // UserDefaults key "imirror.scrollGain".
+            let gain = Swift.max(0.2, UserDefaults.standard.object(forKey: "imirror.scrollGain") as? Double ?? 2.5)
             // viewDelta normalised: dy>0 = finger up = device pointer moves up (y down).
             var end = CGPoint(x: start.x + viewDelta.dx * gain * (size.width / videoRect.width),
                               y: start.y - viewDelta.dy * gain * (size.height / videoRect.height))
@@ -625,7 +627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             end.y = Swift.min(Swift.max(end.y, 0), size.height)
             let moved = ((end.x - start.x) * (end.x - start.x)
                        + (end.y - start.y) * (end.y - start.y)).squareRoot()
-            guard moved >= 50 else { return }          // below iOS momentum threshold
+            guard moved >= 20 else { return }          // skip imperceptible swipes
             self.wda?.drag(path: [start, end], flick: true)
         }
         previewView.onType = { [weak self] text in
