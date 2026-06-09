@@ -38,9 +38,11 @@ class FakeWDA:
     def __call__(self, method, path, body=None, timeout=None):
         self.calls.append((method, path, body))
         self.timeouts.append(timeout)
-        # Prefer an exact path match, then a suffix match (e.g. ".../actions"),
-        # then a plain substring — so "/session" doesn't shadow "/session/s/actions".
-        for match in (lambda k: k == path, path.endswith, lambda k: k in path):
+        # Match by exact path, then by suffix (".../actions", ".../window/size").
+        # No loose substring match: that let "/session" shadow both
+        # "/session/s/actions" and the "/session/s/appium/settings" call that
+        # _ensure_session now fires, consuming the wrong scripted reply.
+        for match in (lambda k: k == path, path.endswith):
             for key in sorted(self.replies, key=len, reverse=True):
                 if self.replies[key] and match(key):
                     return self.replies[key].pop(0)

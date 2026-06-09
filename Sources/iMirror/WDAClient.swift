@@ -41,7 +41,13 @@ final class WDAClient {
     /// Creates a WDA session (system-wide, no specific app) and fetches the
     /// device's logical screen size in points.
     func connect(completion: @escaping (Result<CGSize, Error>) -> Void) {
-        let body: [String: Any] = ["capabilities": ["alwaysMatch": [:], "firstMatch": [[:]]]]
+        // shouldWaitForQuiescence:false is the single biggest latency win — measured
+        // on-device, it drops a swipe's /actions round-trip from ~1300ms to ~10-200ms.
+        // By default XCUITest blocks each gesture until the UI is "quiescent" (~1.2s
+        // after a scroll's animation). We don't need that wait: the user watches the
+        // live mirror, and agents can pass settle_ms when they need a stable frame.
+        let body: [String: Any] = ["capabilities": [
+            "alwaysMatch": ["shouldWaitForQuiescence": false], "firstMatch": [[:]]]]
         send("POST", "/session", body) { [weak self] _, json, error in
             guard let self else { return }
             if let error { completion(.failure(error)); return }
@@ -50,8 +56,22 @@ final class WDAClient {
                 return
             }
             self.sessionId = sid
+            self.applyFastGestureSettings(sid: sid)
             self.fetchWindowSize(completion: completion)
         }
+    }
+
+    /// Disable XCUITest's idle/animation wait so gestures return promptly. THE big
+    /// latency win, measured on-device: a swipe over animating content drops from
+    /// ~13s to ~1s, and a static-list swipe from ~1.3s toward the ~10ms floor.
+    /// (XCUITest otherwise blocks each gesture until the app goes "idle"; over
+    /// autoplaying video it never does, so it waits out the full timeout.)
+    /// Best-effort, fire-and-forget — the WDA `appium/settings` route, set per
+    /// session right after connect. The shouldWaitForQuiescence capability is
+    /// ignored by this WDA build, so this endpoint is the working lever.
+    private func applyFastGestureSettings(sid: String) {
+        send("POST", "/session/\(sid)/appium/settings",
+             ["settings": ["waitForIdleTimeout": 0, "animationCoolOffTimeout": 0]]) { _, _, _ in }
     }
 
     private func fetchWindowSize(completion: @escaping (Result<CGSize, Error>) -> Void) {

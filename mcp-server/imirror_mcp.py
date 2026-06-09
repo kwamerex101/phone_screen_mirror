@@ -100,12 +100,26 @@ def _req(method: str, path: str, body: dict | None = None,
 def _ensure_session() -> str:
     if _session["id"]:
         return _session["id"]  # type: ignore[return-value]
+    # shouldWaitForQuiescence:false slashes gesture latency — measured on-device, a
+    # swipe's /actions drops from ~1300ms to ~10-200ms (XCUITest otherwise blocks each
+    # gesture until the UI settles). Use settle_ms on scroll/swipe when a following
+    # screenshot/source needs a stable, post-animation frame.
     code, j = _req("POST", "/session",
-                   {"capabilities": {"alwaysMatch": {}, "firstMatch": [{}]}})
+                   {"capabilities": {"alwaysMatch": {"shouldWaitForQuiescence": False},
+                                     "firstMatch": [{}]}})
     sid = (j.get("value") or {}).get("sessionId") or j.get("sessionId")
     if not sid:
         raise RuntimeError(f"WDA session create failed (HTTP {code}): {j}")
     _session["id"] = sid
+    # Disable XCUITest's idle/animation wait — the big latency win (a swipe over
+    # animating content drops ~13s -> ~1s, static lists ~1.3s -> near-instant).
+    # Best-effort; the capability above is ignored by this WDA build, but this
+    # per-session settings route is honored.
+    try:
+        _req("POST", f"/session/{sid}/appium/settings",
+             {"settings": {"waitForIdleTimeout": 0, "animationCoolOffTimeout": 0}}, timeout=5)
+    except Exception:
+        pass
     return sid
 
 
