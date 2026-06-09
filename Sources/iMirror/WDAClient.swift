@@ -129,7 +129,9 @@ final class WDAClient {
             ["type": "pointerDown", "button": 0],
         ]
         if flick {
-            steps.append(["type": "pointerMove", "duration": 80, "x": last.x, "y": last.y])
+            // 150ms = ~9 XCUITest interpolation frames: a visible slide, not a
+            // teleport. (Velocity is irrelevant — WDA can't trigger momentum.)
+            steps.append(["type": "pointerMove", "duration": 150, "x": last.x, "y": last.y])
         } else {
             let segments = max(1, path.count - 1)
             let perSegment = max(8, totalMs / segments)
@@ -155,26 +157,36 @@ final class WDAClient {
     /// after the hand stopped, reading as sticky lag — and an in-flight flick's iOS
     /// momentum already covers the user's intent.
     private var gestureInFlight = false
+    /// Read-only view for the health monitor so it can skip probing mid-gesture.
+    /// Set/cleared only on DispatchQueue.main — main-thread access only.
+    var isGestureInFlight: Bool { gestureInFlight }
+
+    /// Gesture request timeout: short enough to recover fast if WDA wedges, long
+    /// enough not to cancel a legitimately slow swipe on a heavy/throttled screen.
+    private let gestureTimeoutSec: TimeInterval = 4.0
 
     /// Sends an input request; a 404 means the session expired — drop it so the
-    /// next health probe recreates it transparently. Gesture posts (/actions) use a
-    /// short timeout and a single-in-flight guard; taps/keys/home are unaffected.
+    /// next health probe recreates it transparently. "Gesture" posts (/actions and
+    /// the home-screen press) use the short timeout and a single-in-flight guard so
+    /// they can't overlap and stall WDA; taps go through /actions too, so they're
+    /// covered. Keys are not gestures.
     private func sendInput(_ path: String, _ body: [String: Any]) {
-        let isGesture = path.hasSuffix("/actions")
+        let isGesture = path.hasSuffix("/actions") || path == "/wda/homescreen"
         if isGesture {
-            if gestureInFlight { return }
+            if gestureInFlight {
+                NSLog("[iMirror] gesture dropped — one already in flight: \(path)")
+                return
+            }
             gestureInFlight = true
-            // Backstop only — the request completion (below) is the real clear. This
+            // Backstop only — the request completion (below) is the real clear. It
             // MUST exceed the gesture request timeout, or it races a still-executing
-            // gesture and lets a second /actions fire concurrently, which stalls WDA
+            // gesture and lets a second one fire concurrently, which stalls WDA
             // (single XCUITest queue) and trips the health probe into a false .down.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + gestureTimeoutSec + 2) { [weak self] in
                 self?.gestureInFlight = false
             }
         }
-        // Gestures get a moderately short timeout for fast recovery if WDA wedges, but
-        // long enough not to cancel a legitimately slow swipe on a heavy screen.
-        send("POST", path, body, timeout: isGesture ? 4 : 8) { [weak self] code, _, _ in
+        send("POST", path, body, timeout: isGesture ? gestureTimeoutSec : 8) { [weak self] code, _, _ in
             DispatchQueue.main.async {
                 if isGesture { self?.gestureInFlight = false }
                 if code == 404 { self?.sessionId = nil }

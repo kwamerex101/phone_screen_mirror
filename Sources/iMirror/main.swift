@@ -47,6 +47,7 @@ final class PreviewView: NSView {
     private var downPoint: CGPoint?
     private var dragSamples: [(p: CGPoint, t: TimeInterval)] = []
     private var wheelAccum = CGVector(dx: 0, dy: 0)
+    private let kFlickWindowSec: TimeInterval = 0.08    // trailing window for flick velocity
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -93,12 +94,13 @@ final class PreviewView: NSView {
     private func releaseIsFlick() -> Bool {
         guard let b = dragSamples.last, dragSamples.count >= 2 else { return false }
         var i = dragSamples.count - 1
-        while i > 0 && b.t - dragSamples[i - 1].t < 0.08 { i -= 1 }
+        while i > 0 && b.t - dragSamples[i - 1].t < kFlickWindowSec { i -= 1 }
+        guard dragSamples.count - i >= 3 else { return false }   // too few samples → velocity unreliable
         let a = dragSamples[i]
         let dt = Swift.max(b.t - a.t, 1.0 / 240)            // guard against /0
         let dist = ((b.p.x - a.p.x) * (b.p.x - a.p.x)
                   + (b.p.y - a.p.y) * (b.p.y - a.p.y)).squareRoot()
-        return dist > 15 && dist / dt > 600                // view points/sec (tune)
+        return dist > 25 && dist / dt > 800                // view points/sec (tune)
     }
 
     /// Points to send for the gesture. For a flick, only the last ~100ms of travel,
@@ -108,7 +110,7 @@ final class PreviewView: NSView {
         guard flick, let b = dragSamples.last else { return dragSamples.map { $0.p } }
         var start = 0
         for i in stride(from: dragSamples.count - 1, through: 0, by: -1)
-        where b.t - dragSamples[i].t >= 0.10 { start = i; break }
+        where b.t - dragSamples[i].t >= kFlickWindowSec { start = i; break }
         return dragSamples[start...].map { $0.p }
     }
 
@@ -135,8 +137,13 @@ final class PreviewView: NSView {
         wheelAccum.dx += dx
         wheelAccum.dy += dy
         if event.phase.contains(.ended) {
-            let d = wheelAccum
+            var d = wheelAccum
             wheelAccum = .zero
+            // Dominant-axis dead zone: a near-vertical scroll shouldn't smear the
+            // content sideways (and vice-versa). Drop the minor axis when it's < 30%
+            // of the major; true diagonals (both axes comparable) pass through.
+            if abs(d.dx) < abs(d.dy) * 0.3 { d.dx = 0 }
+            else if abs(d.dy) < abs(d.dx) * 0.3 { d.dy = 0 }
             if (d.dx * d.dx + d.dy * d.dy).squareRoot() > 4 { onScroll?(at, d) }
         }
     }
@@ -619,7 +626,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             // length so a small trackpad push still travels a useful distance — it
             // stacks on the view→device scale (~2.4x) and is live-tunable via the
             // UserDefaults key "imirror.scrollGain".
-            let gain = Swift.max(0.2, UserDefaults.standard.object(forKey: "imirror.scrollGain") as? Double ?? 2.5)
+            let gain = Swift.max(0.2, UserDefaults.standard.object(forKey: "imirror.scrollGain") as? Double ?? 3.5)
             // viewDelta normalised: dy>0 = finger up = device pointer moves up (y down).
             var end = CGPoint(x: start.x + viewDelta.dx * gain * (size.width / videoRect.width),
                               y: start.y - viewDelta.dy * gain * (size.height / videoRect.height))
@@ -661,6 +668,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     private func probeNow() {
         guard !probing else { return }
+        // Don't probe mid-gesture: a probe GET contends with the in-flight /actions
+        // on WDA's single XCUITest queue and can time out into a false .down.
+        // gestureInFlight is set/cleared only on DispatchQueue.main — main-thread safe.
+        if wda?.isGestureInFlight == true { return }
         probing = true
         wda?.probe { [weak self] result in
             DispatchQueue.main.async {
@@ -706,14 +717,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         }
     }
 
+    private var downStatusWorkItem: DispatchWorkItem?
+    private var hadSuccessfulConnection = false
+
     private func setHealth(_ new: Health) {
         let changed = (new != health)
         health = new
-        updateHealthDot()
+        updateHealthDot()                       // dot colour is always instant
 
         switch new {
         case .connected:
             downSince = nil
+            hadSuccessfulConnection = true
+            downStatusWorkItem?.cancel(); downStatusWorkItem = nil
             controlSwitch.isEnabled = true
             homeItem?.isEnabled = true
             if changed {
@@ -721,6 +737,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
                 setStatus("WDA connected — \(Int(s.width))×\(Int(s.height)) pts. Flip Control to drive.")
             }
         case .connecting:
+            downStatusWorkItem?.cancel(); downStatusWorkItem = nil
             if changed { setStatus("Connecting to WDA…") }
         case .down:
             if downSince == nil { downSince = Date() }
@@ -732,10 +749,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             }
             controlSwitch.isEnabled = false
             homeItem?.isEnabled = false
+            // Debounce the *status text* by 6s: a brief probe blip during heavy
+            // scrolling flips health to .down for one cycle, and flashing
+            // "Starting WebDriverAgent…" on every scroll is alarming and wrong.
+            // The red dot already shows instantly above; only the text waits.
             if changed {
-                setStatus(transport.canSelfManage
-                    ? "Starting WebDriverAgent… (first launch can take ~20s)"
-                    : "WDA unreachable — run ./scripts/wda-up.sh")
+                downStatusWorkItem?.cancel()
+                let canManage = transport.canSelfManage
+                let reconnecting = hadSuccessfulConnection
+                let item = DispatchWorkItem { [weak self] in
+                    guard let self, self.health == .down else { return }
+                    self.setStatus(reconnecting ? "WDA reconnecting…"
+                        : (canManage ? "Starting WebDriverAgent… (first launch can take ~20s)"
+                                     : "WDA unreachable — run ./scripts/wda-up.sh"))
+                }
+                downStatusWorkItem = item
+                DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: item)
             }
         }
     }
