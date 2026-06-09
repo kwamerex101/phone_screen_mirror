@@ -34,6 +34,14 @@ not ready, tell the user to start the app rather than retrying blindly.
    is recorded before this. Runs are written under `~/.imirror/runs/` (override
    with the `IMIRROR_RUNS_DIR` env var).
 
+2a. **Name each section.** Call `ios_run_section(title)` at the start of each
+   logical area or scenario you test (e.g. "Sign in", "Money requests",
+   "Settings"). Everything recorded after it is grouped under that section in the
+   report's table of contents, with its own pass/fail rollup — this is what gives
+   the report a readable "what was tested" structure. Start a new section whenever
+   you move to a distinct area. (Optional but recommended; steps before the first
+   section fall into an implicit opening one.)
+
 3. **Drive the flow.** Use the normal tools — `ios_tap`, `ios_swipe`, `ios_type`,
    `ios_find_and_tap`, `ios_press_button`, `ios_wait_for`, `ios_orientation`. Each
    is logged automatically while the run is active. After `ios_orientation` flips
@@ -75,7 +83,8 @@ User: "Test the login flow and give me a report."
 
 1. `ios_status` → ready.
 2. `ios_start_run("login flow")`
-3. `ios_screenshot` (login screen) →
+3. `ios_run_section("Sign in")` →
+   `ios_screenshot` (login screen) →
    `ios_find_and_tap("Email")` → `ios_type("user@example.com")` →
    `ios_find_and_tap("Password")` → `ios_type("hunter2")` →
    `ios_find_and_tap("Sign In")`

@@ -285,6 +285,72 @@ def test_failed_note_marks_report_fail(mod, wda, monkeypatch, tmp_path):
     assert ">FAIL<" in htmltext
 
 
+def test_run_section_requires_active_run(mod):
+    with pytest.raises(RuntimeError, match="No active run"):
+        mod.ios_run_section("Login")
+
+
+def test_run_section_groups_steps_and_builds_toc(mod, wda, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}))
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+
+    mod.ios_start_run("wallet checks")
+    out = mod.ios_run_section("Money requests")
+    assert "Money requests" in out
+    mod.ios_tap(1, 2)
+    mod.ios_run_note("request shows correct amount", status="pass")
+    mod.ios_run_section("Admin removal")
+    mod.ios_run_note("empty state copy wrong", status="fail")
+    report = mod.ios_finish_run(video="none")
+
+    htmltext = open(report, encoding="utf-8").read()
+    # both section titles rendered, and a table of contents links to anchors
+    assert "Money requests" in htmltext and "Admin removal" in htmltext
+    assert 'class="toc"' in htmltext
+    assert 'href="#sec-' in htmltext and 'id="sec-' in htmltext
+    # per-section rollup: the failing section's status shows FAIL, passing one PASS
+    assert ">FAIL<" in htmltext
+    # overall verdict is FAIL because a section failed
+    assert htmltext.count("FAIL") >= 1
+
+
+def test_report_has_cover_and_summary_infographics(mod, wda, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    import base64
+    png = b"\x89PNG\r\n\x1a\nfakebytes"
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/status", (200, {"value": {"device": "iPhone 15", "os": {"version": "17.4"}}}))
+    wda.script("/screenshot", (200, {"value": base64.b64encode(png).decode()}))
+
+    mod.ios_start_run("smoke")
+    mod.ios_run_section("Home")
+    mod.ios_screenshot()
+    mod.ios_run_note("home ok", status="pass")
+    report = mod.ios_finish_run(video="none")
+
+    htmltext = open(report, encoding="utf-8").read()
+    # cover + summary infographic markers
+    assert 'class="summary"' in htmltext
+    assert "<svg" in htmltext          # donut / chart is inline SVG (no JS libs)
+    assert "Screenshots" in htmltext   # stat card label
+    assert "Sections" in htmltext
+
+
+def test_report_without_sections_still_renders(mod, wda, monkeypatch, tmp_path):
+    """Backward compatible: runs that never call ios_run_section group under a
+    single implicit section and still render TOC + summary."""
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}))
+    mod.ios_start_run("legacy")
+    mod.ios_run_note("did a thing", status="pass")
+    report = mod.ios_finish_run(video="none")
+    htmltext = open(report, encoding="utf-8").read()
+    assert ">PASS<" in htmltext
+    assert 'class="summary"' in htmltext
+    assert "did a thing" in htmltext
+
+
 def test_start_run_survives_status_failure(mod, monkeypatch, tmp_path):
     """A flaky /status during start must not abort recording."""
     monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
