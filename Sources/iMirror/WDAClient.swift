@@ -178,13 +178,17 @@ final class WDAClient {
         if isGesture {
             if gestureInFlight { return }
             gestureInFlight = true
-            // Safety reset in case a completion is ever dropped (covers the longest
-            // proportional flick + WDA overhead).
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            // Backstop only — the request completion (below) is the real clear. This
+            // MUST exceed the gesture request timeout, or it races a still-executing
+            // gesture and lets a second /actions fire concurrently, which stalls WDA
+            // (single XCUITest queue) and trips the health probe into a false .down.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
                 self?.gestureInFlight = false
             }
         }
-        send("POST", path, body, timeout: isGesture ? 2 : 8) { [weak self] code, _, _ in
+        // Gestures get a moderately short timeout for fast recovery if WDA wedges, but
+        // long enough not to cancel a legitimately slow swipe on a heavy screen.
+        send("POST", path, body, timeout: isGesture ? 4 : 8) { [weak self] code, _, _ in
             DispatchQueue.main.async {
                 if isGesture { self?.gestureInFlight = false }
                 if code == 404 { self?.sessionId = nil }
