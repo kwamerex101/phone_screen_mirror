@@ -108,19 +108,48 @@ final class WDAClient {
         ]))
     }
 
-    /// Drag through a path of device points (one continuous gesture). Following
-    /// the real path — rather than a straight start→end line — makes scrolling
-    /// and swipes track the cursor faithfully.
-    func drag(path: [CGPoint], totalMs: Int = 300) {
-        guard let sid = sessionId, let first = path.first else { return }
+    /// Drag through a path of device points (one continuous gesture).
+    ///
+    /// `flick = false` → faithful slow drag: replay the whole path so the content
+    /// tracks the cursor (precise dragging, picking, slow scrub).
+    ///
+    /// `flick = true` → throw a single fast straight swipe (first→last over a short
+    /// duration). The high pointer velocity makes iOS run its *own* scroll momentum
+    /// — the buttery deceleration you get from a finger flick — instead of us
+    /// replaying every point at real-time speed. This is the key smoothness lever
+    /// within WDA's scripted-gesture model (it can't stream realtime touch like
+    /// Apple's private iPhone-Mirroring HID path).
+    func drag(path: [CGPoint], flick: Bool = false, totalMs: Int = 300) {
+        guard let sid = sessionId, let first = path.first, let last = path.last else { return }
         var steps: [[String: Any]] = [
             ["type": "pointerMove", "duration": 0, "x": first.x, "y": first.y],
             ["type": "pointerDown", "button": 0],
         ]
-        let segments = max(1, path.count - 1)
-        let perSegment = max(8, totalMs / segments)
-        for p in path.dropFirst() {
-            steps.append(["type": "pointerMove", "duration": perSegment, "x": p.x, "y": p.y])
+        let dist = hypot(last.x - first.x, last.y - first.y)
+        if flick && dist >= 50 {
+            // Velocity-flick: a short swipe at a constant target velocity so iOS runs
+            // its OWN scroll momentum. Duration is proportional to distance (constant
+            // velocity), and three interpolation steps give the iOS velocity estimator
+            // enough samples to read the speed — a single step reads as near-zero.
+            //
+            // NOTE: pointerMove `duration` is XCUITest's W3C *interpolation* (move)
+            // time, not a sleep — valid on WDA >= 2022 (bundled is v9.9.0). A sleep-
+            // semantics build would teleport the pointer, collapsing the flick to a tap.
+            let targetVelocity = 1500.0                       // device pt/s
+            let durationMs = max(60, Int(dist / targetVelocity * 1000))
+            let per = max(8, durationMs / 3)
+            for f in [0.33, 0.66, 1.0] {
+                steps.append(["type": "pointerMove", "duration": per,
+                              "x": first.x + (last.x - first.x) * f,
+                              "y": first.y + (last.y - first.y) * f])
+            }
+        } else {
+            // Faithful slow drag: replay the whole path so content tracks the cursor.
+            let segments = max(1, path.count - 1)
+            let perSegment = max(8, totalMs / segments)
+            for p in path.dropFirst() {
+                steps.append(["type": "pointerMove", "duration": perSegment, "x": p.x, "y": p.y])
+            }
         }
         steps.append(["type": "pointerUp", "button": 0])
         sendInput("/session/\(sid)/actions", pointer(steps))
@@ -135,11 +164,31 @@ final class WDAClient {
         sendInput("/wda/homescreen", [:])
     }
 
+    /// True while a gesture POST (/actions) is outstanding. Concurrent gestures are
+    /// dropped rather than queued: serial HTTP round-trips would land hundreds of ms
+    /// after the hand stopped, reading as sticky lag — and an in-flight flick's iOS
+    /// momentum already covers the user's intent.
+    private var gestureInFlight = false
+
     /// Sends an input request; a 404 means the session expired — drop it so the
-    /// next health probe recreates it transparently.
+    /// next health probe recreates it transparently. Gesture posts (/actions) use a
+    /// short timeout and a single-in-flight guard; taps/keys/home are unaffected.
     private func sendInput(_ path: String, _ body: [String: Any]) {
-        send("POST", path, body) { [weak self] code, _, _ in
-            if code == 404 { self?.sessionId = nil }
+        let isGesture = path.hasSuffix("/actions")
+        if isGesture {
+            if gestureInFlight { return }
+            gestureInFlight = true
+            // Safety reset in case a completion is ever dropped (covers the longest
+            // proportional flick + WDA overhead).
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.gestureInFlight = false
+            }
+        }
+        send("POST", path, body, timeout: isGesture ? 2 : 8) { [weak self] code, _, _ in
+            DispatchQueue.main.async {
+                if isGesture { self?.gestureInFlight = false }
+                if code == 404 { self?.sessionId = nil }
+            }
         }
     }
 
@@ -155,6 +204,7 @@ final class WDAClient {
     // MARK: HTTP core (fresh connection per request)
 
     private func send(_ method: String, _ path: String, _ body: [String: Any]?,
+                      timeout: TimeInterval = 8,
                       completion: @escaping (Int?, [String: Any]?, Error?) -> Void) {
         var req = URLRequest(url: base.appendingPathComponent(path))
         req.httpMethod = method
@@ -163,7 +213,7 @@ final class WDAClient {
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         }
         let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 8
+        cfg.timeoutIntervalForRequest = timeout
         cfg.waitsForConnectivity = false
         cfg.httpMaximumConnectionsPerHost = 1
         let oneShot = URLSession(configuration: cfg)

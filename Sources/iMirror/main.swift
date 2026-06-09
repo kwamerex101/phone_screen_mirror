@@ -40,11 +40,13 @@ final class PreviewView: NSView {
 
     // View-space callbacks (AppDelegate transforms to device coordinates).
     var onTap: ((CGPoint) -> Void)?
-    var onDrag: (([CGPoint]) -> Void)?      // full drag path, view coords
+    var onDrag: (([CGPoint], _ flick: Bool) -> Void)?   // path + fast-release flag
+    var onScroll: ((_ at: CGPoint, _ delta: CGVector) -> Void)?  // trackpad scroll
     var onType: ((String) -> Void)?
 
     private var downPoint: CGPoint?
-    private var dragPath: [CGPoint] = []
+    private var dragSamples: [(p: CGPoint, t: TimeInterval)] = []
+    private var wheelAccum = CGVector(dx: 0, dy: 0)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -61,25 +63,85 @@ final class PreviewView: NSView {
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         downPoint = p
-        dragPath = [p]
+        dragSamples = [(p, event.timestamp)]
     }
 
     override func mouseDragged(with event: NSEvent) {
-        dragPath.append(convert(event.locationInWindow, from: nil))
+        dragSamples.append((convert(event.locationInWindow, from: nil), event.timestamp))
     }
 
     override func mouseUp(with event: NSEvent) {
         let up = convert(event.locationInWindow, from: nil)
         guard let down = downPoint else { return }
         downPoint = nil
+        dragSamples.append((up, event.timestamp))           // release point in the window + path
         let dx = up.x - down.x, dy = up.y - down.y
         if (dx * dx + dy * dy).squareRoot() > 6 {
-            onDrag?(dragPath)              // follow the actual path (scroll/swipe)
+            let flick = releaseIsFlick()
+            onDrag?(gesturePath(flick: flick), flick)
         } else {
             onTap?(up)
         }
-        dragPath = []
+        dragSamples = []
     }
+
+    /// True when the trailing ~80ms of travel is fast enough to read as a flick — so
+    /// the gesture is thrown as a quick swipe and iOS applies its own scroll momentum
+    /// instead of us replaying the slow path 1:1. The 80ms window matches iOS's own
+    /// gesture-velocity window and survives a single coalesced (~16ms) event.
+    private func releaseIsFlick() -> Bool {
+        guard let b = dragSamples.last, dragSamples.count >= 2 else { return false }
+        var i = dragSamples.count - 1
+        while i > 0 && b.t - dragSamples[i - 1].t < 0.08 { i -= 1 }
+        let a = dragSamples[i]
+        let dt = Swift.max(b.t - a.t, 1.0 / 240)            // guard against /0
+        let dist = ((b.p.x - a.p.x) * (b.p.x - a.p.x)
+                  + (b.p.y - a.p.y) * (b.p.y - a.p.y)).squareRoot()
+        return dist > 15 && dist / dt > 600                // view points/sec (tune)
+    }
+
+    /// Points to send for the gesture. For a flick, only the last ~100ms of travel,
+    /// so the swipe's origin is where the flick actually started — not an earlier
+    /// slow wander, which would encode the wrong angle and distance.
+    private func gesturePath(flick: Bool) -> [CGPoint] {
+        guard flick, let b = dragSamples.last else { return dragSamples.map { $0.p } }
+        var start = 0
+        for i in stride(from: dragSamples.count - 1, through: 0, by: -1)
+        where b.t - dragSamples[i].t >= 0.10 { start = i; break }
+        return dragSamples[start...].map { $0.p }
+    }
+
+    /// Two-finger trackpad scroll. Accumulate the finger distance and emit one quick
+    /// swipe when the user lifts (phase .ended) so the device runs its own momentum;
+    /// OS inertial frames are ignored. A legacy mouse wheel (no precise deltas, no
+    /// phase) instead emits an immediate nudge per tick. Direction is normalised via
+    /// isDirectionInvertedFromDevice (the authoritative Natural-Scroll flag): dy > 0
+    /// means the finger moved up, dx > 0 means it moved right.
+    override func scrollWheel(with event: NSEvent) {
+        if event.momentumPhase != [] { return }                       // iOS supplies the tail
+        if event.phase.contains(.cancelled) { wheelAccum = .zero; return }
+        let at = convert(event.locationInWindow, from: nil)
+        let inv = event.isDirectionInvertedFromDevice
+        let dx = inv ? event.scrollingDeltaX : -event.scrollingDeltaX
+        let dy = inv ? event.scrollingDeltaY : -event.scrollingDeltaY
+        if !event.hasPreciseScrollingDeltas {
+            // Legacy wheel: discrete ticks, no phase. Emit an immediate nudge.
+            let nudge = CGVector(dx: dx * 30, dy: dy * 30)
+            if (nudge.dx * nudge.dx + nudge.dy * nudge.dy).squareRoot() >= 8 { onScroll?(at, nudge) }
+            return
+        }
+        wheelAccum.dx += dx
+        wheelAccum.dy += dy
+        if event.phase.contains(.ended) {
+            let d = wheelAccum
+            wheelAccum = .zero
+            if (d.dx * d.dx + d.dy * d.dy).squareRoot() > 4 { onScroll?(at, d) }
+        }
+    }
+
+    /// Clear any buffered trackpad delta — call when control is disarmed so a stale
+    /// partial gesture can't fire a phantom swipe on re-enable.
+    func resetScroll() { wheelAccum = .zero }
 
     override func keyDown(with event: NSEvent) {
         // Map special keys to the characters XCUITest's typeText understands.
@@ -536,12 +598,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             guard let self, self.controlEnabled, let p = self.devicePoint(fromViewPoint: viewPoint) else { return }
             self.wda?.tap(at: p)
         }
-        previewView.onDrag = { [weak self] viewPath in
+        previewView.onDrag = { [weak self] viewPath, flick in
             guard let self, self.controlEnabled else { return }
             let devicePath = downsample(viewPath, max: 24)
                 .compactMap { self.devicePoint(fromViewPoint: $0) }
             guard devicePath.count >= 2 else { return }
-            self.wda?.drag(path: devicePath)
+            self.wda?.drag(path: devicePath, flick: flick)
+        }
+        previewView.onScroll = { [weak self] viewPoint, viewDelta in
+            guard let self, self.controlEnabled,
+                  let size = self.wda?.deviceSize,
+                  let start = self.devicePoint(fromViewPoint: viewPoint) else { return }
+            let videoRect = self.previewView.previewLayer.layerRectConverted(
+                fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
+            guard videoRect.width > 1, videoRect.height > 1 else { return }
+            // Scale view-space scroll distance into device points and throw it as a
+            // flick for momentum. `gain` stacks on top of the view→device scale
+            // (~2.4x), so it's modest here and live-tunable via the UserDefaults key
+            // "imirror.scrollGain" (the panel's suggested 18 didn't account for that
+            // scale — start low and tune on device).
+            let gain = Swift.max(0.2, UserDefaults.standard.object(forKey: "imirror.scrollGain") as? Double ?? 2.0)
+            // viewDelta normalised: dy>0 = finger up = device pointer moves up (y down).
+            var end = CGPoint(x: start.x + viewDelta.dx * gain * (size.width / videoRect.width),
+                              y: start.y - viewDelta.dy * gain * (size.height / videoRect.height))
+            end.x = Swift.min(Swift.max(end.x, 0), size.width)
+            end.y = Swift.min(Swift.max(end.y, 0), size.height)
+            let moved = ((end.x - start.x) * (end.x - start.x)
+                       + (end.y - start.y) * (end.y - start.y)).squareRoot()
+            guard moved >= 50 else { return }          // below iOS momentum threshold
+            self.wda?.drag(path: [start, end], flick: true)
         }
         previewView.onType = { [weak self] text in
             guard let self, self.controlEnabled else { return }
@@ -641,6 +726,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             if controlEnabled {
                 controlEnabled = false
                 controlSwitch.state = .off
+                previewView.resetScroll()
             }
             controlSwitch.isEnabled = false
             homeItem?.isEnabled = false
@@ -675,6 +761,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             return
         }
         controlEnabled = (controlSwitch.state == .on)
+        if !controlEnabled { previewView.resetScroll() }
         setStatus(controlEnabled
             ? "Control ON — clicks/keys drive the phone."
             : "Control off — mirror only.")
