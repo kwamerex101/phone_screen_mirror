@@ -6,7 +6,8 @@ locks the device).
 
 - **Video + audio** — live mirror, optional phone-audio playback (muted by
   default), record to mp4, full-resolution PNG screenshots.
-- **Control** — tap, drag/scroll, type, Home, driven from the preview.
+- **Control** — tap, drag, two-finger trackpad scroll (with flick detection),
+  type, Home, driven from the preview.
 - **Self-managed** — launch the app and it brings the control channel up itself
   (no Xcode, no sudo, no terminal). A toolbar health dot + auto-reconnect.
 
@@ -95,6 +96,16 @@ full-res screenshots. The capture is passive — the phone is never locked.
 to WebDriverAgent (XCUITest) as W3C pointer/key actions. Control is off by
 default and armed by the switch (only while the health dot is green).
 
+Scrolling is two-finger trackpad scroll (or click-drag): the gesture is mapped to
+a WDA swipe over the same path, respecting the system Natural-Scroll direction. A
+fast release is detected as a *flick* and sent as one quick swipe so the scroll
+jumps rather than crawling 1:1. Note WDA can't trigger iOS inertial momentum — a
+swipe moves content ~1:1 and stops on release — so distance comes from a longer
+swipe, not a faster one (the macOS momentum tail is intentionally dropped, since
+the phone can't coast). The XCUITest "wait for quiescence" idle-wait is disabled
+on session creation, which removes the multi-second stall that previously hit the
+first swipe of a session.
+
 **Self-managed transport.** On launch the app spawns `go-ios` as child processes
 and runs an in-process loopback relay:
 
@@ -107,7 +118,10 @@ iMirror (CFNetwork) → 127.0.0.1:8100 (relay) → :8101 (ios forward) --USB--> 
 
 Children run with a writable working dir (`~/Library/Application Support/iMirror`),
 auto-restart on crash, and a watchdog does a full-chain reset if WDA hangs
-(rate-limited so it can't wedge `testmanagerd`). The health dot shows
+(rate-limited so it can't wedge `testmanagerd`). Before each bring-up the app also
+sweeps any stray go-ios children left by a previously crashed instance — most
+often a tunnel reparented to `launchd` that would otherwise keep holding the
+device's RSD state and port 60105 and pin the dot on red. The health dot shows
 **green**/**yellow**/**red** and the app auto-reconnects.
 
 Why the relay: `go-ios forward` alone is incompatible with macOS CFNetwork
@@ -132,10 +146,12 @@ Supply-chain risk is treated as a first-class constraint:
 ## MCP server (drive the phone from Claude)
 
 [`mcp-server/`](mcp-server/) is an MCP server that lets an MCP client (e.g. Claude)
-control the device directly — screenshot, tap, swipe, type, hardware buttons,
-find-and-tap by text, accessibility source. Handy for testing flows on a real
-device without clicking the Mac UI. It talks to the same loopback WDA the app
-brings up (run the app + green dot first). See [mcp-server/README.md](mcp-server/README.md).
+control the device directly — screenshot, tap, swipe, scroll (by direction or
+until an element is visible), type, hardware buttons, find-and-tap / wait-for by
+text, orientation, accessibility source — plus opt-in HTML test-run reports with
+embedded screenshots and a timelapse. Handy for testing flows on a real device
+without clicking the Mac UI. It talks to the same loopback WDA the app brings up
+(run the app + green dot first). See [mcp-server/README.md](mcp-server/README.md).
 
 ## Packaging / distribution
 
@@ -163,17 +179,21 @@ with the App Sandbox; distribute the notarized DMG directly.
 
 - **Working:** video mirror, audio playback (Sound toggle — muted by default to
   avoid echo with the phone's own speaker), record, screenshot, and control (tap,
-  drag/scroll, type incl. backspace/return/tab, Home).
+  drag, two-finger trackpad scroll with flick detection, type incl.
+  backspace/return/tab, Home).
 - **macOS only** by design. Cross-platform would mean the libusb /
   `quicktime_video_hack` path — a different architecture.
 - **Latency:** video ~60–150 ms (USB capture); control adds a WDA round-trip
-  (tens–hundreds of ms per action — fine, not frame-tight).
+  (tens–hundreds of ms per action — fine, not frame-tight). Scrolling is not
+  frame-tight and has no inertial coast (a WDA limitation, not a tuning knob).
 - **Not reachable** (XCUITest limitation): App Switcher, Control Center, Siri.
 - **Landscape** adapts via WDA `window/size` (refreshed each poll) but hasn't been
   physically rotation-tested.
 - Relaunching the app in quick succession can briefly wedge the device's
   `testmanagerd`; the watchdog recovers within ~1–2 min, or just pause between
-  launches.
+  launches. A hard crash (rather than a clean quit) can orphan a go-ios child;
+  the next launch sweeps it automatically, but if the dot stays red, quitting and
+  relaunching forces a clean chain.
 
 ## Credits
 
