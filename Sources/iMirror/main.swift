@@ -124,6 +124,7 @@ final class PreviewView: NSView {
     override func scrollWheel(with event: NSEvent) {
         if event.momentumPhase != [] { return }                       // iOS supplies the tail
         if event.phase.contains(.cancelled) { wheelAccum = .zero; return }
+        if event.phase.contains(.began) { wheelAccum = .zero }        // drop any stale partial gesture
         let at = convert(event.locationInWindow, from: nil)
         let inv = event.isDirectionInvertedFromDevice
         let dx = inv ? event.scrollingDeltaX : -event.scrollingDeltaX

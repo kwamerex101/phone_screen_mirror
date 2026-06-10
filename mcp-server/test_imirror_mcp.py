@@ -31,9 +31,15 @@ class FakeWDA:
         self.calls: list[tuple[str, str, dict | None]] = []
         self.timeouts: list[float | None] = []
         self.replies: dict[str, list[tuple[int, dict]]] = {}
+        self.allowed: set[str] = set()
 
     def script(self, key: str, *responses: tuple[int, dict]):
         self.replies[key] = list(responses)
+
+    def allow(self, *suffixes: str):
+        """Let these route suffixes default-succeed (200, empty) without scripting.
+        Explicit opt-in keeps unscripted-route failures loud everywhere else."""
+        self.allowed.update(suffixes)
 
     def __call__(self, method, path, body=None, timeout=None):
         self.calls.append((method, path, body))
@@ -46,7 +52,14 @@ class FakeWDA:
             for key in sorted(self.replies, key=len, reverse=True):
                 if self.replies[key] and match(key):
                     return self.replies[key].pop(0)
-        return 200, {"value": {}}
+        # _ensure_session always fires this boilerplate; succeed it by default.
+        if path.endswith("/appium/settings"):
+            return 200, {"value": {}}
+        if any(path.endswith(s) for s in self.allowed):
+            return 200, {"value": {}}
+        # Anything else unscripted is a test bug or a silently renamed route —
+        # fail loudly instead of returning a fake success.
+        raise AssertionError(f"FakeWDA: unscripted call {method} {path}")
 
 
 @pytest.fixture()
@@ -139,6 +152,7 @@ def test_screenshot_raises_when_empty(mod, wda):
 # ---- gestures ------------------------------------------------------------------
 
 def test_tap_emits_pointer_sequence(mod, wda):
+    wda.allow("/actions")
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     mod.ios_tap(10, 20)
     actions = next(b for m, p, b in wda.calls if p.endswith("/actions"))
@@ -149,6 +163,7 @@ def test_tap_emits_pointer_sequence(mod, wda):
 
 
 def test_swipe_clamps_zero_duration(mod, wda):
+    wda.allow("/actions")
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     mod.ios_swipe(0, 0, 5, 5, duration_ms=0)
     actions = next(b for m, p, b in wda.calls if p.endswith("/actions"))
@@ -157,6 +172,7 @@ def test_swipe_clamps_zero_duration(mod, wda):
 
 
 def test_type_sends_char_list(mod, wda):
+    wda.allow("/wda/keys")
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     mod.ios_type("hi")
     body = next(b for m, p, b in wda.calls if p.endswith("/wda/keys"))
@@ -169,6 +185,7 @@ def test_press_button_rejects_unknown(mod, wda):
 
 
 def test_press_home_uses_homescreen_route(mod, wda):
+    wda.allow("/wda/homescreen")
     mod.ios_press_button("home")
     assert any(p == "/wda/homescreen" for m, p, _ in wda.calls)
 
@@ -176,6 +193,7 @@ def test_press_home_uses_homescreen_route(mod, wda):
 # ---- find / wait ---------------------------------------------------------------
 
 def test_find_and_tap_escapes_quotes(mod, wda):
+    wda.allow("/click")
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     wda.script("/element", (200, {"value": {"ELEMENT": "e1"}}))
     mod.ios_find_and_tap("O'Brien")
@@ -216,6 +234,7 @@ def test_wait_for_polls_then_succeeds(mod, monkeypatch):
 # ---- run recording & report ----------------------------------------------------
 
 def test_recording_off_by_default(mod, wda):
+    wda.allow("/actions")
     """Actions outside a run leave no trace and write nothing."""
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     mod.ios_tap(1, 2)
@@ -242,6 +261,7 @@ def test_run_note_validates_status(mod, wda, monkeypatch, tmp_path):
 
 
 def test_full_run_records_and_renders_report(mod, wda, monkeypatch, tmp_path):
+    wda.allow("/actions", "/wda/keys")
     import base64
     monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
     png = b"\x89PNG\r\n\x1a\nfakebytes"
@@ -291,6 +311,7 @@ def test_run_section_requires_active_run(mod):
 
 
 def test_run_section_groups_steps_and_builds_toc(mod, wda, monkeypatch, tmp_path):
+    wda.allow("/actions", "/wda/keys")
     monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
     wda.script("/status", (200, {"value": {}}))
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
@@ -399,6 +420,7 @@ def _swipe_points(wda):
 
 
 def test_ios_scroll_down_swipes_up(mod, wda):
+    wda.allow("/actions")
     import json
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     wda.script("/window/size", (200, {"value": {"width": 430, "height": 932}}))
@@ -411,6 +433,7 @@ def test_ios_scroll_down_swipes_up(mod, wda):
 
 
 def test_ios_scroll_up_swipes_down(mod, wda):
+    wda.allow("/actions")
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     wda.script("/window/size", (200, {"value": {"width": 430, "height": 932}}))
     mod.ios_scroll("up", distance_pct=40)
@@ -419,6 +442,7 @@ def test_ios_scroll_up_swipes_down(mod, wda):
 
 
 def test_ios_scroll_distance_floored(mod, wda):
+    wda.allow("/actions")
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     wda.script("/window/size", (200, {"value": {"width": 430, "height": 932}}))
     mod.ios_scroll("down", distance_pct=1)            # floored to 15%
@@ -434,6 +458,7 @@ def test_ios_scroll_rejects_bad_direction(mod, wda):
 
 
 def test_ios_scroll_clamps_to_bounds(mod, wda):
+    wda.allow("/actions")
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     wda.script("/window/size", (200, {"value": {"width": 430, "height": 932}}))
     mod.ios_scroll("down", distance_pct=100, y_pct=50)  # would overshoot screen
@@ -472,6 +497,7 @@ def test_ios_scroll_to_raises_after_cap(mod, monkeypatch):
 
 
 def test_swipe_settle_sleeps(mod, wda, monkeypatch):
+    wda.allow("/actions")
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     slept = []
     monkeypatch.setattr(mod.time, "sleep", lambda s: slept.append(s))
@@ -567,3 +593,89 @@ def test_timelapse_handles_ffmpeg_failure(mod, wda, monkeypatch, tmp_path):
     report = mod.ios_finish_run(video="gif")     # must not raise
     assert "ffmpeg failed" in open(report).read()
     assert mod._run["active"] is False
+
+
+# ---- verified-review fixes -------------------------------------------------------
+
+def test_orientation_set_invalidates_window_cache(mod, wda):
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/window/size", (200, {"value": {"width": 430, "height": 932}}),
+               (200, {"value": {"width": 932, "height": 430}}))
+    wda.script("/orientation", (200, {"value": {}}), (200, {"value": "LANDSCAPE"}))
+    assert mod._win_size() == (430.0, 932.0)
+    mod.ios_orientation("landscape")
+    # cache must be dropped: next _win_size re-queries and sees swapped dims
+    assert mod._win_size() == (932.0, 430.0)
+
+
+def test_find_element_escapes_backslash(mod, wda):
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/element", (200, {"value": {"ELEMENT": "e1"}}))
+    mod._find_element("end\\")
+    body = next(b for m, p, b in wda.calls if p.endswith("/element"))
+    # trailing backslash must be doubled so it can't eat the closing quote
+    assert "end\\\\" in body["value"]
+
+
+def test_press_home_raises_on_wda_error(mod, wda):
+    wda.script("/wda/homescreen", (500, {"value": "boom"}))
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        mod.ios_press_button("home")
+
+
+def test_find_and_tap_raises_on_click_error(mod, wda):
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/element", (200, {"value": {"ELEMENT": "e1"}}))
+    wda.script("/click", (500, {"value": "boom"}))
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        mod.ios_find_and_tap("Settings")
+
+
+def test_scroll_to_records_success(mod, wda, monkeypatch, tmp_path):
+    import json
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}))
+    mod.ios_start_run("r")
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: "e1")
+    json.loads(mod.ios_scroll_to("Privacy"))
+    assert any(s["action"] == "scroll_to" and "found after 0" in s["detail"]
+               for s in mod._run["steps"])
+
+
+def test_scroll_to_records_failure_as_fail_note(mod, wda, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}))
+    mod.ios_start_run("r")
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_scroll_once", lambda *a, **k: None)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+    with pytest.raises(RuntimeError):
+        mod.ios_scroll_to("Ghost", max_swipes=2)
+    fails = [s for s in mod._run["steps"] if s["action"] == "note" and s["note"] == "fail"]
+    assert fails and "NOT found" in fails[0]["detail"]
+
+
+def test_finish_run_deactivates_even_if_write_fails(mod, wda, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}))
+    mod.ios_start_run("r")
+    monkeypatch.setattr(mod, "_render_report", lambda **k: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(OSError):
+        mod.ios_finish_run(video="none")
+    assert mod._run["active"] is False  # recording stopped despite the failure
+
+
+def test_screenshot_cap_stops_saving(mod, wda, monkeypatch, tmp_path):
+    import base64, os as _os
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    monkeypatch.setenv("IMIRROR_MAX_RUN_SHOTS", "2")
+    png = base64.b64encode(b"\x89PNGfake").decode()
+    wda.script("/status", (200, {"value": {}}))
+    wda.script("/screenshot", *[(200, {"value": png})] * 4)
+    mod.ios_start_run("capped")
+    for _ in range(4):
+        mod.ios_screenshot()                      # all 4 still return an image
+    saved = [f for f in _os.listdir(mod._run["dir"]) if f.endswith(".png")]
+    assert len(saved) == 2                        # only the first 2 persisted
+    notes = [s for s in mod._run["steps"] if s["action"] == "note"]
+    assert len(notes) == 1 and "cap reached" in notes[0]["detail"]

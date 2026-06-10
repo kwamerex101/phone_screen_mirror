@@ -47,6 +47,9 @@ final class ManagedProcess {
     private let workDir: URL
     private var process: Process?
     private var stopped = false
+    // `stopped`/`process` are touched from the caller's thread, the spawn-delay
+    // queue, AND Process.terminationHandler's private queue — guard every access.
+    private let lock = NSLock()
 
     init(binary: URL, args: [String], label: String, restartDelay: TimeInterval, workDir: URL) {
         self.binary = binary
@@ -56,23 +59,32 @@ final class ManagedProcess {
         self.workDir = workDir
     }
 
+    private var isStopped: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return stopped
+    }
+
     func start() {
-        stopped = false
+        lock.lock(); stopped = false; lock.unlock()
         spawn()
     }
 
     func stop() {
+        lock.lock()
         stopped = true
-        process?.terminationHandler = nil
-        process?.terminate()
+        let p = process
         process = nil
+        lock.unlock()
+        p?.terminationHandler = nil
+        p?.terminate()
     }
 
     /// Kill the current instance so the termination handler respawns it. Used by
     /// the watchdog to recover a hung child (one that never exits on its own).
     func bounce() {
         NSLog("iMirror: bouncing \(label)")
-        process?.terminate()
+        lock.lock(); let p = process; lock.unlock()
+        p?.terminate()
     }
 
     private func spawn() {
@@ -96,16 +108,16 @@ final class ManagedProcess {
             p.standardError = FileHandle.nullDevice
         }
         p.terminationHandler = { [weak self] _ in
-            guard let self, !self.stopped else { return }
+            guard let self, !self.isStopped else { return }
             NSLog("iMirror: \(self.label) exited — restarting in \(Int(self.restartDelay))s")
             DispatchQueue.global().asyncAfter(deadline: .now() + self.restartDelay) { [weak self] in
-                guard let self, !self.stopped else { return }
+                guard let self, !self.isStopped else { return }
                 self.spawn()
             }
         }
         do {
             try p.run()
-            process = p
+            lock.lock(); process = p; lock.unlock()
             NSLog("iMirror: started \(label) (pid \(p.processIdentifier))")
         } catch {
             NSLog("iMirror: failed to start \(label): \(error.localizedDescription)")
@@ -225,15 +237,22 @@ final class Transport {
         }
     }
 
+    /// Bumped on every stop/restart. Delayed bring-up closures capture the value
+    /// at schedule time and abort if it moved — otherwise a stop() landing inside
+    /// startChildren()'s 8s window would still spawn runwda/forward as orphans
+    /// (handles not yet assigned, so nothing would ever stop them).
+    private var chainGeneration = 0
+
     /// Start the go-ios children in order: tunnel first, then (after it has had
     /// time to establish) runwda + forward.
     private func startChildren() {
         guard let bin = goios else { return }
+        let gen = chainGeneration
         tunnel = ManagedProcess(binary: bin, args: ["tunnel", "start", "--userspace"],
                                 label: "tunnel", restartDelay: 15, workDir: workDir)
         tunnel?.start()
         DispatchQueue.global().asyncAfter(deadline: .now() + 8) { [weak self] in
-            guard let self else { return }
+            guard let self, self.chainGeneration == gen else { return }
             self.wda = ManagedProcess(binary: bin, args: ["runwda"],
                                       label: "runwda", restartDelay: 6, workDir: self.workDir)
             self.wda?.start()
@@ -244,6 +263,7 @@ final class Transport {
     }
 
     func stop() {
+        chainGeneration += 1
         relay.stop()
         forward?.stop()
         wda?.stop()
@@ -256,6 +276,7 @@ final class Transport {
     /// This mirrors the manual recovery that reliably works.
     func restartChain() {
         NSLog("iMirror: restarting full go-ios chain")
+        chainGeneration += 1
         forward?.stop(); wda?.stop(); tunnel?.stop()
         forward = nil; wda = nil; tunnel = nil
         DispatchQueue.global().asyncAfter(deadline: .now() + 4) { [weak self] in
