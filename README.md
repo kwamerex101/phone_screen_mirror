@@ -207,6 +207,10 @@ tools, fetched into `tools/` at build time (see [SECURITY-AUDIT.md](SECURITY-AUD
 
 Distributions that bundle the `go-ios` binary should include its MIT notice.
 
+## Author
+
+Theophilus RexDanquah — [rexdanquah.dev](https://rexdanquah.dev)
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
