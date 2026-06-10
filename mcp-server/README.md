@@ -36,8 +36,10 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 
 ```bash
 python3 -m venv mcp-server/.venv
-mcp-server/.venv/bin/pip install "mcp[cli]"
+mcp-server/.venv/bin/pip install -r mcp-server/requirements.txt pytest
 ```
+
+(`requirements.txt` pins `mcp[cli]`; `pytest` is for the unit suite below.)
 
 Register with Claude Code (run from the repo root):
 

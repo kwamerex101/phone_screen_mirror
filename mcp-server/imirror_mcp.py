@@ -224,7 +224,9 @@ def _find_element(text: str, _retry: bool = True) -> str | None:
     on a stale 404.
     """
     sid = _ensure_session()
-    safe = text.replace("'", "\\'")
+    # Escape backslashes BEFORE quotes: input ending in \' would otherwise become
+    # \\' (escaped backslash + live quote) and break out of the predicate literal.
+    safe = text.replace("\\", "\\\\").replace("'", "\\'")
     predicate = f"label == '{safe}' OR name == '{safe}' OR value == '{safe}'"
     code, j = _req("POST", f"/session/{sid}/element",
                    {"using": "predicate string", "value": predicate})
@@ -281,10 +283,20 @@ def ios_screenshot() -> Image:
         raise RuntimeError(f"No screenshot returned: {j}")
     data = base64.b64decode(b64)
     if _run["active"]:
-        fname = f"{len(_run['steps']) + 1:03d}.png"
-        with open(os.path.join(_run["dir"], fname), "wb") as f:
-            f.write(data)
-        _record("screenshot", screenshot=fname)
+        # Cap saved screenshots per run so a looping agent can't fill the disk
+        # (~0.5 MB each). Past the cap the screenshot still returns to the caller;
+        # it just isn't persisted into the run.
+        cap = int(os.environ.get("IMIRROR_MAX_RUN_SHOTS", "500"))
+        saved = sum(1 for s in _run["steps"] if s["screenshot"])
+        if saved < cap:
+            fname = f"{len(_run['steps']) + 1:03d}.png"
+            with open(os.path.join(_run["dir"], fname), "wb") as f:
+                f.write(data)
+            _record("screenshot", screenshot=fname)
+        elif not _run.get("cap_noted"):
+            _run["cap_noted"] = True
+            _record("note", f"screenshot cap reached ({cap}); further shots not saved",
+                    note="info")
     return Image(data=data, format="png")
 
 
@@ -391,11 +403,15 @@ def ios_scroll_to(text: str, direction: str = "down", max_swipes: int = 10,
         _record("scroll_to", f"max_swipes {max_swipes} capped at 20")
     for n in range(cap + 1):
         if _find_element(text):
+            _record("scroll_to", f"'{text}' {direction}: found after {n} swipe(s)")
             return json.dumps({"found": True, "swipes": n})
         if n == cap:
             break
         _scroll_once(direction, distance_pct, 50, 50, 300)
         time.sleep(settle_ms / 1000.0)
+    # Recorded as a "note" so the failure counts in the report's pass/fail rollup.
+    _record("note", f"scroll_to '{text}' {direction}: NOT found after {cap} swipes",
+            note="fail")
     raise RuntimeError(f"Element '{text}' not found after {cap} swipes ({direction}).")
 
 
@@ -421,7 +437,9 @@ def ios_press_button(name: str = "home") -> str:
     if name not in allowed:
         raise RuntimeError(f"name must be one of {sorted(allowed)}")
     if name == "home":
-        _req("POST", "/wda/homescreen", {})
+        code, j = _req("POST", "/wda/homescreen", {})
+        if code >= 400:
+            raise RuntimeError(f"WDA error (HTTP {code}) pressing home: {j}")
     else:
         _session_post("/wda/pressButton", {"name": name})
     _record("press_button", name)
@@ -439,8 +457,9 @@ def ios_find_and_tap(text: str) -> str:
     eid = _find_element(text)
     if not eid:
         raise RuntimeError(f"No element matching '{text}'. Use ios_source to inspect.")
-    sid = _ensure_session()
-    _req("POST", f"/session/{sid}/element/{eid}/click", {})
+    # The click leg goes through _session_post so a stale-session 404 retries and a
+    # WDA error raises — returning "tapped" on a failed click would mislead the agent.
+    _session_post(f"/element/{eid}/click", {})
     _record("find_and_tap", text)
     return f"tapped element '{text}'"
 
@@ -481,6 +500,9 @@ def ios_orientation(set_to: str = "") -> str:
         if val not in allowed:
             raise RuntimeError(f"set_to must be one of {sorted(allowed)}")
         _session_post("/orientation", {"orientation": val})
+        # Width/height swap on rotation — drop the cached window size so the next
+        # ios_scroll computes its geometry from the new dimensions, not stale ones.
+        _window_cache.update(size=None, t=0.0)
         _record("orientation", f"set {val}")
     j = _session_get("/orientation")
     return json.dumps({"orientation": j.get("value")})
@@ -514,7 +536,7 @@ def ios_start_run(label: str = "test") -> str:
     except Exception:
         pass
     _run.update(active=True, dir=run_dir, label=label, started=time.time(),
-                device=device, ios=ios_ver, steps=[])
+                device=device, ios=ios_ver, steps=[], cap_noted=False)
     return f"recording run '{label}' -> {run_dir}"
 
 
@@ -572,11 +594,16 @@ def ios_finish_run(video: str = "gif") -> str:
     video = video.lower()
     if video not in {"none", "gif", "mp4"}:
         raise RuntimeError("video must be one of none / gif / mp4")
-    clip, clip_note = _make_timelapse(video)
-    path = os.path.join(_run["dir"], "report.html")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(_render_report(ended=time.time(), clip=clip, clip_note=clip_note))
-    _run["active"] = False
+    # Stop recording even if rendering/writing fails — otherwise later actions keep
+    # appending to a run the caller believes is finished. Steps stay in memory, so a
+    # failed write can still be retried out-of-band.
+    try:
+        clip, clip_note = _make_timelapse(video)
+        path = os.path.join(_run["dir"], "report.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(_render_report(ended=time.time(), clip=clip, clip_note=clip_note))
+    finally:
+        _run["active"] = False
     return path
 
 
