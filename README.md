@@ -1,8 +1,14 @@
+<div align="center">
+
 # iMirror
 
-Mirror a USB-connected iPhone to a macOS window **and control it from the Mac** —
-while the phone stays physically usable (unlike Apple's "iPhone Mirroring", which
-locks the device).
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Swift](https://img.shields.io/badge/Swift-F05138?logo=swift&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
+
+**Mirror a USB-connected iPhone to a macOS window and control it from the Mac — while the phone stays physically usable.**
+
+</div>
 
 - **Video + audio** — live mirror, optional phone-audio playback (muted by
   default), record to mp4, full-resolution PNG screenshots.
