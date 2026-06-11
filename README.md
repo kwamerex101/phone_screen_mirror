@@ -10,10 +10,26 @@
 
 </div>
 
+Unlike Apple's "iPhone Mirroring", the phone is never locked. iMirror is two
+tools in one:
+
+1. **A desktop mirror + remote control** — watch and drive the phone from a Mac
+   window.
+2. **An agent-driven test rig for real devices** — the bundled
+   [MCP server](mcp-server/) lets an AI agent (e.g. Claude) run test flows on the
+   physical phone — tap, scroll, type, assert by visible text — and emit a
+   self-contained HTML report with screenshots, pass/fail sections, and a
+   timelapse. Neither Appium nor Maestro packages real-device evidence reports
+   this way; in practice this is the most distinctive part of the project.
+
+Features:
+
 - **Video + audio** — live mirror, optional phone-audio playback (muted by
   default), record to mp4, full-resolution PNG screenshots.
 - **Control** — tap, drag, two-finger trackpad scroll (with flick detection),
   type, Home, driven from the preview.
+- **Agent control + test reports** — 17 `ios_*` MCP tools, opt-in run recording,
+  cover/TOC/infographics HTML reports (see [MCP server](#mcp-server-drive-the-phone-from-claude)).
 - **Self-managed** — launch the app and it brings the control channel up itself
   (no Xcode, no sudo, no terminal). A toolbar health dot + auto-reconnect.
 
@@ -30,6 +46,11 @@ orientation**, and tap/drag coordinates adapt automatically — verified in both
 portrait and landscape.
 
 ## Requirements
+
+Fair warning: **setup is developer-grade**. The app itself is launch-and-go, but
+the one-time WebDriverAgent install needs Xcode, a signing identity, and a USB
+cable — this is an Apple platform constraint, not a choice. After that one-time
+step, day-to-day use is just opening the app.
 
 - macOS 14+ (built/tested on macOS 26, Xcode 26, Swift 6.3)
 - An iPhone connected by USB, unlocked, "Trust This Computer" accepted, with
@@ -151,13 +172,23 @@ Supply-chain risk is treated as a first-class constraint:
 
 ## MCP server (drive the phone from Claude)
 
-[`mcp-server/`](mcp-server/) is an MCP server that lets an MCP client (e.g. Claude)
-control the device directly — screenshot, tap, swipe, scroll (by direction or
-until an element is visible), type, hardware buttons, find-and-tap / wait-for by
-text, orientation, accessibility source — plus opt-in HTML test-run reports with
-embedded screenshots and a timelapse. Handy for testing flows on a real device
-without clicking the Mac UI. It talks to the same loopback WDA the app brings up
-(run the app + green dot first). See [mcp-server/README.md](mcp-server/README.md).
+[`mcp-server/`](mcp-server/) turns the phone into an **agent-driven test rig**.
+An MCP client (e.g. Claude) controls the device directly — screenshot, tap,
+swipe, scroll (by direction or until an element is visible), type, hardware
+buttons, find-and-tap / wait-for by text, orientation, accessibility source —
+17 tools in all.
+
+The standout is **test-run recording**: the agent starts a run, names the
+sections it tests, asserts checkpoints as pass/fail, and finishes with a
+self-contained HTML report — cover page with verdict, pass/fail donut and stat
+cards, a failures-first panel, a "what was tested" table of contents, every
+step with embedded screenshots, and a looping timelapse of the whole run.
+Ask Claude to "test the login flow and give me a report" and you get reviewable
+evidence from a *real* device, not a simulator.
+
+It talks to the same loopback WDA the app brings up (run the app + green dot
+first). See [mcp-server/README.md](mcp-server/README.md) for the tool table and
+report walkthrough.
 
 ## Packaging / distribution
 
@@ -193,6 +224,12 @@ with the App Sandbox; distribute the notarized DMG directly.
   (tens–hundreds of ms per action — fine, not frame-tight). Scrolling is not
   frame-tight and has no inertial coast (a WDA limitation, not a tuning knob).
 - **Not reachable** (XCUITest limitation): App Switcher, Control Center, Siri.
+- **One device at a time** — the transport assumes a single phone and fixed
+  loopback ports (8100/8101). Multi-device would need per-device port plumbing.
+- **Maintenance reality:** control depends on go-ios + WebDriverAgent tracking
+  Apple's private wire protocols, so a new iOS major version can break the chain
+  until those projects catch up. Pinned versions in
+  [SECURITY-AUDIT.md](SECURITY-AUDIT.md) are what's actually tested.
 - **Landscape** adapts via WDA `window/size` (refreshed each poll) but hasn't been
   physically rotation-tested.
 - Relaunching the app in quick succession can briefly wedge the device's
