@@ -178,16 +178,28 @@ final class FrameGrabber: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     let queue = DispatchQueue(label: "imirror.frames")
     private let lock = NSLock()
     private var latest: CVPixelBuffer?
+    private var lastFrameAt = Date.distantPast
 
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        lock.lock(); latest = pb; lock.unlock()   // holds one frame; pool keeps the rest
+        lock.lock(); latest = pb; lastFrameAt = Date(); lock.unlock()   // holds one frame; pool keeps the rest
     }
 
     func snapshot() -> CVPixelBuffer? {
         lock.lock(); defer { lock.unlock() }; return latest
+    }
+
+    /// Reset the liveness clock — call when (re)binding a device so the frame
+    /// watchdog gives a fresh grace window instead of firing on the stale gap.
+    func markActive() { lock.lock(); lastFrameAt = Date(); lock.unlock() }
+
+    /// Seconds since the last delivered frame (or last markActive). The capture
+    /// watchdog uses this to detect a silently stalled stream (green WDA, black
+    /// mirror) that fires no runtime-error or disconnect notification.
+    var secondsSinceLastFrame: TimeInterval {
+        lock.lock(); defer { lock.unlock() }; return Date().timeIntervalSince(lastFrameAt)
     }
 }
 
@@ -245,6 +257,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private var downSince: Date?
     private var lastWDARestart: Date?
 
+    // Capture-pipe recovery (separate from WDA: the mirror is a CoreMediaIO/AVFoundation
+    // stream that can stall on USB churn without disconnecting the device, leaving a
+    // green WDA dot over a black screen).
+    private var captureWatchdogTimer: Timer?
+    private var lastCaptureRecovery: Date?
+
     // MARK: Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -254,12 +272,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         observeDeviceChanges()
         transport.start()        // spawn go-ios forward + in-process loopback relay
         startHealthMonitor()
+        startCaptureWatchdog()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
         healthTimer?.invalidate()
+        captureWatchdogTimer?.invalidate()
         transport.stop()
         if movieOutput.isRecording { movieOutput.stopRecording() }
         if session.isRunning { session.stopRunning() }
@@ -468,9 +488,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         NotificationCenter.default.addObserver(
             self, selector: #selector(deviceChanged),
             name: .AVCaptureDeviceWasDisconnected, object: nil)
+        // The capture session can fail or be interrupted without the device ever
+        // "disconnecting" (USB renegotiation, media services reset). Without these
+        // the mirror goes black and never recovers until the app is relaunched.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(sessionRuntimeError),
+            name: .AVCaptureSessionRuntimeError, object: session)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(sessionInterrupted),
+            name: .AVCaptureSessionWasInterrupted, object: session)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(sessionInterruptionEnded),
+            name: .AVCaptureSessionInterruptionEnded, object: session)
     }
 
     @objc private func deviceChanged(_ note: Notification) { refreshDevices() }
+
+    @objc private func sessionRuntimeError(_ note: Notification) {
+        let err = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
+        NSLog("[iMirror] AVCaptureSession runtime error: \(err?.localizedDescription ?? "unknown")")
+        DispatchQueue.main.async { [weak self] in self?.recoverCapture("runtime error") }
+    }
+
+    @objc private func sessionInterrupted(_ note: Notification) {
+        DispatchQueue.main.async { [weak self] in self?.setStatus("Mirror paused — capture interrupted.") }
+    }
+
+    @objc private func sessionInterruptionEnded(_ note: Notification) {
+        DispatchQueue.main.async { [weak self] in self?.recoverCapture("interruption ended") }
+    }
+
+    // MARK: Capture-pipe recovery
+
+    private func startCaptureWatchdog() {
+        let t = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.checkCaptureLiveness() }
+        RunLoop.main.add(t, forMode: .common)
+        captureWatchdogTimer = t
+    }
+
+    /// Detects a stalled mirror that fires no notification: a device is bound but
+    /// frames stopped arriving (or the session quietly stopped running). Rebinds
+    /// the input to restart the CoreMediaIO stream. Rate-limited so a device that
+    /// can't deliver (e.g. truly unplugged) isn't bounced every tick.
+    private func checkCaptureLiveness() {
+        guard currentInput != nil else { return }               // no device selected — nothing to recover
+        let stalled = frameGrabber.secondsSinceLastFrame > 5
+        let stopped = !session.isRunning
+        guard stalled || stopped else { return }
+        if let last = lastCaptureRecovery, Date().timeIntervalSince(last) < 8 { return }
+        recoverCapture(stopped ? "session stopped" : "no frames >5s")
+    }
+
+    /// Rebuild the current device's input (a fresh AVCaptureDeviceInput forces the
+    /// CMIO stream to re-establish) and ensure the session is running. Covers both
+    /// a stopped session (runtime error) and a silently dead stream (USB churn).
+    private func recoverCapture(_ reason: String) {
+        guard let device = currentInput?.device else { refreshDevices(); return }
+        lastCaptureRecovery = Date()
+        NSLog("[iMirror] recovering capture (\(reason)) on \(device.localizedName)")
+        switchToDevice(device)                                  // begin/commit config on main; rebinds input
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self, !self.session.isRunning else { return }
+            self.session.startRunning()
+        }
+    }
 
     private func refreshDevices() {
         discovery = AVCaptureDevice.DiscoverySession(
@@ -519,6 +600,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
                 if session.canAddInput(input) {
                     session.addInput(input)
                     currentInput = input
+                    frameGrabber.markActive()   // start the watchdog's grace window from this bind
                     setStatus("Mirroring \(device.localizedName) — phone stays usable.")
                     recordItem?.isEnabled = true
                     screenshotItem?.isEnabled = true
