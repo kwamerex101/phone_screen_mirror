@@ -188,6 +188,7 @@ final class Transport {
     private var tunnel: ManagedProcess?
     private var wda: ManagedProcess?
     private var forward: ManagedProcess?
+    private var runnerInstallAttempted = false
 
     init() {
         goios = locateGoIOS()
@@ -253,6 +254,7 @@ final class Transport {
         tunnel?.start()
         DispatchQueue.global().asyncAfter(deadline: .now() + 8) { [weak self] in
             guard let self, self.chainGeneration == gen else { return }
+            self.installRunnerIfMissing(bin: bin)
             self.wda = ManagedProcess(binary: bin, args: ["runwda"],
                                       label: "runwda", restartDelay: 6, workDir: self.workDir)
             self.wda?.start()
@@ -260,6 +262,40 @@ final class Transport {
                                           label: "forward", restartDelay: 3, workDir: self.workDir)
             self.forward?.start()
         }
+    }
+
+    /// Install the bundled branded WDA .ipa once per launch, and only if the runner
+    /// isn't already on the device. Guarded so it never re-runs on restartChain().
+    private func installRunnerIfMissing(bin: URL) {
+        guard !runnerInstallAttempted else { return }
+        runnerInstallAttempted = true
+        guard let ipa = Bundle.main.url(forResource: "WebDriverAgent", withExtension: "ipa") else {
+            return  // dev builds ship no bundled ipa; runner installed via build-wda.sh/Xcode
+        }
+        if runnerIsInstalled(bin: bin) { return }
+        let p = Process()
+        p.executableURL = bin
+        p.arguments = ["install", "--path=\(ipa.path)"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run(); p.waitUntilExit() }
+        catch { NSLog("iMirror: WDA install attempt failed: \(error.localizedDescription)") }
+    }
+
+    /// True if the branded runner id already appears in `ios apps --list`.
+    private func runnerIsInstalled(bin: URL) -> Bool {
+        let p = Process()
+        p.executableURL = bin
+        p.arguments = ["apps", "--list"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run(); p.waitUntilExit()
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                             encoding: .utf8) ?? ""
+            return out.contains("com.local.imirror.WebDriverAgentRunner")
+        } catch { return false }
     }
 
     func stop() {

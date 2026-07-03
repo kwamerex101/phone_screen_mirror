@@ -12,6 +12,7 @@
 # Usage:
 #   ./scripts/package.sh                 # auto-detect signing identity
 #   NOTARY_PROFILE=imirror ./scripts/package.sh   # also notarize + staple
+#   WITH_WDA=build/WebDriverAgent.ipa ./scripts/package.sh
 #
 # One-time notary profile setup (per machine):
 #   xcrun notarytool store-credentials imirror \
@@ -34,6 +35,18 @@ cp "$BIN" "$APP/Contents/MacOS/iMirror"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 [[ -f "$ROOT/Resources/AppIcon.icns" ]] && cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 [[ -x "$ROOT/tools/go-ios/bin/ios" ]] && cp "$ROOT/tools/go-ios/bin/ios" "$APP/Contents/Resources/ios"
+
+# Optional: bundle a pre-signed branded WDA .ipa so first run installs it with no Xcode.
+if [[ -n "${WITH_WDA:-}" ]]; then
+    [[ -f "$WITH_WDA" ]] || { echo "WITH_WDA=$WITH_WDA not found" >&2; exit 1; }
+    cp "$WITH_WDA" "$APP/Contents/Resources/WebDriverAgent.ipa"
+    echo "    bundled WDA ipa: $WITH_WDA"
+fi
+
+# Third-party license notices (WDA BSD-3-Clause, go-ios MIT) — required for redistribution.
+mkdir -p "$APP/Contents/Resources/licenses"
+cp "$ROOT/tools/WebDriverAgent/LICENSE" "$APP/Contents/Resources/licenses/WebDriverAgent-LICENSE.txt" 2>/dev/null || true
+cp "$ROOT/tools/go-ios/LICENSE"        "$APP/Contents/Resources/licenses/go-ios-LICENSE.txt" 2>/dev/null || true
 
 # Pick a signing identity.
 IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
