@@ -1063,6 +1063,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         mcpStatusLabel.font = .systemFont(ofSize: 11)
         mcpStatusLabel.textColor = .secondaryLabelColor
         mcpStatusLabel.preferredMaxLayoutWidth = 268
+        mcpStatusLabel.lineBreakMode = .byWordWrapping   // wrap, don't clip long status
+        mcpStatusLabel.maximumNumberOfLines = 0
+        mcpStatusLabel.usesSingleLineMode = false
+        mcpStatusLabel.cell?.wraps = true
+        mcpStatusLabel.cell?.isScrollable = false
         stack.addArrangedSubview(mcpStatusLabel)
         refreshMCP(updateLabel: true)
 
