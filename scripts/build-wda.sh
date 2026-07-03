@@ -17,15 +17,23 @@ DERIVED="$ROOT/build/wda-derived"
   || /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName iMirror' "$PLIST"
 
 echo "==> building rebranded WebDriverAgentRunner (bundle id com.local.imirror.WebDriverAgentRunner)"
+# Two Xcode-26 build accommodations for the vendored WDA:
+#   -allowProvisioningUpdates : lets automatic signing register the (new) branded
+#       App ID and mint a development profile — else "No profiles for '<id>' found".
+#   GCC_TREAT_WARNINGS_AS_ERRORS=NO : WDA's vendored XCTest PrivateHeaders trip
+#       clang's -Wreserved-identifier (35 errors on Xcode 26); this stops those
+#       warnings failing the build. (Do NOT also pass RUN_CLANG_STATIC_ANALYZER=NO
+#       or CLANG_ENABLE_EXPLICIT_MODULES=NO — they break WDA's header-map lookups.)
 xcodebuild build-for-testing \
     -project "$PROJ" \
     -scheme WebDriverAgentRunner \
     -destination 'generic/platform=iOS' \
     -derivedDataPath "$DERIVED" \
+    -allowProvisioningUpdates \
     PRODUCT_BUNDLE_IDENTIFIER=com.local.imirror.WebDriverAgentRunner \
-    PRODUCT_NAME=WebDriverAgentRunner \
     DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
-    CODE_SIGN_STYLE=Automatic
+    CODE_SIGN_STYLE=Automatic \
+    GCC_TREAT_WARNINGS_AS_ERRORS=NO
 
 # Package the runner .app into an installable .ipa (Payload/<App> then zip).
 PROD="$DERIVED/Build/Products/Debug-iphoneos"
