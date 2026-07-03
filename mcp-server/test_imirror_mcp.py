@@ -712,3 +712,31 @@ def test_app_state_maps_code_to_name(mod, wda):
     wda.script("/wda/apps/state", (200, {"value": 4}))
     out = json.loads(mod.ios_app_state("com.apple.Preferences"))
     assert out == {"bundleId": "com.apple.Preferences", "state": "foreground", "code": 4}
+
+
+# ---- url + clipboard -----------------------------------------------------------
+
+def test_open_url_posts_url(mod, wda):
+    wda.allow("/url")
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_open_url("myapp://path")
+    body = next(b for m, p, b in wda.calls if p.endswith("/url"))
+    assert body == {"url": "myapp://path"}
+
+
+def test_clipboard_set_base64_encodes(mod, wda):
+    import base64
+    wda.allow("/wda/setPasteboard")
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_clipboard_set("hello")
+    body = next(b for m, p, b in wda.calls if p.endswith("/wda/setPasteboard"))
+    assert body == {"content": base64.b64encode(b"hello").decode(),
+                    "contentType": "plaintext"}
+
+
+def test_clipboard_get_base64_decodes(mod, wda):
+    import base64
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/wda/getPasteboard",
+               (200, {"value": base64.b64encode(b"copied").decode()}))
+    assert mod.ios_clipboard_get() == "copied"

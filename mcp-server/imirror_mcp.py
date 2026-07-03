@@ -545,6 +545,42 @@ def ios_app_state(bundle_id: str) -> str:
     return json.dumps({"bundleId": bundle_id, "state": state, "code": code})
 
 
+@mcp.tool()
+def ios_open_url(url: str) -> str:
+    """Open a URL or deep link (https://… or myapp://…) on the device."""
+    _session_post("/url", {"url": url})
+    _record("open_url", url)
+    return f"opened {url}"
+
+
+@mcp.tool()
+def ios_clipboard_set(text: str) -> str:
+    """Set the device clipboard to `text`.
+
+    NOTE: iOS grants pasteboard access only while WebDriverAgent is foreground;
+    with another app in front this may be ignored — call after a WDA-owned screen
+    or expect a no-op.
+    """
+    b64 = base64.b64encode(text.encode()).decode()
+    _session_post("/wda/setPasteboard", {"content": b64, "contentType": "plaintext"})
+    _record("clipboard_set", repr(text))
+    return f"set clipboard ({len(text)} chars)"
+
+
+@mcp.tool()
+def ios_clipboard_get() -> str:
+    """Read the device clipboard (plaintext). Same foreground caveat as
+    ios_clipboard_set applies."""
+    j = _session_post("/wda/getPasteboard", {"contentType": "plaintext"})
+    raw = j.get("value") or ""
+    try:
+        text = base64.b64decode(raw).decode("utf-8", "replace")
+    except Exception:
+        text = raw
+    _record("clipboard_get", f"{len(text)} chars")
+    return text
+
+
 # ---- Test-run recording & report -----------------------------------------------
 
 @mcp.tool()
