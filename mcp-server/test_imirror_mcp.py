@@ -679,3 +679,36 @@ def test_screenshot_cap_stops_saving(mod, wda, monkeypatch, tmp_path):
     assert len(saved) == 2                        # only the first 2 persisted
     notes = [s for s in mod._run["steps"] if s["action"] == "note"]
     assert len(notes) == 1 and "cap reached" in notes[0]["detail"]
+
+
+# ---- app lifecycle -------------------------------------------------------------
+
+def test_launch_app_posts_bundle_id(mod, wda):
+    wda.allow("/wda/apps/launch")
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_launch_app("com.apple.Preferences")
+    body = next(b for m, p, b in wda.calls if p.endswith("/wda/apps/launch"))
+    assert body == {"bundleId": "com.apple.Preferences"}
+
+
+def test_terminate_app_posts_bundle_id(mod, wda):
+    wda.allow("/wda/apps/terminate")
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_terminate_app("com.apple.Preferences")
+    assert any(p.endswith("/wda/apps/terminate") for m, p, _ in wda.calls)
+
+
+def test_activate_app_posts_bundle_id(mod, wda):
+    wda.allow("/wda/apps/activate")
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_activate_app("com.apple.Preferences")
+    body = next(b for m, p, b in wda.calls if p.endswith("/wda/apps/activate"))
+    assert body == {"bundleId": "com.apple.Preferences"}
+
+
+def test_app_state_maps_code_to_name(mod, wda):
+    import json
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/wda/apps/state", (200, {"value": 4}))
+    out = json.loads(mod.ios_app_state("com.apple.Preferences"))
+    assert out == {"bundleId": "com.apple.Preferences", "state": "foreground", "code": 4}

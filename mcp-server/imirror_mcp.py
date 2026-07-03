@@ -508,6 +508,43 @@ def ios_orientation(set_to: str = "") -> str:
     return json.dumps({"orientation": j.get("value")})
 
 
+@mcp.tool()
+def ios_launch_app(bundle_id: str) -> str:
+    """Launch (or foreground) an app by bundle id, e.g. com.apple.Preferences."""
+    _session_post("/wda/apps/launch", {"bundleId": bundle_id})
+    _record("launch_app", bundle_id)
+    return f"launched {bundle_id}"
+
+
+@mcp.tool()
+def ios_terminate_app(bundle_id: str) -> str:
+    """Terminate a running app by bundle id."""
+    _session_post("/wda/apps/terminate", {"bundleId": bundle_id})
+    _record("terminate_app", bundle_id)
+    return f"terminated {bundle_id}"
+
+
+@mcp.tool()
+def ios_activate_app(bundle_id: str) -> str:
+    """Bring an already-running app to the foreground by bundle id."""
+    _session_post("/wda/apps/activate", {"bundleId": bundle_id})
+    _record("activate_app", bundle_id)
+    return f"activated {bundle_id}"
+
+
+@mcp.tool()
+def ios_app_state(bundle_id: str) -> str:
+    """Report an app's running state as JSON: not-installed / not-running /
+    background / foreground (WDA numeric code included)."""
+    j = _session_post("/wda/apps/state", {"bundleId": bundle_id})
+    code = j.get("value")
+    names = {0: "not-installed", 1: "not-running", 2: "background-suspended",
+             3: "background", 4: "foreground"}
+    state = names.get(code, f"unknown({code})")
+    _record("app_state", f"{bundle_id}: {state}")
+    return json.dumps({"bundleId": bundle_id, "state": state, "code": code})
+
+
 # ---- Test-run recording & report -----------------------------------------------
 
 @mcp.tool()
