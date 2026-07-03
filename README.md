@@ -28,7 +28,7 @@ Features:
   default), record to mp4, full-resolution PNG screenshots.
 - **Control** — tap, drag, two-finger trackpad scroll (with flick detection),
   type, Home, driven from the preview.
-- **Agent control + test reports** — 17 `ios_*` MCP tools, opt-in run recording,
+- **Agent control + test reports** — 27 `ios_*` MCP tools, opt-in run recording,
   cover/TOC/infographics HTML reports (see [MCP server](#mcp-server-drive-the-phone-from-claude)).
 - **Self-managed** — launch the app and it brings the control channel up itself
   (no Xcode, no sudo, no terminal). A toolbar health dot + auto-reconnect.
@@ -93,10 +93,22 @@ Then install WebDriverAgent on the device once (Xcode):
    cert on the phone when prompted. You can stop the test afterward — the app
    relaunches WDA itself (see below).
 
-   Note: on newer Xcode, WDA's vendored XCTest headers trip clang's
-   `-Wreserved-identifier`. Add `-Wno-reserved-identifier` to `WARNING_CFLAGS`
-   in `Configurations/IOSSettings.xcconfig` + the `project.pbxproj` if the build
-   fails on that.
+   Note: on newer Xcode (tested on Xcode 26), WDA's vendored XCTest headers trip
+   clang's `-Wreserved-identifier`; a GUI build needs `-Wno-reserved-identifier`
+   in `WARNING_CFLAGS`.
+
+   **Command-line / rebranded build:** [`scripts/build-wda.sh`](scripts/build-wda.sh)
+   builds, signs, and packages the runner into an installable `.ipa` from the
+   terminal — handling the Xcode 26 accommodations for you (`-allowProvisioningUpdates`,
+   warnings-as-errors off) — and rebrands its **bundle id** to
+   `com.local.imirror.WebDriverAgentRunner`, so the runner installs under your own
+   identity rather than `com.facebook.*` (the on-device display name/icon are a
+   known cosmetic follow-up — the runner still labels itself
+   "WebDriverAgentRunner-Runner"). Run it with your paid Team:
+   `DEVELOPMENT_TEAM=<TEAMID> ./scripts/build-wda.sh`, then install with
+   `tools/go-ios/bin/ios install --path=build/WebDriverAgent.ipa`. See the
+   [rebrand design](docs/2026-07-03-rebrand-wda-and-improvements-design.md) for the
+   why/how. (The macOS app's `runwda` is already wired to launch the branded id.)
 
 ## Run
 
@@ -175,8 +187,9 @@ Supply-chain risk is treated as a first-class constraint:
 [`mcp-server/`](mcp-server/) turns the phone into an **agent-driven test rig**.
 An MCP client (e.g. Claude) controls the device directly — screenshot, tap,
 swipe, scroll (by direction or until an element is visible), type, hardware
-buttons, find-and-tap / wait-for by text, orientation, accessibility source —
-17 tools in all.
+buttons, find-and-tap / wait-for by text, orientation, accessibility source,
+app lifecycle (launch / terminate / activate / state / install), deep links,
+clipboard, and pass/fail assertions — 27 tools in all.
 
 The standout is **test-run recording**: the agent starts a run, names the
 sections it tests, asserts checkpoints as pass/fail, and finishes with a
