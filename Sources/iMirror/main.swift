@@ -212,6 +212,7 @@ private extension NSToolbarItem.Identifier {
     static let audio      = NSToolbarItem.Identifier("audio")
     static let health     = NSToolbarItem.Identifier("health")
     static let control    = NSToolbarItem.Identifier("control")
+    static let settings   = NSToolbarItem.Identifier("settings")
     static let home       = NSToolbarItem.Identifier("home")
 }
 
@@ -226,6 +227,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     // Toolbar controls
     private let devicePopUp = NSPopUpButton(frame: .zero, pullsDown: false)
     private let controlSwitch = NSSwitch()
+    private let automationSwitch = NSSwitch()
+    private let settingsButton = NSButton()
+    private let settingsPopover = NSPopover()
+    private var settingsBuilt = false
     private let healthButton = NSButton()
     private var recordItem: NSToolbarItem!
     private var screenshotItem: NSToolbarItem!
@@ -250,6 +255,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private let transport = Transport()
     private var wda: WDAClient?
     private var controlEnabled = false
+    private var automationEnabled = false
     private var health: Health = .down
     private var healthTimer: Timer?
     private var probing = false
@@ -270,9 +276,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         buildWindow()
         requestCameraAccessThenStart()
         observeDeviceChanges()
-        transport.start()        // spawn go-ios forward + in-process loopback relay
-        startHealthMonitor()
+        // Automation (WebDriverAgent) is OFF by default: opening the app is pure
+        // view-only mirroring, so nothing runs on the phone and iOS shows no
+        // "Automation Running" overlay. Flip the Automation toggle to bring WDA up.
         startCaptureWatchdog()
+        updateHealthDot()        // grey — automation off
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -339,10 +347,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         devicePopUp.controlSize = .large
         devicePopUp.bezelStyle = .toolbar
 
-        // Control switch (iOS-style toggle)
+        // Control switch (iOS-style toggle) — arms sending taps; needs WDA connected.
         controlSwitch.target = self
         controlSwitch.action = #selector(toggleControl)
         controlSwitch.isEnabled = false
+
+        // Automation switch — starts/stops WebDriverAgent (and iOS's on-phone
+        // "Automation Running" overlay). Off by default: view-only until you opt in.
+        automationSwitch.target = self
+        automationSwitch.action = #selector(toggleAutomation)
+        automationSwitch.state = .off
 
         // Health dot — colored status, click to force a re-check
         healthButton.isBordered = false
@@ -353,6 +367,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         healthButton.target = self
         healthButton.action = #selector(forceProbe)
         healthButton.toolTip = "WDA status — click to re-check"
+
+        // Settings gear — opens the settings popover (automation, scroll speed, …).
+        settingsButton.isBordered = true
+        settingsButton.bezelStyle = .toolbar
+        settingsButton.imagePosition = .imageOnly
+        settingsButton.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Settings")
+        settingsButton.target = self
+        settingsButton.action = #selector(showSettings)
+        settingsButton.toolTip = "iMirror settings"
 
         let toolbar = NSToolbar(identifier: "iMirrorToolbar")
         toolbar.delegate = self
@@ -389,11 +412,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     // MARK: NSToolbarDelegate
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.device, .record, .screenshot, .audio, .flexibleSpace, .health, .control, .home]
+        [.device, .record, .screenshot, .audio, .flexibleSpace, .health, .control, .settings, .home]
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.device, .record, .screenshot, .audio, .health, .control, .home, .flexibleSpace, .space]
+        [.device, .record, .screenshot, .audio, .health, .control, .settings, .home, .flexibleSpace, .space]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier,
@@ -432,7 +455,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             controlItem.label = "Control"
             controlItem.toolTip = "Drive the phone from the preview (taps, swipes, typing)"
             controlItem.view = controlSwitch
+            // A custom-view toolbar item is dead in the narrow-window overflow menu;
+            // this menu form makes Control work there too.
+            let cmenu = NSMenuItem(title: "Control", action: #selector(toggleControlFromMenu), keyEquivalent: "")
+            cmenu.target = self
+            controlItem.menuFormRepresentation = cmenu
             return controlItem
+
+        case .settings:
+            let item = NSToolbarItem(itemIdentifier: .settings)
+            item.label = "Settings"
+            item.toolTip = "iMirror settings — automation (WDA), scroll speed, …"
+            item.view = settingsButton
+            let smenu = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: "")
+            smenu.target = self
+            item.menuFormRepresentation = smenu
+            return item
 
         case .home:
             homeItem = actionItem(.home, "Home", "house",
@@ -750,6 +788,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     @objc private func forceProbe() { probeNow() }
 
     private func probeNow() {
+        guard automationEnabled else { return }   // no WDA to probe when automation is off
         guard !probing else { return }
         // Don't probe mid-gesture: a probe GET contends with the in-flight /actions
         // on WDA's single XCUITest queue and can time out into a false .down.
@@ -777,7 +816,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     /// is probably hung (it never exits, so the crash-restart can't fire). Bounce
     /// it — rate-limited so rapid restarts can't wedge the device's testmanagerd.
     private func runWatchdog() {
-        guard transport.canSelfManage, health == .down, let since = downSince else { return }
+        guard automationEnabled, transport.canSelfManage, health == .down, let since = downSince else { return }
         guard Date().timeIntervalSince(since) >= 60 else { return }   // past normal boot time
         if let last = lastWDARestart, Date().timeIntervalSince(last) < 100 { return }
         lastWDARestart = Date()
@@ -853,6 +892,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     }
 
     private func updateHealthDot() {
+        guard automationEnabled else {
+            healthButton.contentTintColor = .systemGray
+            healthButton.toolTip = "Automation off — flip Automation on to control the phone"
+            return
+        }
         switch health {
         case .connected:
             healthButton.contentTintColor = .systemGreen
@@ -879,6 +923,115 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         setStatus(controlEnabled
             ? "Control ON — clicks/keys drive the phone."
             : "Control off — mirror only.")
+    }
+
+    /// Start or stop WebDriverAgent on demand. Off (default) = pure view-only
+    /// mirroring: no go-ios children, no XCUITest session, and no iOS "Automation
+    /// Running" overlay on the phone. On = bring the control channel up.
+    @objc private func toggleAutomation() {
+        automationEnabled = (automationSwitch.state == .on)
+        if automationEnabled {
+            setStatus("Automation ON — starting WebDriverAgent… "
+                    + "(iOS shows an \"Automation Running\" overlay on the phone).")
+            transport.start()        // spawn tunnel + runwda + forward + relay
+            startHealthMonitor()     // begin probing; dot goes yellow → green
+        } else {
+            // Tear everything down so nothing runs on the phone (the overlay clears).
+            controlEnabled = false
+            controlSwitch.state = .off
+            controlSwitch.isEnabled = false
+            previewView.resetScroll()
+            homeItem?.isEnabled = false
+            healthTimer?.invalidate(); healthTimer = nil
+            wda = nil
+            transport.stop()
+            health = .down; downSince = nil
+            updateHealthDot()        // grey — automation off
+            setStatus("Automation off — mirror only (no control, no on-phone overlay).")
+        }
+    }
+
+    /// Drive the Control switch from its overflow-menu form (custom-view toolbar
+    /// items are non-interactive in the narrow-window `»` menu on their own).
+    @objc private func toggleControlFromMenu() {
+        controlSwitch.state = (controlSwitch.state == .on) ? .off : .on
+        toggleControl()
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(toggleControlFromMenu) {
+            menuItem.state = controlEnabled ? .on : .off
+            return controlSwitch.isEnabled          // only armable once WDA is connected
+        }
+        return true
+    }
+
+    // MARK: Settings popover
+
+    @objc private func showSettings() {
+        if !settingsBuilt { buildSettingsPopover(); settingsBuilt = true }
+        if settingsPopover.isShown { settingsPopover.close(); return }
+        // Anchor to the gear when it's on screen; if it overflowed into the `»` menu
+        // its view is detached (no window), so fall back to the window content view.
+        let anchor: NSView = settingsButton.window != nil ? settingsButton : (window.contentView ?? settingsButton)
+        let edge: NSRectEdge = anchor === settingsButton ? .maxY : .minY
+        settingsPopover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: edge)
+    }
+
+    private func buildSettingsPopover() {
+        let pad: CGFloat = 16
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.edgeInsets = NSEdgeInsets(top: pad, left: pad, bottom: pad, right: pad)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let title = NSTextField(labelWithString: "iMirror Settings")
+        title.font = .boldSystemFont(ofSize: 14)
+        stack.addArrangedSubview(title)
+
+        let autoRow = NSStackView()
+        autoRow.orientation = .horizontal
+        autoRow.spacing = 8
+        autoRow.addArrangedSubview(NSTextField(labelWithString: "Automation (WebDriverAgent)"))
+        autoRow.addArrangedSubview(automationSwitch)
+        stack.addArrangedSubview(autoRow)
+
+        let cap = NSTextField(wrappingLabelWithString:
+            "On starts the control channel; iOS shows an “Automation Running” overlay on the phone. Off = view-only mirroring.")
+        cap.font = .systemFont(ofSize: 11)
+        cap.textColor = .secondaryLabelColor
+        cap.preferredMaxLayoutWidth = 260
+        stack.addArrangedSubview(cap)
+
+        let scrollRow = NSStackView()
+        scrollRow.orientation = .horizontal
+        scrollRow.spacing = 8
+        scrollRow.addArrangedSubview(NSTextField(labelWithString: "Scroll speed"))
+        let slider = NSSlider(value: UserDefaults.standard.object(forKey: "imirror.scrollGain") as? Double ?? 3.5,
+                              minValue: 0.5, maxValue: 6.0, target: self, action: #selector(scrollGainChanged(_:)))
+        slider.widthAnchor.constraint(equalToConstant: 150).isActive = true
+        scrollRow.addArrangedSubview(slider)
+        stack.addArrangedSubview(scrollRow)
+
+        let container = NSView()
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: container.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            container.widthAnchor.constraint(equalToConstant: 300),
+        ])
+        let vc = NSViewController()
+        vc.view = container
+        settingsPopover.contentViewController = vc
+        settingsPopover.behavior = .transient
+    }
+
+    @objc private func scrollGainChanged(_ sender: NSSlider) {
+        UserDefaults.standard.set(sender.doubleValue, forKey: "imirror.scrollGain")
     }
 
     @objc private func pressHome() {
