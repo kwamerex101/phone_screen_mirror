@@ -33,6 +33,12 @@ else
     echo "    WARNING: $GOIOS not found — app will fall back to scripts/wda-up.sh"
 fi
 
+# Bundle the MCP server so the in-app one-click MCP install works from the .app.
+mkdir -p "$APP/Contents/Resources/mcp-server"
+cp "$ROOT/mcp-server/imirror_mcp.py" "$APP/Contents/Resources/mcp-server/" 2>/dev/null || true
+[[ -f "$ROOT/mcp-server/requirements.txt" ]] && \
+    cp "$ROOT/mcp-server/requirements.txt" "$APP/Contents/Resources/mcp-server/" || true
+
 echo "==> ad-hoc signing (local dev)"
 codesign --force --sign - --timestamp=none "$APP"
 

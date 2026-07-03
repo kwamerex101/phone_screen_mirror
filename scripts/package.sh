@@ -36,6 +36,12 @@ cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 [[ -f "$ROOT/Resources/AppIcon.icns" ]] && cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 [[ -x "$ROOT/tools/go-ios/bin/ios" ]] && cp "$ROOT/tools/go-ios/bin/ios" "$APP/Contents/Resources/ios"
 
+# Bundle the MCP server so the in-app one-click MCP install works from a DMG.
+mkdir -p "$APP/Contents/Resources/mcp-server"
+cp "$ROOT/mcp-server/imirror_mcp.py" "$APP/Contents/Resources/mcp-server/" 2>/dev/null || true
+[[ -f "$ROOT/mcp-server/requirements.txt" ]] && \
+    cp "$ROOT/mcp-server/requirements.txt" "$APP/Contents/Resources/mcp-server/" || true
+
 # Optional: bundle a pre-signed branded WDA .ipa so first run installs it with no Xcode.
 if [[ -n "${WITH_WDA:-}" ]]; then
     [[ -f "$WITH_WDA" ]] || { echo "WITH_WDA=$WITH_WDA not found" >&2; exit 1; }

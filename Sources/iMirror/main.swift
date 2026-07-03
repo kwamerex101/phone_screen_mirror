@@ -231,6 +231,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private let settingsButton = NSButton()
     private let settingsPopover = NSPopover()
     private var settingsBuilt = false
+    private let mcpButton = NSButton()
+    private let mcpStatusLabel = NSTextField(labelWithString: "")
+    private var mcpInstalled = false
     private let healthButton = NSButton()
     private var recordItem: NSToolbarItem!
     private var screenshotItem: NSToolbarItem!
@@ -1015,6 +1018,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         scrollRow.addArrangedSubview(slider)
         stack.addArrangedSubview(scrollRow)
 
+        // MCP server section — one-click register with Claude Code / Claude Desktop.
+        let sep = NSBox(); sep.boxType = .separator
+        sep.translatesAutoresizingMaskIntoConstraints = false
+        sep.widthAnchor.constraint(equalToConstant: 268).isActive = true
+        stack.addArrangedSubview(sep)
+
+        let mcpTitle = NSTextField(labelWithString: "MCP server (drive from Claude)")
+        mcpTitle.font = .boldSystemFont(ofSize: 12)
+        stack.addArrangedSubview(mcpTitle)
+
+        let mcpCap = NSTextField(wrappingLabelWithString:
+            "Register the iMirror MCP server with Claude Code and Claude Desktop so an "
+          + "agent can drive the phone. (Turn Automation on for it to connect.)")
+        mcpCap.font = .systemFont(ofSize: 11)
+        mcpCap.textColor = .secondaryLabelColor
+        mcpCap.preferredMaxLayoutWidth = 268
+        stack.addArrangedSubview(mcpCap)
+
+        mcpButton.bezelStyle = .rounded
+        mcpButton.title = "Install MCP server"
+        mcpButton.target = self
+        mcpButton.action = #selector(toggleMCP)
+        stack.addArrangedSubview(mcpButton)
+
+        mcpStatusLabel.font = .systemFont(ofSize: 11)
+        mcpStatusLabel.textColor = .secondaryLabelColor
+        mcpStatusLabel.preferredMaxLayoutWidth = 268
+        stack.addArrangedSubview(mcpStatusLabel)
+        refreshMCPStatus()
+
         let container = NSView()
         container.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -1032,6 +1065,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     @objc private func scrollGainChanged(_ sender: NSSlider) {
         UserDefaults.standard.set(sender.doubleValue, forKey: "imirror.scrollGain")
+    }
+
+    /// Refresh the MCP install button off the main thread (detection may shell out).
+    private func refreshMCPStatus() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let installed = MCPInstaller.isInstalled()
+            DispatchQueue.main.async {
+                self.mcpInstalled = installed
+                self.mcpButton.title = installed ? "Uninstall MCP server" : "Install MCP server"
+            }
+        }
+    }
+
+    @objc private func toggleMCP() {
+        mcpButton.isEnabled = false
+        if mcpInstalled {
+            mcpStatusLabel.stringValue = "Removing…"
+            MCPInstaller.uninstall { [weak self] r in
+                guard let self else { return }
+                self.mcpStatusLabel.stringValue = r.message
+                self.mcpButton.isEnabled = true
+                self.refreshMCPStatus()
+            }
+        } else {
+            mcpStatusLabel.stringValue = "Installing… (first run sets up Python — up to ~30s)"
+            MCPInstaller.install(progress: { [weak self] msg in
+                self?.mcpStatusLabel.stringValue = msg
+            }, completion: { [weak self] r in
+                guard let self else { return }
+                self.mcpStatusLabel.stringValue = r.message
+                self.mcpButton.isEnabled = true
+                self.refreshMCPStatus()
+            })
+        }
     }
 
     @objc private func pressHome() {
