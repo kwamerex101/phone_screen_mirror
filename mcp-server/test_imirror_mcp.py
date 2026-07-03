@@ -740,3 +740,33 @@ def test_clipboard_get_base64_decodes(mod, wda):
     wda.script("/wda/getPasteboard",
                (200, {"value": base64.b64encode(b"copied").decode()}))
     assert mod.ios_clipboard_get() == "copied"
+
+
+# ---- install app (go-ios shell-out) --------------------------------------------
+
+def test_install_app_invokes_go_ios(mod, monkeypatch, tmp_path):
+    ipa = tmp_path / "App.ipa"; ipa.write_bytes(b"PK\x03\x04")
+    seen = {}
+    def fake_run(args, **kw):
+        seen["args"] = args
+        class R: returncode = 0; stderr = ""
+        return R()
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    out = mod.ios_install_app(str(ipa))
+    assert seen["args"][1] == "install" and f"--path={ipa}" in seen["args"]
+    assert "installed" in out
+
+
+def test_install_app_missing_file_raises(mod):
+    with pytest.raises(RuntimeError, match="No such file"):
+        mod.ios_install_app("/nope/x.ipa")
+
+
+def test_install_app_reports_go_ios_failure(mod, monkeypatch, tmp_path):
+    import subprocess
+    ipa = tmp_path / "App.ipa"; ipa.write_bytes(b"x")
+    def boom(args, **kw):
+        raise subprocess.CalledProcessError(1, args, stderr="device locked")
+    monkeypatch.setattr(mod.subprocess, "run", boom)
+    with pytest.raises(RuntimeError, match="install failed: device locked"):
+        mod.ios_install_app(str(ipa))

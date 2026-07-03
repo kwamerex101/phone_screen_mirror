@@ -581,6 +581,32 @@ def ios_clipboard_get() -> str:
     return text
 
 
+def _ios_bin() -> str:
+    """Path to the go-ios `ios` binary (bundled by the app, or on PATH)."""
+    return os.environ.get("IMIRROR_IOS_BIN", "ios")
+
+
+@mcp.tool()
+def ios_install_app(path: str) -> str:
+    """Install an .ipa (or .app) on the device via the bundled go-ios.
+
+    Requires the go-ios `ios` binary on PATH or IMIRROR_IOS_BIN, and a signature
+    already valid for the device. Shell-out (not WDA); degrades with a clear error
+    if go-ios is absent.
+    """
+    if not os.path.exists(path):
+        raise RuntimeError(f"No such file: {path}")
+    try:
+        subprocess.run([_ios_bin(), "install", f"--path={path}"],
+                       check=True, capture_output=True, text=True)
+    except FileNotFoundError as e:
+        raise RuntimeError("go-ios 'ios' binary not found (set IMIRROR_IOS_BIN).") from e
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"install failed: {(e.stderr or '').strip() or e}") from e
+    _record("install_app", path)
+    return f"installed {os.path.basename(path)}"
+
+
 # ---- Test-run recording & report -----------------------------------------------
 
 @mcp.tool()
