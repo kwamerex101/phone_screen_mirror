@@ -19,6 +19,19 @@
 import Foundation
 import Network
 
+// MARK: - Branded WDA runner identity
+//
+// The runner is rebranded to iMirror at build time (see scripts/build-wda.sh).
+// Xcode appends ".xctrunner" to the UI-test target's bundle id when it wraps it
+// into the runner .app, so go-ios is told the *suffixed* id. PRODUCT_NAME stays
+// WebDriverAgentRunner, so xctestConfig keeps the default name — but go-ios still
+// requires it explicitly whenever bundleid/testrunnerbundleid are set.
+enum WDAIdentity {
+    static let runnerBundleId = "com.local.imirror.WebDriverAgentRunner.xctrunner"
+    static let testRunnerBundleId = "com.local.imirror.WebDriverAgentRunner.xctrunner"
+    static let xctestConfig = "WebDriverAgentRunner.xctest"
+}
+
 // MARK: - Locate the bundled go-ios binary
 
 func locateGoIOS() -> URL? {
@@ -255,8 +268,13 @@ final class Transport {
         DispatchQueue.global().asyncAfter(deadline: .now() + 8) { [weak self] in
             guard let self, self.chainGeneration == gen else { return }
             self.installRunnerIfMissing(bin: bin)
-            self.wda = ManagedProcess(binary: bin, args: ["runwda"],
-                                      label: "runwda", restartDelay: 6, workDir: self.workDir)
+            self.wda = ManagedProcess(
+                binary: bin,
+                args: ["runwda",
+                       "--bundleid=\(WDAIdentity.runnerBundleId)",
+                       "--testrunnerbundleid=\(WDAIdentity.testRunnerBundleId)",
+                       "--xctestconfig=\(WDAIdentity.xctestConfig)"],
+                label: "runwda", restartDelay: 6, workDir: self.workDir)
             self.wda?.start()
             self.forward = ManagedProcess(binary: bin, args: ["forward", "8101", "8100"],
                                           label: "forward", restartDelay: 3, workDir: self.workDir)
