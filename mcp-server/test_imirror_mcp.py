@@ -818,3 +818,16 @@ def test_assert_failure_shows_in_report(mod, monkeypatch, tmp_path):
     report = mod.ios_finish_run(video="none")
     html = open(report, encoding="utf-8").read()
     assert "1 failures" in html and ">FAIL<" in html
+
+
+# ---- find-and-tap retry --------------------------------------------------------
+
+def test_find_and_tap_retries_until_present(mod, wda, monkeypatch):
+    wda.allow("/click")
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    seq = [None, "e1"]                       # absent, then appears
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: seq.pop(0))
+    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+    out = mod.ios_find_and_tap("Continue", retries=1)
+    assert "tapped" in out
+    assert seq == []                         # both attempts consumed

@@ -447,21 +447,28 @@ def ios_press_button(name: str = "home") -> str:
 
 
 @mcp.tool()
-def ios_find_and_tap(text: str) -> str:
+def ios_find_and_tap(text: str, retries: int = 0, retry_delay_s: float = 0.5) -> str:
     """Find an on-screen element by its visible label/name and tap it.
 
     Convenience for tapping by text instead of pixel coordinates (e.g. a button
-    titled "Settings"). Fails with a clear message if no matching element is
-    found — fall back to ios_source to inspect, or ios_tap with coordinates.
+    titled "Settings"). `retries` re-attempts the find (with `retry_delay_s`
+    between) to absorb a slow-appearing element; default 0 keeps single-shot
+    behavior. Fails with a clear message if no matching element is found — fall
+    back to ios_source to inspect, or ios_tap with coordinates.
     """
-    eid = _find_element(text)
-    if not eid:
-        raise RuntimeError(f"No element matching '{text}'. Use ios_source to inspect.")
-    # The click leg goes through _session_post so a stale-session 404 retries and a
-    # WDA error raises — returning "tapped" on a failed click would mislead the agent.
-    _session_post(f"/element/{eid}/click", {})
-    _record("find_and_tap", text)
-    return f"tapped element '{text}'"
+    attempt = 0
+    while True:
+        eid = _find_element(text)
+        if eid:
+            # The click leg goes through _session_post so a stale-session 404 retries
+            # and a WDA error raises — returning "tapped" on a failed click would mislead.
+            _session_post(f"/element/{eid}/click", {})
+            _record("find_and_tap", text)
+            return f"tapped element '{text}'"
+        if attempt >= retries:
+            raise RuntimeError(f"No element matching '{text}'. Use ios_source to inspect.")
+        attempt += 1
+        time.sleep(retry_delay_s)
 
 
 @mcp.tool()
