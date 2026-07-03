@@ -30,8 +30,11 @@ Features:
   type, Home, driven from the preview.
 - **Agent control + test reports** — 27 `ios_*` MCP tools, opt-in run recording,
   cover/TOC/infographics HTML reports (see [MCP server](#mcp-server-drive-the-phone-from-claude)).
-- **Self-managed** — launch the app and it brings the control channel up itself
-  (no Xcode, no sudo, no terminal). A toolbar health dot + auto-reconnect.
+- **View-only by default, control on demand** — the app opens as a pure mirror,
+  so nothing runs on the phone and iOS shows no "Automation Running" overlay. Turn
+  on **Automation** in the Settings (⚙) popover to bring WebDriverAgent up itself
+  (no Xcode, no sudo, no terminal) — a toolbar health dot + auto-reconnect. That
+  popover also has a scroll-speed control and a one-click **MCP server install**.
 
 The app code is dependency-free Swift (AppKit, AVFoundation, CoreImage,
 CoreMediaIO, Network). Control rides on two vetted, source-built tools —
@@ -118,10 +121,17 @@ Then install WebDriverAgent on the device once (Xcode):
 ```
 
 First launch prompts for **Camera** permission (the iOS screen-capture device is
-gated by the camera privilege — iMirror does not use the Mac camera). Grant it,
-pick the iPhone, and the toolbar health dot turns green within ~30 s. Flip the
-**Control** switch to drive the phone; **⤓ Shot** saves a screenshot; **● Record**
-captures mp4.
+gated by the camera privilege — iMirror does not use the Mac camera). Grant it and
+pick the iPhone — the mirror appears immediately. **⤓ Shot** saves a screenshot;
+**● Record** captures mp4.
+
+The app opens **view-only** — no automation, so iOS shows no "Automation Running"
+overlay on the phone. To drive it, open the **Settings (⚙)** popover and turn on
+**Automation**: WebDriverAgent comes up (health dot green within ~30 s), then flip
+the **Control** switch to send taps / swipes / typing from the preview. (On a
+narrow window, Control collapses into the toolbar's `»` overflow menu, where it
+still works.) The Settings popover also holds a scroll-speed slider and the
+one-click **MCP server install** described below.
 
 ## How it works
 
@@ -199,9 +209,18 @@ step with embedded screenshots, and a looping timelapse of the whole run.
 Ask Claude to "test the login flow and give me a report" and you get reviewable
 evidence from a *real* device, not a simulator.
 
-It talks to the same loopback WDA the app brings up (run the app + green dot
-first). See [mcp-server/README.md](mcp-server/README.md) for the tool table and
-report walkthrough.
+**One-click install.** The app's **Settings (⚙) → MCP server** section registers
+this server with your MCP client(s) in one click — it makes a Python venv
+(**requires Python 3.10+**; e.g. `brew install python`), installs `mcp[cli]`, and
+registers with both **Claude Code** (`claude mcp add`) and **Claude Desktop** (a
+safe merge into `claude_desktop_config.json` that leaves your other servers
+untouched). It shows installed status + version and flags when a re-register is
+needed. Prefer the manual route? See [mcp-server/README.md](mcp-server/README.md).
+
+It talks to the same loopback WDA the app brings up, so **turn on Automation**
+(Settings ⚙) and wait for the green dot before driving the phone. See
+[mcp-server/README.md](mcp-server/README.md) for the tool table and report
+walkthrough.
 
 ## Packaging / distribution
 
