@@ -100,11 +100,11 @@ Then install WebDriverAgent on the device once (Xcode):
    **Command-line / rebranded build:** [`scripts/build-wda.sh`](scripts/build-wda.sh)
    builds, signs, and packages the runner into an installable `.ipa` from the
    terminal — handling the Xcode 26 accommodations for you (`-allowProvisioningUpdates`,
-   warnings-as-errors off) — and rebrands its **bundle id** to
-   `com.local.imirror.WebDriverAgentRunner`, so the runner installs under your own
-   identity rather than `com.facebook.*` (the on-device display name/icon are a
-   known cosmetic follow-up — the runner still labels itself
-   "WebDriverAgentRunner-Runner"). Run it with your paid Team:
+   warnings-as-errors off) — and fully rebrands the runner: **bundle id**
+   (`com.local.imirror.WebDriverAgentRunner`), on-device **name** ("iMirror"), and
+   **app icon** (the same logo as the Mac app, applied as a post-build patch +
+   re-sign). So it installs as a first-class "iMirror" app under your own identity
+   rather than `com.facebook.*`. Run it with your paid Team:
    `DEVELOPMENT_TEAM=<TEAMID> ./scripts/build-wda.sh`, then install with
    `tools/go-ios/bin/ios install --path=build/WebDriverAgent.ipa`. See the
    [rebrand design](docs/2026-07-03-rebrand-wda-and-improvements-design.md) for the
