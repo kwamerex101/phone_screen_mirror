@@ -222,6 +222,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
                          AVCaptureFileOutputRecordingDelegate {
     private var window: NSWindow!
     private var previewView: PreviewView!
+    private var emptyStateView: NSView!
     private var statusLabel: NSTextField!
 
     // Toolbar controls
@@ -324,6 +325,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         wireInput()
         container.addSubview(previewView)
 
+        // Minimal empty state over the (black) preview when no iPhone is connected.
+        emptyStateView = makeEmptyStateView()
+        container.addSubview(emptyStateView)
+        NSLayoutConstraint.activate([
+            emptyStateView.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            emptyStateView.centerYAnchor.constraint(equalTo: container.centerYAnchor, constant: -24),
+            emptyStateView.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: 24),
+            emptyStateView.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -24),
+        ])
+
         let hud = PassthroughEffectView()
         hud.material = .hudWindow
         hud.blendingMode = .withinWindow
@@ -402,6 +413,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     // SF Symbol helper
     private func symbol(_ name: String, _ label: String) -> NSImage? {
         NSImage(systemSymbolName: name, accessibilityDescription: label)
+    }
+
+    /// Quiet, centered empty state shown over the black preview when no iPhone is
+    /// connected. A thin phone glyph + a title + a one-line hint — nothing loud.
+    private func makeEmptyStateView() -> NSView {
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: "iphone", accessibilityDescription: "No iPhone")?
+            .withSymbolConfiguration(.init(pointSize: 52, weight: .ultraLight))
+        icon.contentTintColor = .tertiaryLabelColor
+
+        let title = NSTextField(labelWithString: "No iPhone connected")
+        title.font = .systemFont(ofSize: 15, weight: .medium)
+        title.textColor = .secondaryLabelColor
+        title.alignment = .center
+
+        let hint = NSTextField(labelWithString: "Plug in via USB, unlock, and tap “Trust.”")
+        hint.font = .systemFont(ofSize: 12)
+        hint.textColor = .tertiaryLabelColor
+        hint.alignment = .center
+
+        let stack = NSStackView(views: [icon, title, hint])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 6
+        stack.setCustomSpacing(16, after: icon)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        return stack
     }
 
     private func actionItem(_ id: NSToolbarItem.Identifier, _ label: String,
@@ -660,6 +698,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             }
         }
         session.commitConfiguration()
+        emptyStateView?.isHidden = (currentInput != nil)   // hide once a phone is bound
     }
 
     // MARK: Recording
