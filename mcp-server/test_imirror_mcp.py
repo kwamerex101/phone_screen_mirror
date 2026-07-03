@@ -770,3 +770,51 @@ def test_install_app_reports_go_ios_failure(mod, monkeypatch, tmp_path):
     monkeypatch.setattr(mod.subprocess, "run", boom)
     with pytest.raises(RuntimeError, match="install failed: device locked"):
         mod.ios_install_app(str(ipa))
+
+
+# ---- assertions ----------------------------------------------------------------
+
+def test_assert_visible_passes_and_records_pass(mod, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "_req", lambda *a, **k: (200, {"value": {}}))
+    mod.ios_start_run("asserts")
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: "e1")
+    out = mod.ios_assert_visible("Welcome")
+    assert "PASS" in out
+    notes = [s for s in mod._run["steps"] if s["action"] == "note"]
+    assert notes and notes[-1]["note"] == "pass"
+
+
+def test_assert_visible_fails_records_fail_and_raises(mod, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "_req", lambda *a, **k: (200, {"value": {}}))
+    mod.ios_start_run("asserts")
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: None)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+    with pytest.raises(RuntimeError, match="ASSERT FAILED"):
+        mod.ios_assert_visible("Ghost", timeout_s=0)
+    fails = [s for s in mod._run["steps"] if s["action"] == "note" and s["note"] == "fail"]
+    assert fails and "Ghost" in fails[0]["detail"]
+
+
+def test_assert_not_visible_passes_when_absent(mod, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "_req", lambda *a, **k: (200, {"value": {}}))
+    mod.ios_start_run("asserts")
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: None)
+    out = mod.ios_assert_not_visible("Spinner")
+    assert "PASS" in out
+    assert mod._run["steps"][-1]["note"] == "pass"
+
+
+def test_assert_failure_shows_in_report(mod, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "_req", lambda *a, **k: (200, {"value": {}}))
+    mod.ios_start_run("report")
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: None)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+    with pytest.raises(RuntimeError):
+        mod.ios_assert_visible("Missing", timeout_s=0)
+    report = mod.ios_finish_run(video="none")
+    html = open(report, encoding="utf-8").read()
+    assert "1 failures" in html and ">FAIL<" in html

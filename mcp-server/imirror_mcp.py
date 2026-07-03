@@ -706,6 +706,46 @@ def ios_finish_run(video: str = "gif") -> str:
     return path
 
 
+@mcp.tool()
+def ios_assert_visible(text: str, timeout_s: float = 5.0) -> str:
+    """Assert an element with the given visible label/name/value is present.
+
+    Polls up to `timeout_s`. Records a PASS note on success or a FAIL note on
+    timeout (so it lands in the report's pass/fail rollup), then raises on failure.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    attempts = 0
+    while True:
+        attempts += 1
+        if _find_element(text):
+            _record("note", f"assert visible '{text}' (after {attempts} check(s))", note="pass")
+            return f"PASS: '{text}' is visible"
+        if time.monotonic() >= deadline:
+            _record("note", f"assert visible '{text}' — NOT found within {timeout_s}s", note="fail")
+            raise RuntimeError(f"ASSERT FAILED: '{text}' not visible within {timeout_s}s.")
+        time.sleep(0.5)
+
+
+@mcp.tool()
+def ios_assert_not_visible(text: str, timeout_s: float = 3.0) -> str:
+    """Assert an element with the given text is ABSENT (waits until it's gone).
+
+    Polls up to `timeout_s` for the element to disappear. Records PASS/FAIL note
+    like ios_assert_visible, then raises on failure.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    attempts = 0
+    while True:
+        attempts += 1
+        if not _find_element(text):
+            _record("note", f"assert not-visible '{text}' (after {attempts} check(s))", note="pass")
+            return f"PASS: '{text}' is not visible"
+        if time.monotonic() >= deadline:
+            _record("note", f"assert not-visible '{text}' — still present after {timeout_s}s", note="fail")
+            raise RuntimeError(f"ASSERT FAILED: '{text}' still visible after {timeout_s}s.")
+        time.sleep(0.5)
+
+
 def _make_timelapse(fmt: str) -> tuple[str | None, str]:
     """Stitch the run's screenshots into a timelapse. Returns (filename, note);
     filename is None when nothing was produced and note explains why."""
