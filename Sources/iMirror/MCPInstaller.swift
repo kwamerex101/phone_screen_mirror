@@ -50,8 +50,34 @@ enum MCPInstaller {
         let path = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
         return (r.code == 0 && FileManager.default.isExecutableFile(atPath: path)) ? path : nil
     }
-    private static func python3() -> String? {
-        resolve("python3", ["/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"])
+    /// A Python interpreter that is 3.10+ (mcp requires it; the system
+    /// /usr/bin/python3 is 3.9 and can't install mcp). Prefers Homebrew's pythons.
+    private static func pythonInterpreter() -> String? {
+        var candidates: [String] = []
+        for base in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            for v in ["3.13", "3.12", "3.11", "3.10"] { candidates.append("\(base)/python\(v)") }
+        }
+        candidates += ["/opt/homebrew/bin/python3", "/usr/local/bin/python3"]
+        for v in ["3.13", "3.12", "3.11", "3.10", "3"] {          // login-shell PATH lookups
+            let p = run("/bin/bash", ["-lc", "command -v python\(v)"])
+                .out.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !p.isEmpty { candidates.append(p) }
+        }
+        return candidates.first(where: isPython310Plus)
+    }
+
+    private static func isPython310Plus(_ path: String) -> Bool {
+        guard FileManager.default.isExecutableFile(atPath: path) else { return false }
+        let r = run(path, ["-c", "import sys; print(sys.version_info[:2] >= (3, 10))"])
+        return r.code == 0 && r.out.contains("True")
+    }
+
+    /// The meaningful line(s) of a pip/venv failure — the real ERROR is usually at
+    /// the top, above pip's "consider upgrading pip" notice (which .suffix() would show).
+    private static func firstError(_ out: String) -> String {
+        let errs = out.split(whereSeparator: \.isNewline)
+            .filter { $0.contains("ERROR") || $0.lowercased().contains("error:") }
+        return String((errs.isEmpty ? Substring(out) : Substring(errs.joined(separator: " "))).prefix(220))
     }
     private static func claudeCLI() -> String? {
         let home = NSHomeDirectory()
@@ -119,32 +145,33 @@ enum MCPInstaller {
         guard let script = scriptURL() else {
             return Result(ok: false, message: "Couldn't find imirror_mcp.py (repo or bundle).")
         }
-        guard let py = python3() else {
-            return Result(ok: false, message: "python3 not found — install Xcode Command Line Tools.")
-        }
-
-        // 1. venv + deps. Create the venv if missing; (re)install deps on first
-        //    setup or when updating (then with --upgrade to pull newer mcp[cli]).
-        let needVenv = !FileManager.default.isExecutableFile(atPath: venvPython.path)
-        if needVenv {
-            progress("Creating Python environment…")
+        // 1. venv + deps. mcp needs Python 3.10+, so (re)create the venv when it's
+        //    missing OR was built with an older Python (e.g. the system 3.9).
+        let venvUsable = isPython310Plus(venvPython.path)
+        if !venvUsable {
+            guard let interp = pythonInterpreter() else {
+                return Result(ok: false,
+                    message: "Need Python 3.10+ for mcp — install it (e.g. `brew install python`) and retry.")
+            }
+            progress("Creating Python environment (\(URL(fileURLWithPath: interp).lastPathComponent))…")
+            try? FileManager.default.removeItem(at: venvDir)          // clear any old/broken venv
             try? FileManager.default.createDirectory(at: venvDir.deletingLastPathComponent(),
                                                      withIntermediateDirectories: true)
-            let mk = run(py, ["-m", "venv", venvDir.path])
+            let mk = run(interp, ["-m", "venv", venvDir.path])
             guard mk.code == 0 else {
-                return Result(ok: false, message: "venv creation failed: \(mk.out.suffix(160))")
+                return Result(ok: false, message: "venv creation failed: \(firstError(mk.out))")
             }
         }
-        if needVenv || update {
+        if !venvUsable || update {
             progress(update ? "Updating dependencies…" : "Installing dependencies (mcp)…")
+            _ = run(venvPython.path, ["-m", "pip", "install", "--upgrade", "pip"])  // old pip can't resolve mcp
             let reqs = script.deletingLastPathComponent().appendingPathComponent("requirements.txt")
-            var pipArgs = ["-m", "pip", "install", "--quiet"]
-            if update { pipArgs.append("--upgrade") }
+            var pipArgs = ["-m", "pip", "install", "--upgrade"]
             if FileManager.default.fileExists(atPath: reqs.path) { pipArgs += ["-r", reqs.path] }
             else { pipArgs.append("mcp[cli]") }
             let pip = run(venvPython.path, pipArgs)
             guard pip.code == 0 else {
-                return Result(ok: false, message: "pip install failed: \(pip.out.suffix(160))")
+                return Result(ok: false, message: "pip install failed: \(firstError(pip.out))")
             }
         }
 
