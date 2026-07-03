@@ -10,6 +10,8 @@
 
 **Two independent parts.** Part 1 (Swift/Xcode/packaging) and Part 2 (Python MCP) share no code and can be landed/executed separately. Part 1 requires a Mac with Xcode + a connected device + a **paid** Apple Team to verify (cannot be validated headlessly). Part 2 is fully unit-testable with no device.
 
+**Part 1 lands as a unit.** Its three tasks are internally coupled: device bring-up only works when the *installed* runner's bundle id matches the *`runwda`* id. On a device already in use with the stock `com.facebook.*` runner, shipping any single Part-1 commit alone turns the health dot red. Execute in dependency order — **Task 1 (build the branded runner) → Task 2 (bundle + install it) → Task 3 (point `runwda` at it)** — and land all three together before testing on a real device.
+
 ## Global Constraints
 
 Copied verbatim from the design + CLAUDE.md — every task must honor these:
@@ -26,8 +28,8 @@ Copied verbatim from the design + CLAUDE.md — every task must honor these:
 | File | Responsibility | Part |
 |---|---|---|
 | `Sources/iMirror/Transport.swift` (modify) | `WDAIdentity` constants; branded `runwda` args; install-if-missing | 1 |
-| `scripts/build-wda.sh` (create) | Build WDA at the pinned tag with branded bundle id / display name / icon overrides | 1 |
-| `scripts/package.sh` (modify) | `--with-wda <ipa>` step that copies the signed branded `.ipa` into the app bundle | 1 |
+| `scripts/build-wda.sh` (create) | Build WDA at the pinned tag with branded bundle id / display name, emit an installable `.ipa` | 1 |
+| `scripts/package.sh` (modify) | `WITH_WDA` env step copying the signed `.ipa` into the bundle + third-party license notices | 1 |
 | `mcp-server/imirror_mcp.py` (modify) | New `ios_*` tools (app lifecycle, url, clipboard, install) + `ios_assert_*` + retry | 2 |
 | `mcp-server/test_imirror_mcp.py` (modify) | Unit tests for every new tool/feature (stubbed HTTP) | 2 |
 
@@ -37,79 +39,37 @@ Copied verbatim from the design + CLAUDE.md — every task must honor these:
 
 > These tasks are verified by `swift build` (compile) and, for install/branding, on a Mac with Xcode + device + paid Team. They have no pytest gate.
 
-### Task 1: Thread the branded runner bundle id through `runwda`
-
-**Files:**
-- Modify: `Sources/iMirror/Transport.swift` (add constants near top; change args at `:256-257`)
-
-**Interfaces:**
-- Produces: `enum WDAIdentity { static let runnerBundleId, testRunnerBundleId: String }` used by `startChildren()`.
-
-**Why:** `go-ios runwda` is called with no args and relies on the default id `com.facebook.WebDriverAgentRunner.xctrunner`. Once the runner is rebranded, bring-up needs the new id or the health dot stays red.
-
-- [ ] **Step 1: Add the identity constants.** After the imports block (after `import Network`, ~line 20) insert:
-
-```swift
-// MARK: - Branded WDA runner identity
-//
-// The runner is rebranded to iMirror at build time (see scripts/build-wda.sh).
-// Xcode appends ".xctrunner" to the UI-test target's bundle id when it wraps it
-// into the runner .app, so go-ios must be told the *suffixed* id. PRODUCT_NAME is
-// left as WebDriverAgentRunner, so --xctestconfig keeps its default and is omitted.
-enum WDAIdentity {
-    static let runnerBundleId = "com.local.imirror.WebDriverAgentRunner.xctrunner"
-    static let testRunnerBundleId = "com.local.imirror.WebDriverAgentRunner.xctrunner"
-}
-```
-
-- [ ] **Step 2: Pass the id to `runwda`.** Replace the `self.wda = ManagedProcess(...)` call at `Transport.swift:256-257` with:
-
-```swift
-            self.wda = ManagedProcess(
-                binary: bin,
-                args: ["runwda",
-                       "--bundleid=\(WDAIdentity.runnerBundleId)",
-                       "--testrunnerbundleid=\(WDAIdentity.testRunnerBundleId)"],
-                label: "runwda", restartDelay: 6, workDir: self.workDir)
-```
-
-- [ ] **Step 3: Compile.**
-
-Run: `swift build`
-Expected: build succeeds with no errors.
-
-- [ ] **Step 4: (Live, on a Mac + rebranded runner installed) confirm bring-up.** Launch iMirror; the toolbar health dot reaches green within ~30 s (go-ios finds the renamed runner via the new id).
-
-- [ ] **Step 5: Commit.**
-
-```bash
-git add Sources/iMirror/Transport.swift
-git commit -m "feat(transport): launch runwda with the branded iMirror runner bundle id"
-```
-
-### Task 2: Build script that rebrands WDA at build time (no fork)
+### Task 1: Build script that rebrands WDA and produces a signed `.ipa`
 
 **Files:**
 - Create: `scripts/build-wda.sh`
 
 **Interfaces:**
 - Consumes: `tools/WebDriverAgent` at the pinned tag; env `DEVELOPMENT_TEAM`.
-- Produces: a built, signed `WebDriverAgentRunner-Runner.app` / `.ipa` whose bundle id is `com.local.imirror.WebDriverAgentRunner` and whose display name is `iMirror`.
+- Produces: `build/WebDriverAgent.ipa` — a signed runner whose bundle id is `com.local.imirror.WebDriverAgentRunner` (device id `…​.xctrunner`) and whose on-device display name is `iMirror`.
+
+**Note (S3/S5):** the Runner target uses an explicit `INFOPLIST_FILE` with no `GENERATE_INFOPLIST_FILE`, so `INFOPLIST_KEY_CFBundleDisplayName` would be **ignored** — set the display name with PlistBuddy on the source `Info.plist` instead. A command-line `PRODUCT_BUNDLE_IDENTIFIER` override applies to *all* targets (WebDriverAgentLib gets the same base id); that is standard Appium practice and fine.
 
 - [ ] **Step 1: Write the script.** Create `scripts/build-wda.sh`:
 
 ```bash
 #!/usr/bin/env bash
 # Build WebDriverAgent at the pinned upstream tag, rebranded to iMirror, WITHOUT
-# forking: bundle id / display name are applied here as xcodebuild overrides so a
-# WDA version bump is just a re-clone + re-run of this script.
+# forking: bundle id + display name are applied here so a WDA version bump is just
+# a re-clone + re-run of this script. Produces a single installable .ipa.
 #
 # Requires: Xcode, a connected iPhone, and a PAID Apple Team (DEVELOPMENT_TEAM).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJ="$ROOT/tools/WebDriverAgent/WebDriverAgent.xcodeproj"
+PLIST="$ROOT/tools/WebDriverAgent/WebDriverAgentRunner/Info.plist"
 : "${DEVELOPMENT_TEAM:?set DEVELOPMENT_TEAM to your paid Apple Team id}"
 DERIVED="$ROOT/build/wda-derived"
+
+# Branded display name — the Runner uses an explicit Info.plist, so set it directly
+# (INFOPLIST_KEY_* only applies to generated plists). Idempotent Add-or-Set.
+/usr/libexec/PlistBuddy -c 'Add :CFBundleDisplayName string iMirror' "$PLIST" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName iMirror' "$PLIST"
 
 echo "==> building rebranded WebDriverAgentRunner (bundle id com.local.imirror.WebDriverAgentRunner)"
 xcodebuild build-for-testing \
@@ -119,46 +79,55 @@ xcodebuild build-for-testing \
     -derivedDataPath "$DERIVED" \
     PRODUCT_BUNDLE_IDENTIFIER=com.local.imirror.WebDriverAgentRunner \
     PRODUCT_NAME=WebDriverAgentRunner \
-    INFOPLIST_KEY_CFBundleDisplayName=iMirror \
     DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
     CODE_SIGN_STYLE=Automatic
 
-echo "==> built runner under: $DERIVED/Build/Products/Debug-iphoneos/"
-echo "    (WebDriverAgentRunner-Runner.app — bundle id com.local.imirror.WebDriverAgentRunner.xctrunner)"
+# Package the runner .app into an installable .ipa (Payload/<App> then zip).
+PROD="$DERIVED/Build/Products/Debug-iphoneos"
+RUNNER="$PROD/WebDriverAgentRunner-Runner.app"
+[[ -d "$RUNNER" ]] || { echo "runner app not found at $RUNNER" >&2; exit 1; }
+rm -rf "$ROOT/build/Payload" "$ROOT/build/WebDriverAgent.ipa"
+mkdir -p "$ROOT/build/Payload"
+cp -R "$RUNNER" "$ROOT/build/Payload/"
+( cd "$ROOT/build" && zip -qr WebDriverAgent.ipa Payload )
+rm -rf "$ROOT/build/Payload"
+echo "==> ipa: $ROOT/build/WebDriverAgent.ipa"
 ```
 
 - [ ] **Step 2: Make it executable.**
 
 Run: `chmod +x scripts/build-wda.sh`
 
-- [ ] **Step 3: (Live) build and verify the id.** With a device + `DEVELOPMENT_TEAM` set, run `./scripts/build-wda.sh`, then confirm the produced `*-Runner.app` has `CFBundleIdentifier = com.local.imirror.WebDriverAgentRunner.xctrunner` and `CFBundleDisplayName = iMirror`:
+- [ ] **Step 3: (Live) build and verify id + name + ipa.** With a device + `DEVELOPMENT_TEAM` set, run `./scripts/build-wda.sh`, then:
 
 ```bash
-/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
-  build/wda-derived/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app/Info.plist
+APP="build/wda-derived/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app"
+/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier'  "$APP/Info.plist"
+/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$APP/Info.plist"
+test -f build/WebDriverAgent.ipa && echo "ipa OK"
 ```
-Expected: `com.local.imirror.WebDriverAgentRunner.xctrunner`
+Expected: `com.local.imirror.WebDriverAgentRunner.xctrunner`, then `iMirror`, then `ipa OK`.
 
-- [ ] **Step 4: (Optional) add a branded icon.** Drop an `AppIcon` asset into the WDA Runner target's asset catalog before building (documented in the script header). Cosmetic; skip if no artwork yet.
+- [ ] **Step 4: (Optional) add a branded icon.** Drop an `AppIcon` asset into the WDA Runner target's asset catalog before building. Cosmetic; skip if no artwork yet.
 
 - [ ] **Step 5: Commit.**
 
 ```bash
 git add scripts/build-wda.sh
-git commit -m "build: rebrand WDA to iMirror at build time (bundle id + display name)"
+git commit -m "build: rebrand WDA to iMirror + emit installable ipa (bundle id + display name)"
 ```
 
-### Task 3: Bundle the signed `.ipa` and install it if missing
+### Task 2: Bundle the `.ipa`, ship license notices, install it if missing
 
 **Files:**
-- Modify: `scripts/package.sh` (add `--with-wda <ipa>` copy step)
-- Modify: `Sources/iMirror/Transport.swift` (install the bundled `.ipa` before `runwda` if the runner is absent)
+- Modify: `scripts/package.sh` (`WITH_WDA` copy step + third-party license notices)
+- Modify: `Sources/iMirror/Transport.swift` (install the bundled `.ipa` once per launch if the runner is absent)
 
 **Interfaces:**
-- Consumes: `WDAIdentity.runnerBundleId` (Task 1); a signed branded `.ipa` produced from Task 2.
+- Consumes: `build/WebDriverAgent.ipa` (Task 1); go-ios `ios apps --list` / `ios install`.
 - Produces: `iMirror.app/Contents/Resources/WebDriverAgent.ipa`; an `installRunnerIfMissing(bin:)` call in `startChildren()`.
 
-- [ ] **Step 1: Copy the `.ipa` into the bundle in `package.sh`.** In `scripts/package.sh`, in the "assembling app" block (right after the `ios` binary copy, ~`:36`), add:
+- [ ] **Step 1: Copy the `.ipa` + licenses into the bundle in `package.sh`.** In `scripts/package.sh`, in the "assembling app" block (right after the `ios` binary copy, ~`:36`), add:
 
 ```bash
 # Optional: bundle a pre-signed branded WDA .ipa so first run installs it with no Xcode.
@@ -167,19 +136,29 @@ if [[ -n "${WITH_WDA:-}" ]]; then
     cp "$WITH_WDA" "$APP/Contents/Resources/WebDriverAgent.ipa"
     echo "    bundled WDA ipa: $WITH_WDA"
 fi
+
+# Third-party license notices (WDA BSD-3-Clause, go-ios MIT) — required for redistribution.
+mkdir -p "$APP/Contents/Resources/licenses"
+cp "$ROOT/tools/WebDriverAgent/LICENSE" "$APP/Contents/Resources/licenses/WebDriverAgent-LICENSE.txt" 2>/dev/null || true
+cp "$ROOT/tools/go-ios/LICENSE"        "$APP/Contents/Resources/licenses/go-ios-LICENSE.txt" 2>/dev/null || true
 ```
 
-Header usage note (add near the top usage comment): `WITH_WDA=path/to/WebDriverAgent.ipa ./scripts/package.sh`. The `.ipa` is already signed with the paid Team and is **not** re-signed with the Mac Developer ID.
+Header usage note (add near the top usage comment): `WITH_WDA=build/WebDriverAgent.ipa ./scripts/package.sh`. The `.ipa` is already signed with the paid Team and is **not** re-signed with the Mac Developer ID.
 
-- [ ] **Step 2: Install-if-missing in the Mac app.** In `Transport.swift`, add a helper and call it from `startChildren()` before creating the `runwda` process. Add the helper near `locateGoIOS()`:
+- [ ] **Step 2: Install-if-missing in the Mac app.** In `Transport.swift`, add the helpers near `locateGoIOS()` and a once-per-launch guard field on the transport type. `ios install` always re-transfers (it is *not* a no-op), so this must run at most once per launch and never repeatedly on the watchdog `restartChain()` path:
 
 ```swift
-/// Install the bundled branded WDA .ipa if the runner isn't on the device yet.
-/// Best-effort and idempotent: `ios install` no-ops when already installed.
+private var runnerInstallAttempted = false
+
+/// Install the bundled branded WDA .ipa once per launch, and only if the runner
+/// isn't already on the device. Guarded so it never re-runs on restartChain().
 private func installRunnerIfMissing(bin: URL) {
+    guard !runnerInstallAttempted else { return }
+    runnerInstallAttempted = true
     guard let ipa = Bundle.main.url(forResource: "WebDriverAgent", withExtension: "ipa") else {
-        return  // dev builds have no bundled ipa; runner installed via Xcode
+        return  // dev builds ship no bundled ipa; runner installed via build-wda.sh/Xcode
     }
+    if runnerIsInstalled(bin: bin) { return }
     let p = Process()
     p.executableURL = bin
     p.arguments = ["install", "--path=\(ipa.path)"]
@@ -188,9 +167,25 @@ private func installRunnerIfMissing(bin: URL) {
     do { try p.run(); p.waitUntilExit() }
     catch { NSLog("iMirror: WDA install attempt failed: \(error.localizedDescription)") }
 }
+
+/// True if the branded runner id already appears in `ios apps --list`.
+private func runnerIsInstalled(bin: URL) -> Bool {
+    let p = Process()
+    p.executableURL = bin
+    p.arguments = ["apps", "--list"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do {
+        try p.run(); p.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                         encoding: .utf8) ?? ""
+        return out.contains("com.local.imirror.WebDriverAgentRunner")
+    } catch { return false }
+}
 ```
 
-Then in `startChildren()`, inside the delayed block just before `self.wda = ManagedProcess(...)` (Task 1's edit), add:
+Then in `startChildren()`, inside the delayed block just before `self.wda = ManagedProcess(...)` (Task 3's edit), add:
 
 ```swift
             self.installRunnerIfMissing(bin: bin)
@@ -201,13 +196,66 @@ Then in `startChildren()`, inside the delayed block just before `self.wda = Mana
 Run: `swift build`
 Expected: build succeeds.
 
-- [ ] **Step 4: (Live) fresh-device install.** On a dev-trusted device without the runner installed, build with `WITH_WDA=... ./scripts/package.sh`, launch the app, and confirm the branded runner installs and the health dot goes green — with no Xcode. (Developer-Mode enable + first trust/Local-Network prompts still require a human, as documented.)
+- [ ] **Step 4: (Live) fresh-device install.** On a dev-trusted device without the runner installed, build with `WITH_WDA=build/WebDriverAgent.ipa ./scripts/package.sh`, launch the app, and confirm the branded runner installs and (with Task 3 landed) the health dot goes green — no Xcode. (Developer-Mode enable + first trust/Local-Network prompts still require a human.)
 
 - [ ] **Step 5: Commit.**
 
 ```bash
 git add scripts/package.sh Sources/iMirror/Transport.swift
-git commit -m "feat: bundle + auto-install the branded WDA ipa (no Xcode on first run)"
+git commit -m "feat: bundle + auto-install the branded WDA ipa once per launch (no Xcode)"
+```
+
+### Task 3: Thread the branded runner id through `runwda`
+
+**Files:**
+- Modify: `Sources/iMirror/Transport.swift` (add constants near top; change args at `:256-257`)
+
+**Interfaces:**
+- Produces: `enum WDAIdentity { static let runnerBundleId, testRunnerBundleId, xctestConfig: String }` used by `startChildren()`.
+
+**Why:** `go-ios runwda` is currently called with no args. go-ios (`main.go:1951-1958`) falls back to the stock `com.facebook.*` defaults only when **all three** of `--bundleid`/`--testrunnerbundleid`/`--xctestconfig` are empty, and **errors out** ("either NONE … or ALL of them") if exactly one is missing — so the rebranded runner needs **all three** flags, or `runwda` fails and respawns forever on a red dot.
+
+- [ ] **Step 1: Add the identity constants.** After the imports block (after `import Network`, ~line 20) insert:
+
+```swift
+// MARK: - Branded WDA runner identity
+//
+// The runner is rebranded to iMirror at build time (see scripts/build-wda.sh).
+// Xcode appends ".xctrunner" to the UI-test target's bundle id when it wraps it
+// into the runner .app, so go-ios is told the *suffixed* id. PRODUCT_NAME stays
+// WebDriverAgentRunner, so xctestConfig keeps the default name — but go-ios still
+// requires it explicitly whenever bundleid/testrunnerbundleid are set.
+enum WDAIdentity {
+    static let runnerBundleId = "com.local.imirror.WebDriverAgentRunner.xctrunner"
+    static let testRunnerBundleId = "com.local.imirror.WebDriverAgentRunner.xctrunner"
+    static let xctestConfig = "WebDriverAgentRunner.xctest"
+}
+```
+
+- [ ] **Step 2: Pass all three flags to `runwda`.** Replace the `self.wda = ManagedProcess(...)` call at `Transport.swift:256-257` with:
+
+```swift
+            self.wda = ManagedProcess(
+                binary: bin,
+                args: ["runwda",
+                       "--bundleid=\(WDAIdentity.runnerBundleId)",
+                       "--testrunnerbundleid=\(WDAIdentity.testRunnerBundleId)",
+                       "--xctestconfig=\(WDAIdentity.xctestConfig)"],
+                label: "runwda", restartDelay: 6, workDir: self.workDir)
+```
+
+- [ ] **Step 3: Compile.**
+
+Run: `swift build`
+Expected: build succeeds with no errors.
+
+- [ ] **Step 4: (Live, with the branded runner installed from Tasks 1–2) confirm bring-up.** Launch iMirror; the toolbar health dot reaches green within ~30 s (go-ios launches the renamed runner via the matching id).
+
+- [ ] **Step 5: Commit.**
+
+```bash
+git add Sources/iMirror/Transport.swift
+git commit -m "feat(transport): launch runwda with the branded iMirror runner id (all three flags)"
 ```
 
 ---
@@ -246,6 +294,14 @@ def test_terminate_app_posts_bundle_id(mod, wda):
     assert any(p.endswith("/wda/apps/terminate") for m, p, _ in wda.calls)
 
 
+def test_activate_app_posts_bundle_id(mod, wda):
+    wda.allow("/wda/apps/activate")
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_activate_app("com.apple.Preferences")
+    body = next(b for m, p, b in wda.calls if p.endswith("/wda/apps/activate"))
+    assert body == {"bundleId": "com.apple.Preferences"}
+
+
 def test_app_state_maps_code_to_name(mod, wda):
     import json
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
@@ -256,7 +312,7 @@ def test_app_state_maps_code_to_name(mod, wda):
 
 - [ ] **Step 2: Run them red.**
 
-Run: `mcp-server/.venv/bin/python -m pytest mcp-server/test_imirror_mcp.py -k "launch_app or terminate_app or app_state" -v`
+Run: `mcp-server/.venv/bin/python -m pytest mcp-server/test_imirror_mcp.py -k "launch_app or terminate_app or activate_app or app_state" -v`
 Expected: FAIL — `AttributeError: module 'imirror_mcp' has no attribute 'ios_launch_app'`.
 
 - [ ] **Step 3: Implement.** Insert after `ios_orientation` (before the `# ---- Test-run recording` banner, ~`:510`):
@@ -301,7 +357,7 @@ def ios_app_state(bundle_id: str) -> str:
 
 - [ ] **Step 4: Run them green + compile.**
 
-Run: `mcp-server/.venv/bin/python -m pytest mcp-server/test_imirror_mcp.py -k "launch_app or terminate_app or app_state" -v && mcp-server/.venv/bin/python -m py_compile mcp-server/imirror_mcp.py`
+Run: `mcp-server/.venv/bin/python -m pytest mcp-server/test_imirror_mcp.py -k "launch_app or terminate_app or activate_app or app_state" -v && mcp-server/.venv/bin/python -m py_compile mcp-server/imirror_mcp.py`
 Expected: PASS; no compile error.
 
 - [ ] **Step 5: Commit.**
@@ -700,7 +756,21 @@ git commit -m "feat(mcp): retry option on ios_find_and_tap for slow-appearing el
 
 ## Self-review notes
 
-- **Spec coverage:** Rebrand (Component 1) → Tasks 1–2; Theme A install/polish (Component 2) → Tasks 2–3; Theme B tools (Component 3, OCR dropped) → Tasks 4–6; Theme C assertions+retry (Component 4) → Tasks 7–8; metrics/video explicitly deferred above.
-- **Report-tally correctness:** assertions record `action="note"` so they count in `_render_report`/`_split_sections` (verified against `imirror_mcp.py:763,773`).
-- **Backward compatibility:** `ios_find_and_tap` keeps `retries=0` default; existing tests must still pass (asserted in Task 8 Step 4).
+- **Spec coverage:** Rebrand (Component 1) → Tasks 1 (build/rebrand) + 3 (`runwda` id); Theme A install/polish (Component 2) → Tasks 1–2; Theme B tools (Component 3, OCR dropped) → Tasks 4–6; Theme C assertions+retry (Component 4) → Tasks 7–8; metrics/video explicitly deferred above.
+- **`runwda` flags (verified `main.go:1951-1958`):** go-ios needs NONE or ALL of `--bundleid`/`--testrunnerbundleid`/`--xctestconfig`; Task 3 passes all three.
+- **Report-tally correctness:** assertions record `action="note"` so they count in `_render_report`/`_split_sections` (verified against `imirror_mcp.py:763,773`). They render as "note" steps (benign; the detail prefix says "assert …").
+- **Install safety:** `installRunnerIfMissing` is guarded once-per-launch and checks `ios apps --list` first — it must not re-run on the `restartChain()` watchdog path (`ios install` always re-transfers).
+- **Backward compatibility:** `ios_find_and_tap` keeps `retries=0` default; existing find/tap tests still pass (asserted in Task 8 Step 4).
 - **Dependency-light:** only `subprocess`/`base64`/`time` (all already imported); go-ios install degrades with a clear error.
+- **Licensing:** Task 2 ships WDA (BSD-3) + go-ios (MIT) license notices in the bundle, per the design checklist.
+
+## Fable 5 review — applied fixes
+
+Reviewed against the actual repo; corrections folded in:
+- **B1 (blocker):** Task 3 now passes all three `runwda` flags (was two → go-ios would error and loop red).
+- **B2 (blocker):** Task 1 now packages the runner into `build/WebDriverAgent.ipa` (Task 2's input previously had no producer).
+- **S1:** Part 1 reordered (build → bundle → `runwda`) with a "lands as a unit" note.
+- **S2:** install helper guarded once-per-launch + `ios apps --list` check; no longer reinstalls on every watchdog recovery.
+- **S3:** display name set via PlistBuddy on the explicit `Info.plist` (INFOPLIST_KEY would be ignored); verification checks it.
+- **S4:** added `test_activate_app_posts_bundle_id` and included it in the `-k` filters.
+- **N3/N4/S5:** `WITH_WDA` naming consistent; license-notice step added; bundle-id-applies-to-all-targets noted.
