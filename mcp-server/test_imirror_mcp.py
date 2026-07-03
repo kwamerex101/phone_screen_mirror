@@ -831,3 +831,29 @@ def test_find_and_tap_retries_until_present(mod, wda, monkeypatch):
     out = mod.ios_find_and_tap("Continue", retries=1)
     assert "tapped" in out
     assert seq == []                         # both attempts consumed
+
+
+# ---- review-fix coverage -------------------------------------------------------
+
+def test_app_state_unknown_code(mod, wda):
+    import json
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/wda/apps/state", (200, {"value": 9}))
+    out = json.loads(mod.ios_app_state("com.apple.Preferences"))
+    assert out["state"] == "unknown(9)" and out["code"] == 9
+
+
+def test_clipboard_get_falls_back_on_bad_base64(mod, wda):
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/wda/getPasteboard", (200, {"value": "a"}))   # not valid base64
+    assert mod.ios_clipboard_get() == "a"
+
+
+def test_ios_bin_prefers_env_then_bundle_then_path(mod, monkeypatch):
+    monkeypatch.setenv("IMIRROR_IOS_BIN", "/custom/ios")
+    assert mod._ios_bin() == "/custom/ios"
+    monkeypatch.delenv("IMIRROR_IOS_BIN", raising=False)
+    monkeypatch.setattr(mod.os.path, "exists", lambda p: p == mod._BUNDLED_IOS)
+    assert mod._ios_bin() == mod._BUNDLED_IOS
+    monkeypatch.setattr(mod.os.path, "exists", lambda p: False)
+    assert mod._ios_bin() == "ios"

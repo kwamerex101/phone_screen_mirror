@@ -588,18 +588,29 @@ def ios_clipboard_get() -> str:
     return text
 
 
+# go-ios ships inside an installed iMirror.app; probe it so ios_install_app works
+# from the packaged app without the user exporting IMIRROR_IOS_BIN.
+_BUNDLED_IOS = "/Applications/iMirror.app/Contents/Resources/ios"
+
+
 def _ios_bin() -> str:
-    """Path to the go-ios `ios` binary (bundled by the app, or on PATH)."""
-    return os.environ.get("IMIRROR_IOS_BIN", "ios")
+    """Path to the go-ios `ios` binary: IMIRROR_IOS_BIN if set, else the copy
+    bundled in an installed iMirror.app, else `ios` on PATH."""
+    env = os.environ.get("IMIRROR_IOS_BIN")
+    if env:
+        return env
+    if os.path.exists(_BUNDLED_IOS):
+        return _BUNDLED_IOS
+    return "ios"
 
 
 @mcp.tool()
 def ios_install_app(path: str) -> str:
     """Install an .ipa (or .app) on the device via the bundled go-ios.
 
-    Requires the go-ios `ios` binary on PATH or IMIRROR_IOS_BIN, and a signature
-    already valid for the device. Shell-out (not WDA); degrades with a clear error
-    if go-ios is absent.
+    Resolves the go-ios `ios` binary via IMIRROR_IOS_BIN, then a bundled
+    iMirror.app copy, then PATH (see _ios_bin). Needs a signature already valid
+    for the device. Shell-out (not WDA); degrades with a clear error if absent.
     """
     if not os.path.exists(path):
         raise RuntimeError(f"No such file: {path}")
