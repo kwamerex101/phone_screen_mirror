@@ -285,6 +285,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         // "Automation Running" overlay. Flip the Automation toggle to bring WDA up.
         startCaptureWatchdog()
         updateHealthDot()        // grey — automation off
+        // Restore the last Automation choice (default off = view-only mirroring).
+        if UserDefaults.standard.bool(forKey: "imirror.automationEnabled") {
+            automationSwitch.state = .on
+            setAutomation(true)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -932,9 +937,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     /// Start or stop WebDriverAgent on demand. Off (default) = pure view-only
     /// mirroring: no go-ios children, no XCUITest session, and no iOS "Automation
     /// Running" overlay on the phone. On = bring the control channel up.
-    @objc private func toggleAutomation() {
-        automationEnabled = (automationSwitch.state == .on)
-        if automationEnabled {
+    @objc private func toggleAutomation() { setAutomation(automationSwitch.state == .on) }
+
+    /// Enable/disable the WDA control channel and remember the choice across launches.
+    private func setAutomation(_ on: Bool) {
+        automationEnabled = on
+        UserDefaults.standard.set(on, forKey: "imirror.automationEnabled")
+        if on {
             setStatus("Automation ON — starting WebDriverAgent… "
                     + "(iOS shows an \"Automation Running\" overlay on the phone).")
             transport.start()        // spawn tunnel + runwda + forward + relay

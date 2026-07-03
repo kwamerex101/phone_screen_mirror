@@ -245,9 +245,10 @@ def _find_element(text: str, _retry: bool = True) -> str | None:
 def ios_status() -> str:
     """Check whether WebDriverAgent is up and ready to accept commands.
 
-    Returns a short JSON summary (ready flag, iOS version, device name). Call this
-    first if other tools fail — a not-ready/unreachable result means the iMirror
-    app isn't running or its health dot isn't green yet.
+    Returns a short JSON summary (ready flag, iOS version, device name, and this
+    MCP server's version). Call this first if other tools fail — a not-ready/
+    unreachable result means the iMirror app isn't running or its health dot isn't
+    green yet.
     """
     _, j = _req("GET", "/status")
     v = j.get("value", {})
@@ -256,6 +257,7 @@ def ios_status() -> str:
         "message": v.get("message"),
         "ios": v.get("os", {}).get("version"),
         "device": v.get("device"),
+        "server_version": __version__,
     })
 
 

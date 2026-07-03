@@ -116,7 +116,8 @@ def test_status_summarizes(mod, wda):
         "ready": True, "message": "ok",
         "os": {"version": "17.4"}, "device": "iPhone"}}))
     out = json.loads(mod.ios_status())
-    assert out == {"ready": True, "message": "ok", "ios": "17.4", "device": "iPhone"}
+    assert out == {"ready": True, "message": "ok", "ios": "17.4", "device": "iPhone",
+                   "server_version": mod.__version__}
 
 
 def test_source_truncates_large_output(mod, wda):
