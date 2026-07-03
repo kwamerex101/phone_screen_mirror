@@ -29,10 +29,14 @@ echo "==> building rebranded WebDriverAgentRunner (bundle id $BUNDLE_ID)"
 #   WebDriverAgentLib's header-map namespace and breaking <WebDriverAgentLib/*.h>
 #   imports), and do NOT pass RUN_CLANG_STATIC_ANALYZER=NO or
 #   CLANG_ENABLE_EXPLICIT_MODULES=NO (they break header-map lookups too).
+# WDA_DESTINATION defaults to a device-agnostic build. To onboard a NEW device,
+# point it at that device so -allowProvisioningUpdates registers its UDID into the
+# profile (else install fails with "A valid provisioning profile ... was not found"):
+#   WDA_DESTINATION="id=<UDID>" ./scripts/build-wda.sh
 xcodebuild build-for-testing \
     -project "$PROJ" \
     -scheme WebDriverAgentRunner \
-    -destination 'generic/platform=iOS' \
+    -destination "${WDA_DESTINATION:-generic/platform=iOS}" \
     -derivedDataPath "$DERIVED" \
     -allowProvisioningUpdates \
     PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
