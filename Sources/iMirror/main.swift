@@ -232,6 +232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private let settingsPopover = NSPopover()
     private var settingsBuilt = false
     private let mcpButton = NSButton()
+    private let mcpUninstallButton = NSButton()
     private let mcpStatusLabel = NSTextField(labelWithString: "")
     private var mcpInstalled = false
     private let healthButton = NSButton()
@@ -1039,14 +1040,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         mcpButton.bezelStyle = .rounded
         mcpButton.title = "Install MCP server"
         mcpButton.target = self
-        mcpButton.action = #selector(toggleMCP)
-        stack.addArrangedSubview(mcpButton)
+        mcpButton.action = #selector(primaryMCP)
+        mcpUninstallButton.bezelStyle = .rounded
+        mcpUninstallButton.title = "Uninstall"
+        mcpUninstallButton.target = self
+        mcpUninstallButton.action = #selector(uninstallMCP)
+        mcpUninstallButton.isHidden = true
+        let mcpButtons = NSStackView(views: [mcpButton, mcpUninstallButton])
+        mcpButtons.orientation = .horizontal
+        mcpButtons.spacing = 8
+        stack.addArrangedSubview(mcpButtons)
 
         mcpStatusLabel.font = .systemFont(ofSize: 11)
         mcpStatusLabel.textColor = .secondaryLabelColor
         mcpStatusLabel.preferredMaxLayoutWidth = 268
         stack.addArrangedSubview(mcpStatusLabel)
-        refreshMCPStatus()
+        refreshMCP(updateLabel: true)
 
         let container = NSView()
         container.addSubview(stack)
@@ -1067,37 +1076,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         UserDefaults.standard.set(sender.doubleValue, forKey: "imirror.scrollGain")
     }
 
-    /// Refresh the MCP install button off the main thread (detection may shell out).
-    private func refreshMCPStatus() {
+    /// Check installed state / version / staleness off the main thread (it shells
+    /// out) and reflect it in the buttons — and the status line when `updateLabel`.
+    private func refreshMCP(updateLabel: Bool) {
+        if updateLabel { mcpStatusLabel.stringValue = "Checking…" }
         DispatchQueue.global(qos: .userInitiated).async {
-            let installed = MCPInstaller.isInstalled()
+            let s = MCPInstaller.status()
             DispatchQueue.main.async {
-                self.mcpInstalled = installed
-                self.mcpButton.title = installed ? "Uninstall MCP server" : "Install MCP server"
+                self.mcpInstalled = s.installed
+                self.mcpUninstallButton.isHidden = !s.installed
+                self.mcpButton.title = !s.installed ? "Install MCP server"
+                                     : (s.upToDate ? "Reinstall" : "Update MCP server")
+                if updateLabel {
+                    let ver = s.version.map { " · v\($0)" } ?? ""
+                    self.mcpStatusLabel.stringValue = !s.installed
+                        ? "Not installed."
+                        : "Installed · \(s.clients.joined(separator: ", "))\(ver) · "
+                          + (s.upToDate ? "up to date." : "update available.")
+                }
             }
         }
     }
 
-    @objc private func toggleMCP() {
-        mcpButton.isEnabled = false
-        if mcpInstalled {
-            mcpStatusLabel.stringValue = "Removing…"
-            MCPInstaller.uninstall { [weak self] r in
-                guard let self else { return }
-                self.mcpStatusLabel.stringValue = r.message
-                self.mcpButton.isEnabled = true
-                self.refreshMCPStatus()
-            }
-        } else {
-            mcpStatusLabel.stringValue = "Installing… (first run sets up Python — up to ~30s)"
-            MCPInstaller.install(progress: { [weak self] msg in
-                self?.mcpStatusLabel.stringValue = msg
-            }, completion: { [weak self] r in
-                guard let self else { return }
-                self.mcpStatusLabel.stringValue = r.message
-                self.mcpButton.isEnabled = true
-                self.refreshMCPStatus()
-            })
+    @objc private func primaryMCP() {
+        mcpButton.isEnabled = false; mcpUninstallButton.isEnabled = false
+        let updating = mcpInstalled          // reinstall/update re-points paths + refreshes deps
+        mcpStatusLabel.stringValue = updating
+            ? "Updating…" : "Installing… (first run sets up Python — up to ~30s)"
+        MCPInstaller.install(update: updating, progress: { [weak self] msg in
+            self?.mcpStatusLabel.stringValue = msg
+        }, completion: { [weak self] r in
+            guard let self else { return }
+            self.mcpStatusLabel.stringValue = r.message
+            self.mcpButton.isEnabled = true; self.mcpUninstallButton.isEnabled = true
+            self.refreshMCP(updateLabel: false)
+        })
+    }
+
+    @objc private func uninstallMCP() {
+        mcpButton.isEnabled = false; mcpUninstallButton.isEnabled = false
+        mcpStatusLabel.stringValue = "Removing…"
+        MCPInstaller.uninstall { [weak self] r in
+            guard let self else { return }
+            self.mcpStatusLabel.stringValue = r.message
+            self.mcpButton.isEnabled = true; self.mcpUninstallButton.isEnabled = true
+            self.refreshMCP(updateLabel: false)
         }
     }
 

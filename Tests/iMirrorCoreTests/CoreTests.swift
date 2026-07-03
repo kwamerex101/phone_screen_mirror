@@ -135,4 +135,12 @@ final class MCPConfigTests: XCTestCase {
         XCTAssertFalse(MCPConfig.contains(#"{}"#.data(using: .utf8), name: "imirror"))
         XCTAssertFalse(MCPConfig.contains(nil, name: "imirror"))
     }
+
+    func testEntryReadsCommandAndArgs() {
+        let cfg = #"{"mcpServers":{"imirror":{"command":"/venv/python","args":["/old/x.py"]}}}"#.data(using: .utf8)
+        let e = MCPConfig.entry(cfg, name: "imirror")
+        XCTAssertEqual(e?.command, "/venv/python")
+        XCTAssertEqual(e?.args, ["/old/x.py"])          // used to detect a stale registration
+        XCTAssertNil(MCPConfig.entry(cfg, name: "nope"))
+    }
 }

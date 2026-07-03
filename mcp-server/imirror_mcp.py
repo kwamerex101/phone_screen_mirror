@@ -18,6 +18,8 @@ Override target:  IMIRROR_WDA=http://127.0.0.1:8100
 """
 from __future__ import annotations
 
+__version__ = "1.0.0"
+
 import base64
 import html
 import http.client

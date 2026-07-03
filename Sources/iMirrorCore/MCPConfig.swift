@@ -39,6 +39,15 @@ public enum MCPConfig {
         (object(from: existing)["mcpServers"] as? [String: Any])?[name] != nil
     }
 
+    /// The (command, args) a named server is registered with, or nil if absent.
+    /// Lets the installer detect a stale registration (path no longer current).
+    public static func entry(_ existing: Data?, name: String) -> (command: String, args: [String])? {
+        guard let servers = object(from: existing)["mcpServers"] as? [String: Any],
+              let e = servers[name] as? [String: Any],
+              let cmd = e["command"] as? String else { return nil }
+        return (cmd, (e["args"] as? [String]) ?? [])
+    }
+
     private static func object(from data: Data?) -> [String: Any] {
         guard let data, !data.isEmpty,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]

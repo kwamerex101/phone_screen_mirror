@@ -61,27 +61,61 @@ enum MCPInstaller {
 
     // MARK: Status
 
-    /// Installed if our entry is in the Claude Desktop config, or Claude Code lists it.
-    static func isInstalled() -> Bool {
-        if MCPConfig.contains(try? Data(contentsOf: claudeDesktopConfig), name: serverName) { return true }
-        if let claude = claudeCLI() {
-            let r = run(claude, ["mcp", "list"])
-            if r.out.contains(serverName) { return true }
+    struct Status {
+        let clients: [String]      // which MCP clients have it registered
+        let version: String?       // current server __version__
+        let upToDate: Bool         // registration points at the current script + a working venv
+        var installed: Bool { !clients.isEmpty }
+    }
+
+    /// Where things stand right now — used to show installed/version/update state
+    /// when the user opens Settings. Runs off the main thread (it may shell out).
+    static func status() -> Status {
+        let desiredScript = scriptURL()?.path
+        let venvOK = FileManager.default.isExecutableFile(atPath: venvPython.path)
+        var clients: [String] = []
+        var stale = false
+
+        if let data = try? Data(contentsOf: claudeDesktopConfig),
+           let e = MCPConfig.entry(data, name: serverName) {
+            clients.append("Claude Desktop")
+            if e.command != venvPython.path || e.args.first != desiredScript { stale = true }
         }
-        return false
+        if let claude = claudeCLI() {
+            let r = run(claude, ["mcp", "get", serverName])
+            if r.code == 0, r.out.contains(serverName) {
+                clients.append("Claude Code")
+                if let s = desiredScript, !r.out.contains(s) { stale = true }
+            }
+        }
+        return Status(clients: clients, version: currentVersion(),
+                      upToDate: !clients.isEmpty && venvOK && !stale)
+    }
+
+    static func isInstalled() -> Bool { status().installed }
+
+    /// The `__version__` of the current (repo or bundled) server script.
+    static func currentVersion() -> String? {
+        guard let s = scriptURL(), let txt = try? String(contentsOf: s, encoding: .utf8) else { return nil }
+        let re = try? NSRegularExpression(pattern: #"__version__\s*=\s*["']([^"']+)["']"#)
+        let range = NSRange(txt.startIndex..., in: txt)
+        guard let m = re?.firstMatch(in: txt, range: range), let r = Range(m.range(at: 1), in: txt)
+        else { return nil }
+        return String(txt[r])
     }
 
     // MARK: Install / uninstall
 
-    static func install(progress: @escaping (String) -> Void,
+    static func install(update: Bool = false,
+                        progress: @escaping (String) -> Void,
                         completion: @escaping (Result) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = doInstall(progress: progress)
+            let result = doInstall(update: update, progress: progress)
             DispatchQueue.main.async { completion(result) }
         }
     }
 
-    private static func doInstall(progress: @escaping (String) -> Void) -> Result {
+    private static func doInstall(update: Bool, progress: @escaping (String) -> Void) -> Result {
         guard let script = scriptURL() else {
             return Result(ok: false, message: "Couldn't find imirror_mcp.py (repo or bundle).")
         }
@@ -89,8 +123,10 @@ enum MCPInstaller {
             return Result(ok: false, message: "python3 not found — install Xcode Command Line Tools.")
         }
 
-        // 1. venv + deps (idempotent — skip if the venv python already exists).
-        if !FileManager.default.isExecutableFile(atPath: venvPython.path) {
+        // 1. venv + deps. Create the venv if missing; (re)install deps on first
+        //    setup or when updating (then with --upgrade to pull newer mcp[cli]).
+        let needVenv = !FileManager.default.isExecutableFile(atPath: venvPython.path)
+        if needVenv {
             progress("Creating Python environment…")
             try? FileManager.default.createDirectory(at: venvDir.deletingLastPathComponent(),
                                                      withIntermediateDirectories: true)
@@ -98,11 +134,14 @@ enum MCPInstaller {
             guard mk.code == 0 else {
                 return Result(ok: false, message: "venv creation failed: \(mk.out.suffix(160))")
             }
-            progress("Installing dependencies (mcp)…")
+        }
+        if needVenv || update {
+            progress(update ? "Updating dependencies…" : "Installing dependencies (mcp)…")
             let reqs = script.deletingLastPathComponent().appendingPathComponent("requirements.txt")
-            let pipArgs = FileManager.default.fileExists(atPath: reqs.path)
-                ? ["-m", "pip", "install", "--quiet", "-r", reqs.path]
-                : ["-m", "pip", "install", "--quiet", "mcp[cli]"]
+            var pipArgs = ["-m", "pip", "install", "--quiet"]
+            if update { pipArgs.append("--upgrade") }
+            if FileManager.default.fileExists(atPath: reqs.path) { pipArgs += ["-r", reqs.path] }
+            else { pipArgs.append("mcp[cli]") }
             let pip = run(venvPython.path, pipArgs)
             guard pip.code == 0 else {
                 return Result(ok: false, message: "pip install failed: \(pip.out.suffix(160))")
