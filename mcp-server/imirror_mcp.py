@@ -23,22 +23,50 @@ __version__ = "1.0.0"
 import base64
 import html
 import http.client
+import ipaddress
 import json
 import math
 import os
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
 import urllib.error
 import urllib.request
 from typing import Any
+from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import FastMCP, Image
 
+
+def _is_loopback_url(url: str) -> bool:
+    """True only if `url` is plain http to an actual loopback host.
+
+    A raw `startswith("http://127.0.0.1")` prefix check is unsafe: it accepts
+    hostile hosts like http://127.0.0.1.attacker.example or
+    http://localhost.attacker.example, which resolve off-box. Parse the URL and
+    compare the *hostname* exactly — "localhost" by name, or any address in the
+    127.0.0.0/8 (and ::1) loopback ranges via ipaddress. WDA has no auth on the
+    wire, so this must never widen to a non-loopback host.
+    """
+    parts = urlsplit(url)
+    if parts.scheme != "http":
+        return False
+    host = parts.hostname
+    if host is None:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 WDA = os.environ.get("IMIRROR_WDA", "http://127.0.0.1:8100")
-if not (WDA.startswith("http://127.0.0.1") or WDA.startswith("http://localhost")):
+if not _is_loopback_url(WDA):
     raise SystemExit("Refusing non-loopback WDA target (WDA has no auth on the wire).")
 
 mcp = FastMCP("imirror")
@@ -55,46 +83,111 @@ _run: dict[str, Any] = {
 
 def _record(action: str, detail: str = "", screenshot: str | None = None,
             note: str = "") -> None:
-    """Append a step to the active run. No-op when no run is recording."""
+    """Append a step to the active run. No-op when no run is recording.
+
+    Each step is also appended to steps.jsonl in the run dir so a crash between
+    ios_start_run and ios_finish_run leaves a replayable log next to the
+    screenshots already on disk (the in-memory timeline would otherwise be lost).
+    The disk append is best-effort — a write failure must never break recording.
+    """
     if not _run["active"]:
         return
-    _run["steps"].append({
+    step = {
         "i": len(_run["steps"]) + 1, "t": time.time(),
         "action": action, "detail": detail, "screenshot": screenshot, "note": note,
-    })
+    }
+    _run["steps"].append(step)
+    run_dir = _run.get("dir")
+    if run_dir:
+        try:
+            with open(os.path.join(run_dir, "steps.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(step) + "\n")
+        except OSError:
+            pass
 
 
-# ---- HTTP helpers (fresh connection per request) -------------------------------
+# ---- HTTP helpers (keep-alive connection, reconnect on drop) -------------------
+
+# A reused HTTPConnection to WDA on loopback, kept *per thread*. Every WDA call
+# (every tap, and every poll iteration in wait_for/scroll_to/asserts) otherwise
+# paid a fresh TCP handshake *and* a fresh hop through the in-app relay's USB
+# tunnel. Reusing the connection removes that per-call setup. It's thread-local
+# (not one shared, lock-serialised connection) so a slow request on one thread —
+# e.g. a 60s /source — can't block a concurrent call on another thread. A
+# dropped/half-closed connection is detected on the next request and replaced.
+_conn_local = threading.local()
+
+
+def _drop_conn() -> None:
+    c = getattr(_conn_local, "c", None)
+    if c is not None:
+        try:
+            c.close()
+        except Exception:
+            pass
+        _conn_local.c = None
+
+
+def _http(method: str, path: str, data: bytes | None,
+          timeout: float) -> tuple[int, bytes]:
+    """Send one request over this thread's cached keep-alive connection and return
+    (status, raw_body). Raises the underlying socket/http.client error on a
+    connection-level failure (the caller decides whether to retry)."""
+    parts = urlsplit(WDA)
+    host, port = parts.hostname, parts.port or 80
+    c = getattr(_conn_local, "c", None)
+    if c is None:
+        c = http.client.HTTPConnection(host, port, timeout=timeout)
+        _conn_local.c = c
+    try:
+        c.timeout = timeout
+        c.request(method, path, body=data,
+                  headers={"Content-Type": "application/json"})
+        r = c.getresponse()
+        return r.status, r.read()
+    except Exception:
+        _drop_conn()          # poison so the next call reconnects clean
+        raise
+
 
 def _req(method: str, path: str, body: dict | None = None,
          timeout: float = 15) -> tuple[int, dict[str, Any]]:
     data = json.dumps(body).encode() if body is not None else None
     # WDA's CocoaHTTPServer occasionally drops a connection mid-exchange
-    # (RemoteDisconnected / reset). Retry such transient failures a couple times.
+    # (RemoteDisconnected / reset), and keep-alive means we may hand back a
+    # server-closed socket — retry such transient failures a couple times.
     last_exc: Exception | None = None
     for attempt in range(3):
-        req = urllib.request.Request(
-            WDA + path, data=data, method=method,
-            headers={"Content-Type": "application/json", "Connection": "close"})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                raw = r.read()
-                return r.status, (json.loads(raw) if raw else {})
-        except urllib.error.HTTPError as e:
-            raw = e.read()
-            try:
-                return e.code, json.loads(raw)
-            except Exception:
-                return e.code, {"error": raw.decode("utf-8", "replace")[:300]}
+            status, raw = _http(method, path, data, timeout)
         except (http.client.RemoteDisconnected, ConnectionResetError,
-                http.client.BadStatusLine, http.client.IncompleteRead) as e:
+                http.client.BadStatusLine, http.client.IncompleteRead,
+                BrokenPipeError) as e:
             last_exc = e
-            time.sleep(0.3 * (attempt + 1))
+            # A reused keep-alive socket the server already closed fails on the
+            # first send — that's expected staleness, so reconnect and retry
+            # immediately (no penalty). Only back off on repeated failures, which
+            # signal a genuinely busy/wedged WDA rather than a stale socket.
+            if attempt > 0:
+                time.sleep(0.3 * attempt)
             continue
-        except urllib.error.URLError as e:
+        except (socket.timeout, TimeoutError) as e:
             raise RuntimeError(
-                f"Cannot reach WDA at {WDA} ({e.reason}). Is the iMirror app running and "
+                f"WDA timed out after {timeout}s on {path}. It may be busy or "
+                f"wedged — check the iMirror health dot.") from e
+        except OSError as e:
+            raise RuntimeError(
+                f"Cannot reach WDA at {WDA} ({e}). Is the iMirror app running and "
                 f"is the health dot green?") from e
+        # HTTP errors (4xx/5xx) come back as a normal response with http.client,
+        # not an exception — callers (e.g. _session_post) rely on seeing the code
+        # and any JSON error body, so return them rather than raising.
+        try:
+            return status, (json.loads(raw) if raw else {})
+        except Exception:
+            if status >= 400:
+                return status, {"error": raw.decode("utf-8", "replace")[:300]}
+            raise
     raise RuntimeError(
         f"WDA dropped the connection repeatedly on {path} ({last_exc}). "
         f"It may be busy or wedged — check the iMirror health dot.")
@@ -644,6 +737,13 @@ def ios_start_run(label: str = "test") -> str:
     under $IMIRROR_RUNS_DIR (default ~/.imirror/runs). Starting a run replaces any
     run already in progress.
     """
+    # Surface (don't silently swallow) an in-progress run being discarded — with
+    # several agents sharing one server, a second start_run would otherwise wipe
+    # the first caller's recording with no trace.
+    warn = ""
+    if _run["active"]:
+        warn = (f"WARNING: discarded in-progress run '{_run['label']}' "
+                f"({len(_run['steps'])} steps) — only one run records at a time. ")
     base = os.environ.get("IMIRROR_RUNS_DIR", os.path.expanduser("~/.imirror/runs"))
     slug = re.sub(r"[^A-Za-z0-9_-]+", "-", label).strip("-") or "test"
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -658,7 +758,7 @@ def ios_start_run(label: str = "test") -> str:
         pass
     _run.update(active=True, dir=run_dir, label=label, started=time.time(),
                 device=device, ios=ios_ver, steps=[], cap_noted=False)
-    return f"recording run '{label}' -> {run_dir}"
+    return f"{warn}recording run '{label}' -> {run_dir}"
 
 
 @mcp.tool()

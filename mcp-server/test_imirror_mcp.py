@@ -75,12 +75,120 @@ def wda(mod, monkeypatch):
     "http://10.0.0.5:8100",
     "https://example.com",
     "http://evil.localhost.attacker.com",
+    # suffix-abuse: these pass a naive startswith() prefix check but resolve off-box
+    "http://127.0.0.1.attacker.example:8100",
+    "http://localhost.attacker.example:8100",
+    "https://127.0.0.1:8100",              # non-http scheme to a loopback host
 ])
 def test_refuses_non_loopback_target(monkeypatch, target):
     monkeypatch.setenv("IMIRROR_WDA", target)
     sys.modules.pop("imirror_mcp", None)
     with pytest.raises(SystemExit):
         importlib.import_module("imirror_mcp")
+
+
+@pytest.mark.parametrize("target", [
+    "http://127.0.0.1:8100",
+    "http://localhost:8100",
+    "http://127.0.0.2:9100",               # anywhere in 127.0.0.0/8 is loopback
+    "http://[::1]:8100",                    # IPv6 loopback
+])
+def test_accepts_loopback_target(monkeypatch, target):
+    monkeypatch.setenv("IMIRROR_WDA", target)
+    sys.modules.pop("imirror_mcp", None)
+    m = importlib.import_module("imirror_mcp")   # must not raise
+    assert m._is_loopback_url(target)
+
+
+# ---- HTTP wire layer (_req over the _http seam) --------------------------------
+
+def test_req_parses_json_body(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_http", lambda *a: (200, b'{"value": 42}'))
+    assert mod._req("GET", "/status") == (200, {"value": 42})
+
+
+def test_req_returns_error_code_and_body(mod, monkeypatch):
+    """4xx/5xx come back as a normal response (not an exception) so callers like
+    _session_post can see the code and recreate a stale session."""
+    monkeypatch.setattr(mod, "_http", lambda *a: (404, b'{"value": "no session"}'))
+    assert mod._req("POST", "/session/s/actions", {}) == (404, {"value": "no session"})
+
+
+def test_req_wraps_non_json_error_body(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_http", lambda *a: (500, b"Internal Error"))
+    code, j = mod._req("GET", "/x")
+    assert code == 500 and j["error"] == "Internal Error"
+
+
+def test_req_retries_transient_drop_then_succeeds(mod, monkeypatch):
+    import http.client
+    calls = {"n": 0}
+
+    def flaky(method, path, data, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise http.client.RemoteDisconnected("boom")
+        return 200, b'{"ok": true}'
+
+    monkeypatch.setattr(mod, "_http", flaky)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+    assert mod._req("GET", "/status") == (200, {"ok": True})
+    assert calls["n"] == 2
+
+
+def test_req_timeout_gives_actionable_error(mod, monkeypatch):
+    import socket
+
+    def slow(*a):
+        raise socket.timeout("timed out")
+
+    monkeypatch.setattr(mod, "_http", slow)
+    with pytest.raises(RuntimeError, match="timed out"):
+        mod._req("GET", "/source", timeout=1)
+
+
+def test_req_unreachable_gives_actionable_error(mod, monkeypatch):
+    def refused(*a):
+        raise ConnectionRefusedError("nope")
+
+    monkeypatch.setattr(mod, "_http", refused)
+    with pytest.raises(RuntimeError, match="Cannot reach WDA"):
+        mod._req("GET", "/status")
+
+
+def test_http_reconnects_after_failure(mod, monkeypatch):
+    """A connection-level error must poison the cached connection so the next
+    call builds a fresh one rather than reusing a half-closed socket."""
+    class FakeConn:
+        instances: list = []
+
+        def __init__(self, *a, **k):
+            self.closed = False
+            self.timeout = None
+            FakeConn.instances.append(self)
+
+        def request(self, *a, **k):
+            if len(FakeConn.instances) == 1:
+                raise ConnectionResetError("reset")
+
+        def getresponse(self):
+            class R:
+                status = 200
+                def read(self_inner): return b"{}"
+            return R()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(mod.http.client, "HTTPConnection", FakeConn)
+    mod._drop_conn()
+    with pytest.raises(ConnectionResetError):
+        mod._http("GET", "/x", None, 5)
+    assert FakeConn.instances[0].closed and getattr(mod._conn_local, "c", None) is None
+    # next call transparently opens a new connection and succeeds
+    assert mod._http("GET", "/x", None, 5) == (200, b"{}")
+    assert len(FakeConn.instances) == 2
+    mod._drop_conn()
 
 
 # ---- session lifecycle ---------------------------------------------------------
@@ -848,6 +956,46 @@ def test_clipboard_get_falls_back_on_bad_base64(mod, wda):
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     wda.script("/wda/getPasteboard", (200, {"value": "a"}))   # not valid base64
     assert mod.ios_clipboard_get() == "a"
+
+
+# ---- crash-safe run log + clobber warning --------------------------------------
+
+def test_record_appends_to_steps_jsonl(mod, wda, monkeypatch, tmp_path):
+    """Each step is flushed to steps.jsonl so a crash mid-run leaves a replayable
+    log beside the screenshots already on disk."""
+    import json
+    wda.allow("/actions")
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}))
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_start_run("crashy")
+    mod.ios_tap(1, 2)
+    mod.ios_run_note("checkpoint", status="pass")
+    log = os.path.join(mod._run["dir"], "steps.jsonl")
+    lines = [json.loads(l) for l in open(log, encoding="utf-8") if l.strip()]
+    actions = [l["action"] for l in lines]
+    assert "tap" in actions and "note" in actions
+
+
+def test_record_survives_unwritable_run_dir(mod, wda, monkeypatch, tmp_path):
+    """A failed steps.jsonl append must never break in-memory recording."""
+    wda.allow("/actions")
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}))
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_start_run("x")
+    mod._run["dir"] = "/nonexistent/dir/xyz"       # force the append to fail
+    mod.ios_tap(1, 2)                              # must not raise
+    assert any(s["action"] == "tap" for s in mod._run["steps"])
+
+
+def test_start_run_warns_when_clobbering_active_run(mod, wda, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}), (200, {"value": {}}))
+    mod.ios_start_run("first")
+    mod.ios_run_note("did work", status="pass")
+    out = mod.ios_start_run("second")
+    assert "WARNING" in out and "first" in out and "recording run" in out
 
 
 def test_ios_bin_prefers_env_then_bundle_then_path(mod, monkeypatch):
