@@ -240,11 +240,20 @@ final class WDAClient {
         cfg.httpMaximumConnectionsPerHost = 1
         let oneShot = URLSession(configuration: cfg)
         oneShot.dataTask(with: req) { data, resp, error in
-            defer { oneShot.finishTasksAndInvalidate() }
+            oneShot.finishTasksAndInvalidate()
             let code = (resp as? HTTPURLResponse)?.statusCode
-            if let error { completion(code, nil, error); return }
-            let json = data.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
-            completion(code, json, nil)
+            // Parse off the main thread, then deliver the completion ON main.
+            // Completions mutate shared state (sessionId, deviceSize) that the UI
+            // event handlers and the health-probe timer read on the main thread;
+            // hopping here confines those writes to main so reads can't tear.
+            // (sendInput already main-hops its own state; this generalises it.)
+            let json = error == nil
+                ? data.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+                : nil
+            DispatchQueue.main.async {
+                if let error { completion(code, nil, error); return }
+                completion(code, json, nil)
+            }
         }.resume()
     }
 }
