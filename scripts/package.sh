@@ -54,12 +54,16 @@ mkdir -p "$APP/Contents/Resources/licenses"
 cp "$ROOT/tools/WebDriverAgent/LICENSE" "$APP/Contents/Resources/licenses/WebDriverAgent-LICENSE.txt" 2>/dev/null || true
 cp "$ROOT/tools/go-ios/LICENSE"        "$APP/Contents/Resources/licenses/go-ios-LICENSE.txt" 2>/dev/null || true
 
-# Pick a signing identity.
+# Pick a signing identity — by its SHA-1 hash, not its name. Two "Developer ID
+# Application" certs with the same subject (e.g. after a renewal) make a
+# name-based --sign ambiguous and codesign aborts; the hash is unique.
 IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+            | grep "Developer ID Application" | head -1 | grep -oE '[0-9A-F]{40}' | head -1 || true)"
+IDENTITY_NAME="$(security find-identity -v -p codesigning 2>/dev/null \
             | grep "Developer ID Application" | head -1 | grep -oE '"[^"]+"' | tr -d '"' || true)"
 
 if [[ -n "$IDENTITY" ]]; then
-    echo "==> signing with: $IDENTITY (hardened runtime)"
+    echo "==> signing with: $IDENTITY_NAME [$IDENTITY] (hardened runtime)"
     # Sign nested helper first, then the app (deep is discouraged; sign inside-out).
     [[ -f "$APP/Contents/Resources/ios" ]] && \
         codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP/Contents/Resources/ios"
