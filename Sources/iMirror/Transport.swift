@@ -19,6 +19,19 @@
 import Foundation
 import Network
 
+// MARK: - Branded WDA runner identity
+//
+// The runner is rebranded to iMirror at build time (see scripts/build-wda.sh).
+// Xcode appends ".xctrunner" to the UI-test target's bundle id when it wraps it
+// into the runner .app, so go-ios is told the *suffixed* id. PRODUCT_NAME stays
+// WebDriverAgentRunner, so xctestConfig keeps the default name — but go-ios still
+// requires it explicitly whenever bundleid/testrunnerbundleid are set.
+enum WDAIdentity {
+    static let runnerBundleId = "com.local.imirror.WebDriverAgentRunner.xctrunner"
+    static let testRunnerBundleId = "com.local.imirror.WebDriverAgentRunner.xctrunner"
+    static let xctestConfig = "WebDriverAgentRunner.xctest"
+}
+
 // MARK: - Locate the bundled go-ios binary
 
 func locateGoIOS() -> URL? {
@@ -51,6 +64,22 @@ final class ManagedProcess {
     // queue, AND Process.terminationHandler's private queue — guard every access.
     private let lock = NSLock()
 
+    // Circuit breaker: a child that can never start (bad signing, unsupported
+    // iOS) would otherwise crash-loop at `restartDelay` forever. Count quick
+    // deaths; back off exponentially, and after `maxQuickFailures` give up so the
+    // app's slower chain-level watchdog takes over instead of a tight spin.
+    private var spawnedAt: Date?
+    private var consecutiveFailures = 0
+    private let maxQuickFailures = 8
+    // A child that stayed up at least this long was healthy — a later exit is a
+    // normal drop (device asleep, WDA recycled), not a failed launch, so the
+    // failure streak resets rather than marching toward the give-up cap.
+    private let healthyRuntimeSec: TimeInterval = 20
+    /// Called (once, on a background queue) when the breaker trips. Lets the
+    /// Transport surface a terminal "this device/OS may not support WDA" state
+    /// instead of the channel silently looping on red.
+    var onGaveUp: ((String) -> Void)?
+
     init(binary: URL, args: [String], label: String, restartDelay: TimeInterval, workDir: URL) {
         self.binary = binary
         self.args = args
@@ -65,7 +94,7 @@ final class ManagedProcess {
     }
 
     func start() {
-        lock.lock(); stopped = false; lock.unlock()
+        lock.lock(); stopped = false; consecutiveFailures = 0; lock.unlock()
         spawn()
     }
 
@@ -77,6 +106,15 @@ final class ManagedProcess {
         lock.unlock()
         p?.terminationHandler = nil
         p?.terminate()
+        // terminate() only sends SIGTERM; a wedged child that ignores it would
+        // otherwise linger (and, on quit, reparent to launchd). Escalate to
+        // SIGKILL shortly after if it hasn't exited — off the caller's thread so
+        // neither app-quit nor a chain restart blocks waiting on it.
+        if let p {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            }
+        }
     }
 
     /// Kill the current instance so the termination handler respawns it. Used by
@@ -109,15 +147,37 @@ final class ManagedProcess {
         }
         p.terminationHandler = { [weak self] _ in
             guard let self, !self.isStopped else { return }
-            NSLog("iMirror: \(self.label) exited — restarting in \(Int(self.restartDelay))s")
-            DispatchQueue.global().asyncAfter(deadline: .now() + self.restartDelay) { [weak self] in
+            let ranFor = self.spawnedAt.map { Date().timeIntervalSince($0) } ?? 0
+            self.lock.lock()
+            if ranFor >= self.healthyRuntimeSec {
+                self.consecutiveFailures = 0        // was healthy; this is a normal drop
+            } else {
+                self.consecutiveFailures += 1       // died fast; likely a failed launch
+            }
+            let failures = self.consecutiveFailures
+            self.lock.unlock()
+            // Exponential backoff capped at 60s so an unrecoverable child (bad
+            // signing, unsupported iOS, or just an unplugged phone) can't spin at
+            // the base delay (runwda: 6s) for the whole app lifetime. We keep
+            // retrying at the cap — a later replug still recovers on its own —
+            // but fire onGaveUp exactly once when we cross the threshold so the
+            // app can surface a terminal-looking state instead of silent looping.
+            let delay = min(self.restartDelay * pow(2.0, Double(max(0, failures - 1))), 60)
+            if failures == self.maxQuickFailures {
+                NSLog("iMirror: \(self.label) failed \(failures)x — backing off to "
+                      + "\(Int(delay))s (device/OS may not support WDA, or phone is unplugged)")
+                self.onGaveUp?(self.label)
+            } else {
+                NSLog("iMirror: \(self.label) exited — restarting in \(Int(delay))s (fail \(failures))")
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self, !self.isStopped else { return }
                 self.spawn()
             }
         }
         do {
             try p.run()
-            lock.lock(); process = p; lock.unlock()
+            lock.lock(); process = p; spawnedAt = Date(); lock.unlock()
             NSLog("iMirror: started \(label) (pid \(p.processIdentifier))")
         } catch {
             NSLog("iMirror: failed to start \(label): \(error.localizedDescription)")
@@ -188,6 +248,12 @@ final class Transport {
     private var tunnel: ManagedProcess?
     private var wda: ManagedProcess?
     private var forward: ManagedProcess?
+    private var runnerInstallAttempted = false
+
+    /// Set by the app to surface a terminal state when the WDA runner can't be
+    /// started at all (bad signing / unsupported device) — invoked on the main
+    /// thread. Distinct from a transient drop, which self-heals silently.
+    var onWDAUnrecoverable: (() -> Void)?
 
     init() {
         goios = locateGoIOS()
@@ -215,9 +281,13 @@ final class Transport {
         // holds the device's RSD state and port 60105 so a fresh tunnel can't
         // bind. Those orphans are invisible to our ManagedProcess handles, so
         // restartChain() can never kill them and WDA loops on red forever. Sweep
-        // them before bringing up a clean chain.
-        sweepStrayProcesses()
-        startChildren()
+        // them before bringing up a clean chain — off the main thread, since it
+        // fork/exec/waits three `pkill`s and start() is called from the UI (app
+        // launch / Automation toggle).
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.sweepStrayProcesses()
+            DispatchQueue.main.async { self?.startChildren() }
+        }
     }
 
     /// Kill stray go-ios children left over from a previous app instance, matched
@@ -239,27 +309,119 @@ final class Transport {
 
     /// Bumped on every stop/restart. Delayed bring-up closures capture the value
     /// at schedule time and abort if it moved — otherwise a stop() landing inside
-    /// startChildren()'s 8s window would still spawn runwda/forward as orphans
-    /// (handles not yet assigned, so nothing would ever stop them).
-    private var chainGeneration = 0
+    /// startChildren()'s readiness window would still spawn runwda/forward as
+    /// orphans (handles not yet assigned, so nothing would ever stop them).
+    /// Written on main (from start/stop/restartChain), read from the background
+    /// bring-up queue — guard both with a lock so the comparison can't tear.
+    private let genLock = NSLock()
+    private var _chainGeneration = 0
+    private var chainGeneration: Int {
+        get { genLock.lock(); defer { genLock.unlock() }; return _chainGeneration }
+        set { genLock.lock(); _chainGeneration = newValue; genLock.unlock() }
+    }
 
-    /// Start the go-ios children in order: tunnel first, then (after it has had
-    /// time to establish) runwda + forward.
+    /// Poll go-ios's own tunnel-agent readiness endpoint (the same signal go-ios
+    /// uses internally) instead of guessing with a fixed sleep. Returns true once
+    /// the agent answers on loopback:60105.
+    private func tunnelReady() -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:60105/ready") else { return false }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 1.5
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.waitsForConnectivity = false
+        let sem = DispatchSemaphore(value: 0)
+        var ready = false
+        URLSession(configuration: cfg).dataTask(with: req) { _, resp, _ in
+            if let code = (resp as? HTTPURLResponse)?.statusCode, (200..<300).contains(code) {
+                ready = true
+            }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 2.0)
+        return ready
+    }
+
+    /// Start the go-ios children: the tunnel first, then runwda + forward once the
+    /// tunnel is actually ready. Runner install (usbmuxd, not tunnel-gated) runs
+    /// in parallel so it's off the cold-boot critical path; runwda still waits for
+    /// it since the runner must exist before it can be launched.
     private func startChildren() {
         guard let bin = goios else { return }
         let gen = chainGeneration
         tunnel = ManagedProcess(binary: bin, args: ["tunnel", "start", "--userspace"],
                                 label: "tunnel", restartDelay: 15, workDir: workDir)
         tunnel?.start()
-        DispatchQueue.global().asyncAfter(deadline: .now() + 8) { [weak self] in
+        DispatchQueue.global().async { [weak self] in
             guard let self, self.chainGeneration == gen else { return }
-            self.wda = ManagedProcess(binary: bin, args: ["runwda"],
-                                      label: "runwda", restartDelay: 6, workDir: self.workDir)
-            self.wda?.start()
-            self.forward = ManagedProcess(binary: bin, args: ["forward", "8101", "8100"],
-                                          label: "forward", restartDelay: 3, workDir: self.workDir)
-            self.forward?.start()
+            // Install (or verify) the runner in parallel with the tunnel coming up.
+            let installDone = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async { [weak self] in
+                self?.installRunnerIfMissing(bin: bin)
+                installDone.signal()
+            }
+            // Wait for tunnel readiness, capped so we still proceed (as the old
+            // fixed sleep did) if the endpoint never answers on an odd setup.
+            let deadline = Date().addingTimeInterval(30)
+            while Date() < deadline {
+                if self.chainGeneration != gen { return }
+                if self.tunnelReady() { break }
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            installDone.wait()                       // runner must exist before runwda
+            guard self.chainGeneration == gen else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.chainGeneration == gen else { return }
+                let wda = ManagedProcess(
+                    binary: bin,
+                    args: ["runwda",
+                           "--bundleid=\(WDAIdentity.runnerBundleId)",
+                           "--testrunnerbundleid=\(WDAIdentity.testRunnerBundleId)",
+                           "--xctestconfig=\(WDAIdentity.xctestConfig)"],
+                    label: "runwda", restartDelay: 6, workDir: self.workDir)
+                wda.onGaveUp = { [weak self] _ in
+                    DispatchQueue.main.async { self?.onWDAUnrecoverable?() }
+                }
+                self.wda = wda
+                wda.start()
+                self.forward = ManagedProcess(binary: bin, args: ["forward", "8101", "8100"],
+                                              label: "forward", restartDelay: 3, workDir: self.workDir)
+                self.forward?.start()
+            }
         }
+    }
+
+    /// Install the bundled branded WDA .ipa once per launch, and only if the runner
+    /// isn't already on the device. Guarded so it never re-runs on restartChain().
+    private func installRunnerIfMissing(bin: URL) {
+        guard !runnerInstallAttempted else { return }
+        runnerInstallAttempted = true
+        guard let ipa = Bundle.main.url(forResource: "WebDriverAgent", withExtension: "ipa") else {
+            return  // dev builds ship no bundled ipa; runner installed via build-wda.sh/Xcode
+        }
+        if runnerIsInstalled(bin: bin) { return }
+        let p = Process()
+        p.executableURL = bin
+        p.arguments = ["install", "--path=\(ipa.path)"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run(); p.waitUntilExit() }
+        catch { NSLog("iMirror: WDA install attempt failed: \(error.localizedDescription)") }
+    }
+
+    /// True if the branded runner id already appears in `ios apps --list`.
+    private func runnerIsInstalled(bin: URL) -> Bool {
+        let p = Process()
+        p.executableURL = bin
+        p.arguments = ["apps", "--list"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run(); p.waitUntilExit()
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                             encoding: .utf8) ?? ""
+            return out.contains("com.local.imirror.WebDriverAgentRunner")
+        } catch { return false }
     }
 
     func stop() {
@@ -285,7 +447,7 @@ final class Transport {
             // (e.g. a tunnel reparented to launchd) so the fresh chain owns a
             // clean device + port 60105.
             self.sweepStrayProcesses()
-            self.startChildren()
+            DispatchQueue.main.async { self.startChildren() }
         }
     }
 }

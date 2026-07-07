@@ -28,10 +28,13 @@ Features:
   default), record to mp4, full-resolution PNG screenshots.
 - **Control** — tap, drag, two-finger trackpad scroll (with flick detection),
   type, Home, driven from the preview.
-- **Agent control + test reports** — 17 `ios_*` MCP tools, opt-in run recording,
+- **Agent control + test reports** — 27 `ios_*` MCP tools, opt-in run recording,
   cover/TOC/infographics HTML reports (see [MCP server](#mcp-server-drive-the-phone-from-claude)).
-- **Self-managed** — launch the app and it brings the control channel up itself
-  (no Xcode, no sudo, no terminal). A toolbar health dot + auto-reconnect.
+- **View-only by default, control on demand** — the app opens as a pure mirror,
+  so nothing runs on the phone and iOS shows no "Automation Running" overlay. Turn
+  on **Automation** in the Settings (⚙) popover to bring WebDriverAgent up itself
+  (no Xcode, no sudo, no terminal) — a toolbar health dot + auto-reconnect. That
+  popover also has a scroll-speed control and a one-click **MCP server install**.
 
 The app code is dependency-free Swift (AppKit, AVFoundation, CoreImage,
 CoreMediaIO, Network). Control rides on two vetted, source-built tools —
@@ -93,10 +96,22 @@ Then install WebDriverAgent on the device once (Xcode):
    cert on the phone when prompted. You can stop the test afterward — the app
    relaunches WDA itself (see below).
 
-   Note: on newer Xcode, WDA's vendored XCTest headers trip clang's
-   `-Wreserved-identifier`. Add `-Wno-reserved-identifier` to `WARNING_CFLAGS`
-   in `Configurations/IOSSettings.xcconfig` + the `project.pbxproj` if the build
-   fails on that.
+   Note: on newer Xcode (tested on Xcode 26), WDA's vendored XCTest headers trip
+   clang's `-Wreserved-identifier`; a GUI build needs `-Wno-reserved-identifier`
+   in `WARNING_CFLAGS`.
+
+   **Command-line / rebranded build:** [`scripts/build-wda.sh`](scripts/build-wda.sh)
+   builds, signs, and packages the runner into an installable `.ipa` from the
+   terminal — handling the Xcode 26 accommodations for you (`-allowProvisioningUpdates`,
+   warnings-as-errors off) — and fully rebrands the runner: **bundle id**
+   (`com.local.imirror.WebDriverAgentRunner`), on-device **name** ("iMirror"), and
+   **app icon** (the same logo as the Mac app, applied as a post-build patch +
+   re-sign). So it installs as a first-class "iMirror" app under your own identity
+   rather than `com.facebook.*`. Run it with your paid Team:
+   `DEVELOPMENT_TEAM=<TEAMID> ./scripts/build-wda.sh`, then install with
+   `tools/go-ios/bin/ios install --path=build/WebDriverAgent.ipa`. See the
+   [rebrand design](docs/2026-07-03-rebrand-wda-and-improvements-design.md) for the
+   why/how. (The macOS app's `runwda` is already wired to launch the branded id.)
 
 ## Run
 
@@ -106,10 +121,17 @@ Then install WebDriverAgent on the device once (Xcode):
 ```
 
 First launch prompts for **Camera** permission (the iOS screen-capture device is
-gated by the camera privilege — iMirror does not use the Mac camera). Grant it,
-pick the iPhone, and the toolbar health dot turns green within ~30 s. Flip the
-**Control** switch to drive the phone; **⤓ Shot** saves a screenshot; **● Record**
-captures mp4.
+gated by the camera privilege — iMirror does not use the Mac camera). Grant it and
+pick the iPhone — the mirror appears immediately. **⤓ Shot** saves a screenshot;
+**● Record** captures mp4.
+
+The app opens **view-only** — no automation, so iOS shows no "Automation Running"
+overlay on the phone. To drive it, open the **Settings (⚙)** popover and turn on
+**Automation**: WebDriverAgent comes up (health dot green within ~30 s), then flip
+the **Control** switch to send taps / swipes / typing from the preview. (On a
+narrow window, Control collapses into the toolbar's `»` overflow menu, where it
+still works.) The Settings popover also holds a scroll-speed slider and the
+one-click **MCP server install** described below.
 
 ## How it works
 
@@ -175,8 +197,9 @@ Supply-chain risk is treated as a first-class constraint:
 [`mcp-server/`](mcp-server/) turns the phone into an **agent-driven test rig**.
 An MCP client (e.g. Claude) controls the device directly — screenshot, tap,
 swipe, scroll (by direction or until an element is visible), type, hardware
-buttons, find-and-tap / wait-for by text, orientation, accessibility source —
-17 tools in all.
+buttons, find-and-tap / wait-for by text, orientation, accessibility source,
+app lifecycle (launch / terminate / activate / state / install), deep links,
+clipboard, and pass/fail assertions — 27 tools in all.
 
 The standout is **test-run recording**: the agent starts a run, names the
 sections it tests, asserts checkpoints as pass/fail, and finishes with a
@@ -186,9 +209,18 @@ step with embedded screenshots, and a looping timelapse of the whole run.
 Ask Claude to "test the login flow and give me a report" and you get reviewable
 evidence from a *real* device, not a simulator.
 
-It talks to the same loopback WDA the app brings up (run the app + green dot
-first). See [mcp-server/README.md](mcp-server/README.md) for the tool table and
-report walkthrough.
+**One-click install.** The app's **Settings (⚙) → MCP server** section registers
+this server with your MCP client(s) in one click — it makes a Python venv
+(**requires Python 3.10+**; e.g. `brew install python`), installs `mcp[cli]`, and
+registers with both **Claude Code** (`claude mcp add`) and **Claude Desktop** (a
+safe merge into `claude_desktop_config.json` that leaves your other servers
+untouched). It shows installed status + version and flags when a re-register is
+needed. Prefer the manual route? See [mcp-server/README.md](mcp-server/README.md).
+
+It talks to the same loopback WDA the app brings up, so **turn on Automation**
+(Settings ⚙) and wait for the green dot before driving the phone. See
+[mcp-server/README.md](mcp-server/README.md) for the tool table and report
+walkthrough.
 
 ## Packaging / distribution
 

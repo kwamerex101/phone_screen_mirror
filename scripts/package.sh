@@ -12,6 +12,7 @@
 # Usage:
 #   ./scripts/package.sh                 # auto-detect signing identity
 #   NOTARY_PROFILE=imirror ./scripts/package.sh   # also notarize + staple
+#   WITH_WDA=build/WebDriverAgent.ipa ./scripts/package.sh
 #
 # One-time notary profile setup (per machine):
 #   xcrun notarytool store-credentials imirror \
@@ -35,12 +36,34 @@ cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 [[ -f "$ROOT/Resources/AppIcon.icns" ]] && cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 [[ -x "$ROOT/tools/go-ios/bin/ios" ]] && cp "$ROOT/tools/go-ios/bin/ios" "$APP/Contents/Resources/ios"
 
-# Pick a signing identity.
+# Bundle the MCP server so the in-app one-click MCP install works from a DMG.
+mkdir -p "$APP/Contents/Resources/mcp-server"
+cp "$ROOT/mcp-server/imirror_mcp.py" "$APP/Contents/Resources/mcp-server/" 2>/dev/null || true
+[[ -f "$ROOT/mcp-server/requirements.txt" ]] && \
+    cp "$ROOT/mcp-server/requirements.txt" "$APP/Contents/Resources/mcp-server/" || true
+
+# Optional: bundle a pre-signed branded WDA .ipa so first run installs it with no Xcode.
+if [[ -n "${WITH_WDA:-}" ]]; then
+    [[ -f "$WITH_WDA" ]] || { echo "WITH_WDA=$WITH_WDA not found" >&2; exit 1; }
+    cp "$WITH_WDA" "$APP/Contents/Resources/WebDriverAgent.ipa"
+    echo "    bundled WDA ipa: $WITH_WDA"
+fi
+
+# Third-party license notices (WDA BSD-3-Clause, go-ios MIT) — required for redistribution.
+mkdir -p "$APP/Contents/Resources/licenses"
+cp "$ROOT/tools/WebDriverAgent/LICENSE" "$APP/Contents/Resources/licenses/WebDriverAgent-LICENSE.txt" 2>/dev/null || true
+cp "$ROOT/tools/go-ios/LICENSE"        "$APP/Contents/Resources/licenses/go-ios-LICENSE.txt" 2>/dev/null || true
+
+# Pick a signing identity — by its SHA-1 hash, not its name. Two "Developer ID
+# Application" certs with the same subject (e.g. after a renewal) make a
+# name-based --sign ambiguous and codesign aborts; the hash is unique.
 IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+            | grep "Developer ID Application" | head -1 | grep -oE '[0-9A-F]{40}' | head -1 || true)"
+IDENTITY_NAME="$(security find-identity -v -p codesigning 2>/dev/null \
             | grep "Developer ID Application" | head -1 | grep -oE '"[^"]+"' | tr -d '"' || true)"
 
 if [[ -n "$IDENTITY" ]]; then
-    echo "==> signing with: $IDENTITY (hardened runtime)"
+    echo "==> signing with: $IDENTITY_NAME [$IDENTITY] (hardened runtime)"
     # Sign nested helper first, then the app (deep is discouraged; sign inside-out).
     [[ -f "$APP/Contents/Resources/ios" ]] && \
         codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP/Contents/Resources/ios"

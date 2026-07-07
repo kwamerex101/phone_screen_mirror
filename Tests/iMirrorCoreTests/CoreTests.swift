@@ -81,3 +81,66 @@ final class WDAParseTests: XCTestCase {
         XCTAssertFalse(WDAParse.ready(nil))
     }
 }
+
+final class MCPConfigTests: XCTestCase {
+    private func parse(_ d: Data) -> [String: Any] {
+        try! JSONSerialization.jsonObject(with: d) as! [String: Any]
+    }
+
+    func testMergeIntoEmptyCreatesEntry() throws {
+        let out = try MCPConfig.merged(into: nil, name: "imirror",
+                                       command: "/venv/python", args: ["/x/imirror_mcp.py"])
+        let servers = parse(out)["mcpServers"] as! [String: Any]
+        let entry = servers["imirror"] as! [String: Any]
+        XCTAssertEqual(entry["command"] as? String, "/venv/python")
+        XCTAssertEqual(entry["args"] as? [String], ["/x/imirror_mcp.py"])
+    }
+
+    func testMergePreservesExistingServers() throws {
+        let existing = #"{"mcpServers":{"other":{"command":"x"}},"theme":"dark"}"#.data(using: .utf8)
+        let out = try MCPConfig.merged(into: existing, name: "imirror",
+                                       command: "/venv/python", args: ["/s.py"])
+        let root = parse(out)
+        XCTAssertEqual(root["theme"] as? String, "dark")             // unrelated key kept
+        let servers = root["mcpServers"] as! [String: Any]
+        XCTAssertNotNil(servers["other"])                            // other server kept
+        XCTAssertNotNil(servers["imirror"])                          // ours added
+    }
+
+    func testMergeReplacesOwnEntry() throws {
+        let first = try MCPConfig.merged(into: nil, name: "imirror", command: "/old", args: [])
+        let second = try MCPConfig.merged(into: first, name: "imirror", command: "/new", args: ["/s.py"])
+        let entry = (parse(second)["mcpServers"] as! [String: Any])["imirror"] as! [String: Any]
+        XCTAssertEqual(entry["command"] as? String, "/new")          // updated in place, not duplicated
+    }
+
+    func testRemovedDropsEntryAndKeepsOthers() throws {
+        let existing = #"{"mcpServers":{"other":{"command":"x"},"imirror":{"command":"y"}}}"#.data(using: .utf8)
+        let out = try MCPConfig.removed(from: existing, name: "imirror")
+        XCTAssertNotNil(out)
+        let servers = parse(out!)["mcpServers"] as! [String: Any]
+        XCTAssertNil(servers["imirror"])
+        XCTAssertNotNil(servers["other"])
+    }
+
+    func testRemovedReturnsNilWhenAbsent() throws {
+        XCTAssertNil(try MCPConfig.removed(from: nil, name: "imirror"))
+        let noneOfOurs = #"{"mcpServers":{"other":{}}}"#.data(using: .utf8)
+        XCTAssertNil(try MCPConfig.removed(from: noneOfOurs, name: "imirror"))
+    }
+
+    func testContains() {
+        let has = #"{"mcpServers":{"imirror":{}}}"#.data(using: .utf8)
+        XCTAssertTrue(MCPConfig.contains(has, name: "imirror"))
+        XCTAssertFalse(MCPConfig.contains(#"{}"#.data(using: .utf8), name: "imirror"))
+        XCTAssertFalse(MCPConfig.contains(nil, name: "imirror"))
+    }
+
+    func testEntryReadsCommandAndArgs() {
+        let cfg = #"{"mcpServers":{"imirror":{"command":"/venv/python","args":["/old/x.py"]}}}"#.data(using: .utf8)
+        let e = MCPConfig.entry(cfg, name: "imirror")
+        XCTAssertEqual(e?.command, "/venv/python")
+        XCTAssertEqual(e?.args, ["/old/x.py"])          // used to detect a stale registration
+        XCTAssertNil(MCPConfig.entry(cfg, name: "nope"))
+    }
+}

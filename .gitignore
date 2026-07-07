@@ -7,3 +7,7 @@ tools/
 .venv/
 __pycache__/
 .pytest_cache/
+
+# scratch / tooling state (not project code)
+.superpowers/
+.remember/

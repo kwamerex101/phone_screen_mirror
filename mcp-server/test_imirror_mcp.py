@@ -75,12 +75,120 @@ def wda(mod, monkeypatch):
     "http://10.0.0.5:8100",
     "https://example.com",
     "http://evil.localhost.attacker.com",
+    # suffix-abuse: these pass a naive startswith() prefix check but resolve off-box
+    "http://127.0.0.1.attacker.example:8100",
+    "http://localhost.attacker.example:8100",
+    "https://127.0.0.1:8100",              # non-http scheme to a loopback host
 ])
 def test_refuses_non_loopback_target(monkeypatch, target):
     monkeypatch.setenv("IMIRROR_WDA", target)
     sys.modules.pop("imirror_mcp", None)
     with pytest.raises(SystemExit):
         importlib.import_module("imirror_mcp")
+
+
+@pytest.mark.parametrize("target", [
+    "http://127.0.0.1:8100",
+    "http://localhost:8100",
+    "http://127.0.0.2:9100",               # anywhere in 127.0.0.0/8 is loopback
+    "http://[::1]:8100",                    # IPv6 loopback
+])
+def test_accepts_loopback_target(monkeypatch, target):
+    monkeypatch.setenv("IMIRROR_WDA", target)
+    sys.modules.pop("imirror_mcp", None)
+    m = importlib.import_module("imirror_mcp")   # must not raise
+    assert m._is_loopback_url(target)
+
+
+# ---- HTTP wire layer (_req over the _http seam) --------------------------------
+
+def test_req_parses_json_body(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_http", lambda *a: (200, b'{"value": 42}'))
+    assert mod._req("GET", "/status") == (200, {"value": 42})
+
+
+def test_req_returns_error_code_and_body(mod, monkeypatch):
+    """4xx/5xx come back as a normal response (not an exception) so callers like
+    _session_post can see the code and recreate a stale session."""
+    monkeypatch.setattr(mod, "_http", lambda *a: (404, b'{"value": "no session"}'))
+    assert mod._req("POST", "/session/s/actions", {}) == (404, {"value": "no session"})
+
+
+def test_req_wraps_non_json_error_body(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_http", lambda *a: (500, b"Internal Error"))
+    code, j = mod._req("GET", "/x")
+    assert code == 500 and j["error"] == "Internal Error"
+
+
+def test_req_retries_transient_drop_then_succeeds(mod, monkeypatch):
+    import http.client
+    calls = {"n": 0}
+
+    def flaky(method, path, data, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise http.client.RemoteDisconnected("boom")
+        return 200, b'{"ok": true}'
+
+    monkeypatch.setattr(mod, "_http", flaky)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+    assert mod._req("GET", "/status") == (200, {"ok": True})
+    assert calls["n"] == 2
+
+
+def test_req_timeout_gives_actionable_error(mod, monkeypatch):
+    import socket
+
+    def slow(*a):
+        raise socket.timeout("timed out")
+
+    monkeypatch.setattr(mod, "_http", slow)
+    with pytest.raises(RuntimeError, match="timed out"):
+        mod._req("GET", "/source", timeout=1)
+
+
+def test_req_unreachable_gives_actionable_error(mod, monkeypatch):
+    def refused(*a):
+        raise ConnectionRefusedError("nope")
+
+    monkeypatch.setattr(mod, "_http", refused)
+    with pytest.raises(RuntimeError, match="Cannot reach WDA"):
+        mod._req("GET", "/status")
+
+
+def test_http_reconnects_after_failure(mod, monkeypatch):
+    """A connection-level error must poison the cached connection so the next
+    call builds a fresh one rather than reusing a half-closed socket."""
+    class FakeConn:
+        instances: list = []
+
+        def __init__(self, *a, **k):
+            self.closed = False
+            self.timeout = None
+            FakeConn.instances.append(self)
+
+        def request(self, *a, **k):
+            if len(FakeConn.instances) == 1:
+                raise ConnectionResetError("reset")
+
+        def getresponse(self):
+            class R:
+                status = 200
+                def read(self_inner): return b"{}"
+            return R()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(mod.http.client, "HTTPConnection", FakeConn)
+    mod._drop_conn()
+    with pytest.raises(ConnectionResetError):
+        mod._http("GET", "/x", None, 5)
+    assert FakeConn.instances[0].closed and getattr(mod._conn_local, "c", None) is None
+    # next call transparently opens a new connection and succeeds
+    assert mod._http("GET", "/x", None, 5) == (200, b"{}")
+    assert len(FakeConn.instances) == 2
+    mod._drop_conn()
 
 
 # ---- session lifecycle ---------------------------------------------------------
@@ -116,7 +224,8 @@ def test_status_summarizes(mod, wda):
         "ready": True, "message": "ok",
         "os": {"version": "17.4"}, "device": "iPhone"}}))
     out = json.loads(mod.ios_status())
-    assert out == {"ready": True, "message": "ok", "ios": "17.4", "device": "iPhone"}
+    assert out == {"ready": True, "message": "ok", "ios": "17.4", "device": "iPhone",
+                   "server_version": mod.__version__}
 
 
 def test_source_truncates_large_output(mod, wda):
@@ -679,3 +788,221 @@ def test_screenshot_cap_stops_saving(mod, wda, monkeypatch, tmp_path):
     assert len(saved) == 2                        # only the first 2 persisted
     notes = [s for s in mod._run["steps"] if s["action"] == "note"]
     assert len(notes) == 1 and "cap reached" in notes[0]["detail"]
+
+
+# ---- app lifecycle -------------------------------------------------------------
+
+def test_launch_app_posts_bundle_id(mod, wda):
+    wda.allow("/wda/apps/launch")
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_launch_app("com.apple.Preferences")
+    body = next(b for m, p, b in wda.calls if p.endswith("/wda/apps/launch"))
+    assert body == {"bundleId": "com.apple.Preferences"}
+
+
+def test_terminate_app_posts_bundle_id(mod, wda):
+    wda.allow("/wda/apps/terminate")
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_terminate_app("com.apple.Preferences")
+    assert any(p.endswith("/wda/apps/terminate") for m, p, _ in wda.calls)
+
+
+def test_activate_app_posts_bundle_id(mod, wda):
+    wda.allow("/wda/apps/activate")
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_activate_app("com.apple.Preferences")
+    body = next(b for m, p, b in wda.calls if p.endswith("/wda/apps/activate"))
+    assert body == {"bundleId": "com.apple.Preferences"}
+
+
+def test_app_state_maps_code_to_name(mod, wda):
+    import json
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/wda/apps/state", (200, {"value": 4}))
+    out = json.loads(mod.ios_app_state("com.apple.Preferences"))
+    assert out == {"bundleId": "com.apple.Preferences", "state": "foreground", "code": 4}
+
+
+# ---- url + clipboard -----------------------------------------------------------
+
+def test_open_url_posts_url(mod, wda):
+    wda.allow("/url")
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_open_url("myapp://path")
+    body = next(b for m, p, b in wda.calls if p.endswith("/url"))
+    assert body == {"url": "myapp://path"}
+
+
+def test_clipboard_set_base64_encodes(mod, wda):
+    import base64
+    wda.allow("/wda/setPasteboard")
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_clipboard_set("hello")
+    body = next(b for m, p, b in wda.calls if p.endswith("/wda/setPasteboard"))
+    assert body == {"content": base64.b64encode(b"hello").decode(),
+                    "contentType": "plaintext"}
+
+
+def test_clipboard_get_base64_decodes(mod, wda):
+    import base64
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/wda/getPasteboard",
+               (200, {"value": base64.b64encode(b"copied").decode()}))
+    assert mod.ios_clipboard_get() == "copied"
+
+
+# ---- install app (go-ios shell-out) --------------------------------------------
+
+def test_install_app_invokes_go_ios(mod, monkeypatch, tmp_path):
+    ipa = tmp_path / "App.ipa"; ipa.write_bytes(b"PK\x03\x04")
+    seen = {}
+    def fake_run(args, **kw):
+        seen["args"] = args
+        class R: returncode = 0; stderr = ""
+        return R()
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    out = mod.ios_install_app(str(ipa))
+    assert seen["args"][1] == "install" and f"--path={ipa}" in seen["args"]
+    assert "installed" in out
+
+
+def test_install_app_missing_file_raises(mod):
+    with pytest.raises(RuntimeError, match="No such file"):
+        mod.ios_install_app("/nope/x.ipa")
+
+
+def test_install_app_reports_go_ios_failure(mod, monkeypatch, tmp_path):
+    import subprocess
+    ipa = tmp_path / "App.ipa"; ipa.write_bytes(b"x")
+    def boom(args, **kw):
+        raise subprocess.CalledProcessError(1, args, stderr="device locked")
+    monkeypatch.setattr(mod.subprocess, "run", boom)
+    with pytest.raises(RuntimeError, match="install failed: device locked"):
+        mod.ios_install_app(str(ipa))
+
+
+# ---- assertions ----------------------------------------------------------------
+
+def test_assert_visible_passes_and_records_pass(mod, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "_req", lambda *a, **k: (200, {"value": {}}))
+    mod.ios_start_run("asserts")
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: "e1")
+    out = mod.ios_assert_visible("Welcome")
+    assert "PASS" in out
+    notes = [s for s in mod._run["steps"] if s["action"] == "note"]
+    assert notes and notes[-1]["note"] == "pass"
+
+
+def test_assert_visible_fails_records_fail_and_raises(mod, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "_req", lambda *a, **k: (200, {"value": {}}))
+    mod.ios_start_run("asserts")
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: None)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+    with pytest.raises(RuntimeError, match="ASSERT FAILED"):
+        mod.ios_assert_visible("Ghost", timeout_s=0)
+    fails = [s for s in mod._run["steps"] if s["action"] == "note" and s["note"] == "fail"]
+    assert fails and "Ghost" in fails[0]["detail"]
+
+
+def test_assert_not_visible_passes_when_absent(mod, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "_req", lambda *a, **k: (200, {"value": {}}))
+    mod.ios_start_run("asserts")
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: None)
+    out = mod.ios_assert_not_visible("Spinner")
+    assert "PASS" in out
+    assert mod._run["steps"][-1]["note"] == "pass"
+
+
+def test_assert_failure_shows_in_report(mod, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "_req", lambda *a, **k: (200, {"value": {}}))
+    mod.ios_start_run("report")
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: None)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+    with pytest.raises(RuntimeError):
+        mod.ios_assert_visible("Missing", timeout_s=0)
+    report = mod.ios_finish_run(video="none")
+    html = open(report, encoding="utf-8").read()
+    assert "1 failures" in html and ">FAIL<" in html
+
+
+# ---- find-and-tap retry --------------------------------------------------------
+
+def test_find_and_tap_retries_until_present(mod, wda, monkeypatch):
+    wda.allow("/click")
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    seq = [None, "e1"]                       # absent, then appears
+    monkeypatch.setattr(mod, "_find_element", lambda *a, **k: seq.pop(0))
+    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+    out = mod.ios_find_and_tap("Continue", retries=1)
+    assert "tapped" in out
+    assert seq == []                         # both attempts consumed
+
+
+# ---- review-fix coverage -------------------------------------------------------
+
+def test_app_state_unknown_code(mod, wda):
+    import json
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/wda/apps/state", (200, {"value": 9}))
+    out = json.loads(mod.ios_app_state("com.apple.Preferences"))
+    assert out["state"] == "unknown(9)" and out["code"] == 9
+
+
+def test_clipboard_get_falls_back_on_bad_base64(mod, wda):
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/wda/getPasteboard", (200, {"value": "a"}))   # not valid base64
+    assert mod.ios_clipboard_get() == "a"
+
+
+# ---- crash-safe run log + clobber warning --------------------------------------
+
+def test_record_appends_to_steps_jsonl(mod, wda, monkeypatch, tmp_path):
+    """Each step is flushed to steps.jsonl so a crash mid-run leaves a replayable
+    log beside the screenshots already on disk."""
+    import json
+    wda.allow("/actions")
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}))
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_start_run("crashy")
+    mod.ios_tap(1, 2)
+    mod.ios_run_note("checkpoint", status="pass")
+    log = os.path.join(mod._run["dir"], "steps.jsonl")
+    lines = [json.loads(l) for l in open(log, encoding="utf-8") if l.strip()]
+    actions = [l["action"] for l in lines]
+    assert "tap" in actions and "note" in actions
+
+
+def test_record_survives_unwritable_run_dir(mod, wda, monkeypatch, tmp_path):
+    """A failed steps.jsonl append must never break in-memory recording."""
+    wda.allow("/actions")
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}))
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod.ios_start_run("x")
+    mod._run["dir"] = "/nonexistent/dir/xyz"       # force the append to fail
+    mod.ios_tap(1, 2)                              # must not raise
+    assert any(s["action"] == "tap" for s in mod._run["steps"])
+
+
+def test_start_run_warns_when_clobbering_active_run(mod, wda, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    wda.script("/status", (200, {"value": {}}), (200, {"value": {}}))
+    mod.ios_start_run("first")
+    mod.ios_run_note("did work", status="pass")
+    out = mod.ios_start_run("second")
+    assert "WARNING" in out and "first" in out and "recording run" in out
+
+
+def test_ios_bin_prefers_env_then_bundle_then_path(mod, monkeypatch):
+    monkeypatch.setenv("IMIRROR_IOS_BIN", "/custom/ios")
+    assert mod._ios_bin() == "/custom/ios"
+    monkeypatch.delenv("IMIRROR_IOS_BIN", raising=False)
+    monkeypatch.setattr(mod.os.path, "exists", lambda p: p == mod._BUNDLED_IOS)
+    assert mod._ios_bin() == mod._BUNDLED_IOS
+    monkeypatch.setattr(mod.os.path, "exists", lambda p: False)
+    assert mod._ios_bin() == "ios"
