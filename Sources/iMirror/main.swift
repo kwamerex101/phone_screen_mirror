@@ -61,6 +61,49 @@ final class PreviewView: NSView {
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    /// True while Control is armed. Drives the cursor (a pointing hand signals the
+    /// mirror is interactive) so a click while Control is off isn't a silent no-op.
+    var controlActive = false {
+        didSet {
+            guard controlActive != oldValue else { return }
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+
+    override func resetCursorRects() {
+        if controlActive { addCursorRect(bounds, cursor: .pointingHand) }
+    }
+
+    /// Brief local ripple at a tap point — acknowledges the tap the instant it's
+    /// dispatched, independent of WDA's network round-trip, so a slow response
+    /// reads differently from a dropped one.
+    func flashTap(at point: CGPoint) {
+        let d: CGFloat = 46
+        let ripple = CAShapeLayer()
+        ripple.path = CGPath(ellipseIn: CGRect(x: -d / 2, y: -d / 2, width: d, height: d), transform: nil)
+        ripple.position = point
+        ripple.fillColor = NSColor.controlAccentColor.withAlphaComponent(0.18).cgColor
+        ripple.strokeColor = NSColor.controlAccentColor.withAlphaComponent(0.9).cgColor
+        ripple.lineWidth = 2
+        ripple.opacity = 0
+        previewLayer.addSublayer(ripple)
+
+        let scale = CABasicAnimation(keyPath: "transform.scale")
+        scale.fromValue = 0.35
+        scale.toValue = 1.0
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0.9
+        fade.toValue = 0.0
+        let group = CAAnimationGroup()
+        group.animations = [scale, fade]
+        group.duration = 0.35
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        ripple.add(group, forKey: "tapFlash")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.36) { [weak ripple] in
+            ripple?.removeFromSuperlayer()
+        }
+    }
+
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         downPoint = p
@@ -223,6 +266,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private var window: NSWindow!
     private var previewView: PreviewView!
     private var emptyStateView: NSView!
+    private var emptyStateTitle: NSTextField!
+    private var emptyStateHint: NSTextField!
     private var statusLabel: NSTextField!
 
     // Toolbar controls
@@ -234,6 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private var settingsBuilt = false
     private let mcpButton = NSButton()
     private let mcpUninstallButton = NSButton()
+    private let mcpSpinner = NSProgressIndicator()
     private let mcpStatusLabel = NSTextField(labelWithString: "")
     private var mcpInstalled = false
     private let healthButton = NSButton()
@@ -274,10 +320,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private var captureWatchdogTimer: Timer?
     private var lastCaptureRecovery: Date?
 
+    // True while the window shows any pixels. When it's fully hidden (miniaturized
+    // or occluded) we pause the screenshot frame-grabber and the capture watchdog
+    // so a hidden window costs no continuous decode/probe work.
+    private var appVisible = true
+
     // MARK: Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         enableScreenCaptureDevices()
+        buildMainMenu()
         buildWindow()
         requestCameraAccessThenStart()
         observeDeviceChanges()
@@ -285,6 +337,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         // view-only mirroring, so nothing runs on the phone and iOS shows no
         // "Automation Running" overlay. Flip the Automation toggle to bring WDA up.
         startCaptureWatchdog()
+        // Surface a terminal-looking state if the WDA runner just can't start
+        // (bad signing / unsupported device) rather than looping silently on red.
+        transport.onWDAUnrecoverable = { [weak self] in
+            guard let self, self.automationEnabled, self.health == .down else { return }
+            self.setStatus("WebDriverAgent isn't starting — check the runner is "
+                         + "installed/trusted for this device (Settings ▸ General ▸ VPN & Device Management).")
+        }
         updateHealthDot()        // grey — automation off
         // Restore the last Automation choice (default off = view-only mirroring).
         if UserDefaults.standard.bool(forKey: "imirror.automationEnabled") {
@@ -305,6 +364,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     // MARK: UI
 
+    /// A plain SPM executable ships no MainMenu nib, so build one: the standard App
+    /// and Window menus (Quit/Hide/Minimize a Mac user expects) plus a Controls
+    /// menu that gives the toolbar actions real keyboard shortcuts.
+    private func buildMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appItem = NSMenuItem()
+        mainMenu.addItem(appItem)
+        let appMenu = NSMenu()
+        appItem.submenu = appMenu
+        appMenu.addItem(withTitle: "About iMirror",
+                        action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Hide iMirror",
+                        action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        let hideOthers = appMenu.addItem(withTitle: "Hide Others",
+                        action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        appMenu.addItem(withTitle: "Show All",
+                        action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit iMirror",
+                        action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+
+        let ctrlItem = NSMenuItem()
+        mainMenu.addItem(ctrlItem)
+        let ctrlMenu = NSMenu(title: "Controls")
+        ctrlItem.submenu = ctrlMenu
+        let rec = ctrlMenu.addItem(withTitle: "Record", action: #selector(toggleRecord), keyEquivalent: "r")
+        rec.target = self
+        let shot = ctrlMenu.addItem(withTitle: "Screenshot", action: #selector(takeScreenshot), keyEquivalent: "s")
+        shot.target = self
+        let home = ctrlMenu.addItem(withTitle: "Home", action: #selector(pressHome), keyEquivalent: "h")
+        home.keyEquivalentModifierMask = [.command, .shift]
+        home.target = self
+
+        let winItem = NSMenuItem()
+        mainMenu.addItem(winItem)
+        let winMenu = NSMenu(title: "Window")
+        winItem.submenu = winMenu
+        winMenu.addItem(withTitle: "Minimize",
+                        action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        winMenu.addItem(withTitle: "Zoom",
+                        action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        NSApp.windowsMenu = winMenu
+
+        NSApp.mainMenu = mainMenu
+    }
+
     private func buildWindow() {
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 430, height: 880),
@@ -314,6 +422,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         window.titleVisibility = .hidden   // free the unified toolbar for the controls
         window.center()
         window.setFrameAutosaveName("iMirrorMain")
+        // Stop the window shrinking into a degenerate size that clips the toolbar;
+        // the content aspect ratio is locked to the phone once its size is known.
+        window.contentMinSize = NSSize(width: 260, height: 480)
 
         // Container: preview fills it; a click-through glass HUD shows status at
         // the bottom so the toolbar stays clean.
@@ -371,17 +482,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         controlSwitch.target = self
         controlSwitch.action = #selector(toggleControl)
         controlSwitch.isEnabled = false
+        controlSwitch.setAccessibilityLabel("Control — drive the phone from the preview")
 
         // Automation switch — starts/stops WebDriverAgent (and iOS's on-phone
         // "Automation Running" overlay). Off by default: view-only until you opt in.
         automationSwitch.target = self
         automationSwitch.action = #selector(toggleAutomation)
         automationSwitch.state = .off
+        automationSwitch.setAccessibilityLabel("Automation — start or stop WebDriverAgent")
 
         // Health dot — colored status, click to force a re-check
         healthButton.isBordered = false
         healthButton.bezelStyle = .toolbar
         healthButton.imagePosition = .imageOnly
+        healthButton.wantsLayer = true   // for the tint cross-fade + connecting pulse
         healthButton.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "WDA status")
         healthButton.contentTintColor = .systemGray
         healthButton.target = self
@@ -427,11 +541,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         title.font = .systemFont(ofSize: 15, weight: .medium)
         title.textColor = .secondaryLabelColor
         title.alignment = .center
+        emptyStateTitle = title
 
         let hint = NSTextField(labelWithString: "Plug in via USB, unlock, and tap “Trust.”")
         hint.font = .systemFont(ofSize: 12)
         hint.textColor = .tertiaryLabelColor
         hint.alignment = .center
+        emptyStateHint = hint
 
         let stack = NSStackView(views: [icon, title, hint])
         stack.orientation = .vertical
@@ -439,7 +555,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         stack.spacing = 6
         stack.setCustomSpacing(16, after: icon)
         stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.wantsLayer = true                    // layer-backed so alphaValue animates
         return stack
+    }
+
+    /// Cross-fade the empty state instead of snapping it — the first mirror frame
+    /// otherwise pops in abruptly the instant a device binds.
+    private func setEmptyState(hidden: Bool) {
+        guard let v = emptyStateView else { return }
+        if hidden {
+            guard !v.isHidden else { return }
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.25
+                v.animator().alphaValue = 0
+            }, completionHandler: { v.isHidden = true })
+        } else {
+            v.isHidden = false
+            v.alphaValue = 0
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.25
+                v.animator().alphaValue = 1
+            }
+        }
+    }
+
+    /// Update the empty-state copy to match the real reason there's no mirror, so
+    /// a permission failure doesn't show the generic "plug in via USB" guidance.
+    private func setEmptyStateReason(title: String, hint: String) {
+        emptyStateTitle?.stringValue = title
+        emptyStateHint?.stringValue = hint
     }
 
     private func actionItem(_ id: NSToolbarItem.Identifier, _ label: String,
@@ -539,12 +683,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
                 DispatchQueue.main.async {
                     if granted { self?.configureSession() }
-                    else { self?.setStatus("Camera access denied — enable in System Settings ▸ Privacy") }
+                    else { self?.showCameraDenied() }
                 }
             }
         default:
-            setStatus("Camera access denied — enable in System Settings ▸ Privacy ▸ Camera")
+            showCameraDenied()
         }
+    }
+
+    /// Camera access is what feeds the mirror; without it there's nothing to show.
+    /// Say so in the primary empty state, not just the footer HUD, so the user
+    /// isn't told to "plug in via USB" when the real fix is a privacy setting.
+    private func showCameraDenied() {
+        setEmptyStateReason(title: "Camera access needed",
+                            hint: "Enable it in System Settings ▸ Privacy & Security ▸ Camera, then reopen iMirror.")
+        setEmptyState(hidden: false)
+        setStatus("Camera access denied — enable in System Settings ▸ Privacy & Security ▸ Camera.")
     }
 
     private func configureSession() {
@@ -585,9 +739,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         NotificationCenter.default.addObserver(
             self, selector: #selector(sessionInterruptionEnded),
             name: .AVCaptureSessionInterruptionEnded, object: session)
+        // Pause per-frame work + the capture watchdog while the window is hidden.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(occlusionChanged),
+            name: NSWindow.didChangeOcclusionStateNotification, object: window)
     }
 
-    @objc private func deviceChanged(_ note: Notification) { refreshDevices() }
+    @objc private func occlusionChanged() {
+        let visible = window.occlusionState.contains(.visible)
+        guard visible != appVisible else { return }
+        appVisible = visible
+        // Stop delivering frames to the screenshot grabber while hidden (the live
+        // preview layer is driven separately and unaffected). On reveal, reset the
+        // liveness clock so the watchdog doesn't fire on the hidden gap.
+        videoDataOutput.connection(with: .video)?.isEnabled = visible
+        if visible { frameGrabber.markActive() }
+    }
+
+    @objc private func deviceChanged(_ note: Notification) {
+        refreshDevices()
+        // Fast replug recovery: when a phone (re)appears while automation is on but
+        // WDA is down, the go-ios chain has likely backed off — kick a clean chain
+        // restart now instead of waiting out the slow down-watchdog. Rate-limited
+        // (and shares lastWDARestart) so it can't storm if the device flaps.
+        // Gated on a prior successful connect so this only ever fires on a genuine
+        // replug, never during the initial bring-up (health starts .down).
+        guard automationEnabled, transport.canSelfManage, hadSuccessfulConnection,
+              !devices.isEmpty, health == .down else { return }
+        if let last = lastWDARestart, Date().timeIntervalSince(last) < 30 { return }
+        lastWDARestart = Date()
+        downSince = Date()
+        setStatus("iPhone reconnected — restarting WebDriverAgent…")
+        transport.restartChain()
+    }
 
     @objc private func sessionRuntimeError(_ note: Notification) {
         let err = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
@@ -616,6 +800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     /// the input to restart the CoreMediaIO stream. Rate-limited so a device that
     /// can't deliver (e.g. truly unplugged) isn't bounced every tick.
     private func checkCaptureLiveness() {
+        guard appVisible else { return }                        // hidden — frame delivery is paused
         guard currentInput != nil else { return }               // no device selected — nothing to recover
         let stalled = frameGrabber.secondsSinceLastFrame > 5
         let stopped = !session.isRunning
@@ -698,7 +883,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             }
         }
         session.commitConfiguration()
-        emptyStateView?.isHidden = (currentInput != nil)   // hide once a phone is bound
+        if currentInput == nil {
+            // Back to no-device: restore the default guidance (a prior failure may
+            // have changed it) unless the camera itself is blocked.
+            if AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
+                setEmptyStateReason(title: "No iPhone connected",
+                                    hint: "Plug in via USB, unlock, and tap “Trust.”")
+            }
+        }
+        setEmptyState(hidden: currentInput != nil)         // fade out once a phone is bound
     }
 
     // MARK: Recording
@@ -735,25 +928,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             setStatus("No frame yet — wait for the mirror to start.")
             return
         }
-        let ciImage = CIImage(cvImageBuffer: pixelBuffer)
-        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
-            setStatus("Screenshot failed (could not render frame).")
-            return
-        }
-        let rep = NSBitmapImageRep(cgImage: cgImage)
-        guard let png = rep.representation(using: .png, properties: [:]) else {
-            setStatus("Screenshot failed (could not encode PNG).")
-            return
-        }
         let name = "iMirror_\(timestamp()).png"
         let url = FileManager.default
             .urls(for: .picturesDirectory, in: .userDomainMask).first!
             .appendingPathComponent(name)
-        do {
-            try png.write(to: url)
-            setStatus("Saved \(url.lastPathComponent) → ~/Pictures")
-        } catch {
-            setStatus("Screenshot save failed: \(error.localizedDescription)")
+        // Render + PNG-encode + write off the main thread: a CIContext render and a
+        // blocking file write (to a possibly iCloud-synced ~/Pictures) would
+        // otherwise hitch the UI on a click that should feel instant. Only the
+        // status update hops back to main.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let ciImage = CIImage(cvImageBuffer: pixelBuffer)
+            guard let cgImage = self.ciContext.createCGImage(ciImage, from: ciImage.extent) else {
+                DispatchQueue.main.async { self.setStatus("Screenshot failed (could not render frame).") }
+                return
+            }
+            let rep = NSBitmapImageRep(cgImage: cgImage)
+            guard let png = rep.representation(using: .png, properties: [:]) else {
+                DispatchQueue.main.async { self.setStatus("Screenshot failed (could not encode PNG).") }
+                return
+            }
+            do {
+                try png.write(to: url)
+                DispatchQueue.main.async { self.setStatus("Saved \(url.lastPathComponent) → ~/Pictures") }
+            } catch {
+                DispatchQueue.main.async { self.setStatus("Screenshot save failed: \(error.localizedDescription)") }
+            }
         }
     }
 
@@ -775,6 +975,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         previewView.onTap = { [weak self] viewPoint in
             guard let self, self.controlEnabled, let p = self.devicePoint(fromViewPoint: viewPoint) else { return }
             self.wda?.tap(at: p)
+            self.previewView.flashTap(at: viewPoint)   // local acknowledgment
         }
         previewView.onDrag = { [weak self] viewPath, flick in
             guard let self, self.controlEnabled else { return }
@@ -904,6 +1105,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             homeItem?.isEnabled = true
             if changed {
                 let s = wda?.deviceSize ?? .zero
+                // Lock resizing to the phone's proportions so the mirror fills the
+                // window without letterboxing (portrait points; landscape just
+                // shows bars until the next connect).
+                if s.width > 0, s.height > 0 {
+                    window.contentAspectRatio = NSSize(width: s.width, height: s.height)
+                }
                 setStatus("WDA connected — \(Int(s.width))×\(Int(s.height)) pts. Flip Control to drive.")
             }
         case .connecting:
@@ -915,6 +1122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             if controlEnabled {
                 controlEnabled = false
                 controlSwitch.state = .off
+                previewView.controlActive = false
                 previewView.resetScroll()
             }
             controlSwitch.isEnabled = false
@@ -939,22 +1147,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         }
     }
 
+    private var healthDotColor: NSColor?
+
     private func updateHealthDot() {
         guard automationEnabled else {
-            healthButton.contentTintColor = .systemGray
-            healthButton.toolTip = "Automation off — flip Automation on to control the phone"
+            setHealthDot(.systemGray, tip: "Automation off — flip Automation on to control the phone",
+                         a11y: "automation off", pulsing: false)
             return
         }
         switch health {
         case .connected:
-            healthButton.contentTintColor = .systemGreen
-            healthButton.toolTip = "WDA connected — click to re-check"
+            setHealthDot(.systemGreen, tip: "WDA connected — click to re-check",
+                         a11y: "connected", pulsing: false)
         case .connecting:
-            healthButton.contentTintColor = .systemYellow
-            healthButton.toolTip = "Connecting to WDA…"
+            setHealthDot(.systemYellow, tip: "Connecting to WDA…",
+                         a11y: "connecting", pulsing: true)
         case .down:
-            healthButton.contentTintColor = .systemRed
-            healthButton.toolTip = "WDA unreachable — click to re-check"
+            setHealthDot(.systemRed, tip: "WDA unreachable — click to re-check",
+                         a11y: "unreachable", pulsing: false)
+        }
+    }
+
+    /// Apply the health dot's colour/tooltip/label. Cross-fades the tint only when
+    /// it actually changes (so a steady state doesn't flicker every probe), and
+    /// runs a gentle opacity pulse while connecting so "in progress" reads
+    /// differently from a stuck yellow. Also updates the VoiceOver label so status
+    /// isn't communicated by hue alone.
+    private func setHealthDot(_ color: NSColor, tip: String, a11y: String, pulsing: Bool) {
+        healthButton.toolTip = tip
+        healthButton.setAccessibilityLabel("WDA status: \(a11y)")
+        if color != healthDotColor {
+            let fade = CATransition()
+            fade.type = .fade
+            fade.duration = 0.25
+            healthButton.layer?.add(fade, forKey: "tint")
+            healthButton.contentTintColor = color
+            healthDotColor = color
+        }
+        let key = "connectingPulse"
+        if pulsing {
+            if healthButton.layer?.animation(forKey: key) == nil {
+                let pulse = CABasicAnimation(keyPath: "opacity")
+                pulse.fromValue = 1.0
+                pulse.toValue = 0.35
+                pulse.duration = 0.7
+                pulse.autoreverses = true
+                pulse.repeatCount = .infinity
+                healthButton.layer?.add(pulse, forKey: key)
+            }
+        } else {
+            healthButton.layer?.removeAnimation(forKey: key)
         }
     }
 
@@ -963,10 +1205,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         guard health == .connected else {
             controlSwitch.state = .off
             controlEnabled = false
+            previewView.controlActive = false
             setStatus("Can't enable control — WDA not connected (dot is not green).")
             return
         }
         controlEnabled = (controlSwitch.state == .on)
+        previewView.controlActive = controlEnabled
         if !controlEnabled { previewView.resetScroll() }
         setStatus(controlEnabled
             ? "Control ON — clicks/keys drive the phone."
@@ -992,6 +1236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             controlEnabled = false
             controlSwitch.state = .off
             controlSwitch.isEnabled = false
+            previewView.controlActive = false
             previewView.resetScroll()
             homeItem?.isEnabled = false
             healthTimer?.invalidate(); healthTimer = nil
@@ -1094,7 +1339,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         mcpUninstallButton.target = self
         mcpUninstallButton.action = #selector(uninstallMCP)
         mcpUninstallButton.isHidden = true
-        let mcpButtons = NSStackView(views: [mcpButton, mcpUninstallButton])
+        mcpSpinner.style = .spinning
+        mcpSpinner.controlSize = .small
+        mcpSpinner.isDisplayedWhenStopped = false   // invisible until an op runs
+        let mcpButtons = NSStackView(views: [mcpButton, mcpUninstallButton, mcpSpinner])
         mcpButtons.orientation = .horizontal
         mcpButtons.spacing = 8
         stack.addArrangedSubview(mcpButtons)
@@ -1153,6 +1401,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     @objc private func primaryMCP() {
         mcpButton.isEnabled = false; mcpUninstallButton.isEnabled = false
+        mcpSpinner.startAnimation(nil)
         let updating = mcpInstalled          // reinstall/update re-points paths + refreshes deps
         mcpStatusLabel.stringValue = updating
             ? "Updating…" : "Installing… (first run sets up Python — up to ~30s)"
@@ -1160,6 +1409,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             self?.mcpStatusLabel.stringValue = msg
         }, completion: { [weak self] r in
             guard let self else { return }
+            self.mcpSpinner.stopAnimation(nil)
             self.mcpStatusLabel.stringValue = r.message
             self.mcpButton.isEnabled = true; self.mcpUninstallButton.isEnabled = true
             self.refreshMCP(updateLabel: false)
@@ -1168,9 +1418,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     @objc private func uninstallMCP() {
         mcpButton.isEnabled = false; mcpUninstallButton.isEnabled = false
+        mcpSpinner.startAnimation(nil)
         mcpStatusLabel.stringValue = "Removing…"
         MCPInstaller.uninstall { [weak self] r in
             guard let self else { return }
+            self.mcpSpinner.stopAnimation(nil)
             self.mcpStatusLabel.stringValue = r.message
             self.mcpButton.isEnabled = true; self.mcpUninstallButton.isEnabled = true
             self.refreshMCP(updateLabel: false)
