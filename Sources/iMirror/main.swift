@@ -282,6 +282,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private let mcpUninstallButton = NSButton()
     private let mcpSpinner = NSProgressIndicator()
     private let mcpStatusLabel = NSTextField(labelWithString: "")
+    private let iosRunnerLabel = NSTextField(labelWithString: "")
+    private var lastRunnerInstall: RunnerInstall?
     private var mcpInstalled = false
     private let healthButton = NSButton()
     private var recordItem: NSToolbarItem!
@@ -362,6 +364,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
                 self.setStatus("Installing WebDriverAgent on iPhone… (first time can take ~30s)")
             case .done(let result):
                 self.installingRunner = false
+                self.lastRunnerInstall = result
+                self.updateRunnerStatusLabel()
                 switch result {
                 case .installed:
                     self.setStatus("WebDriverAgent installed — starting…")
@@ -1358,6 +1362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     @objc private func showSettings() {
         if !settingsBuilt { buildSettingsPopover(); settingsBuilt = true }
+        updateRunnerStatusLabel()   // refresh device/runner status each time it opens
         if settingsPopover.isShown { settingsPopover.close(); return }
         // Anchor to the gear when it's on screen; if it overflowed into the `»` menu
         // its view is detached (no window), so fall back to the window content view.
@@ -1402,6 +1407,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         slider.widthAnchor.constraint(equalToConstant: 150).isActive = true
         scrollRow.addArrangedSubview(slider)
         stack.addArrangedSubview(scrollRow)
+
+        // iPhone section — whether the WebDriverAgent runner is on the device.
+        let devSep = NSBox(); devSep.boxType = .separator
+        devSep.translatesAutoresizingMaskIntoConstraints = false
+        devSep.widthAnchor.constraint(equalToConstant: 268).isActive = true
+        stack.addArrangedSubview(devSep)
+
+        let devTitle = NSTextField(labelWithString: "iPhone")
+        devTitle.font = .boldSystemFont(ofSize: 12)
+        stack.addArrangedSubview(devTitle)
+
+        iosRunnerLabel.font = .systemFont(ofSize: 11)
+        iosRunnerLabel.textColor = .secondaryLabelColor
+        iosRunnerLabel.preferredMaxLayoutWidth = 268
+        iosRunnerLabel.lineBreakMode = .byWordWrapping
+        iosRunnerLabel.maximumNumberOfLines = 0
+        iosRunnerLabel.usesSingleLineMode = false
+        iosRunnerLabel.cell?.wraps = true
+        stack.addArrangedSubview(iosRunnerLabel)
+        updateRunnerStatusLabel()
 
         // MCP server section — one-click register with Claude Code / Claude Desktop.
         let sep = NSBox(); sep.boxType = .separator
@@ -1449,6 +1474,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         stack.addArrangedSubview(mcpStatusLabel)
         refreshMCP(updateLabel: true)
 
+        // Version footer.
+        let verSep = NSBox(); verSep.boxType = .separator
+        verSep.translatesAutoresizingMaskIntoConstraints = false
+        verSep.widthAnchor.constraint(equalToConstant: 268).isActive = true
+        stack.addArrangedSubview(verSep)
+
+        let info = Bundle.main.infoDictionary
+        let ver = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        let versionLabel = NSTextField(labelWithString: "iMirror \(ver) (build \(build))")
+        versionLabel.font = .systemFont(ofSize: 11)
+        versionLabel.textColor = .tertiaryLabelColor
+        stack.addArrangedSubview(versionLabel)
+
         let container = NSView()
         container.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -1466,6 +1505,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     @objc private func scrollGainChanged(_ sender: NSSlider) {
         UserDefaults.standard.set(sender.doubleValue, forKey: "imirror.scrollGain")
+    }
+
+    /// Reflect whether the WebDriverAgent runner is on the connected iPhone. A live
+    /// WDA connection is proof it's installed and running; otherwise fall back to
+    /// the last install outcome, or a prompt to turn Automation on.
+    private func updateRunnerStatusLabel() {
+        let text: String
+        if health == .connected {
+            text = "WebDriverAgent app: installed and running ✓"
+        } else {
+            switch lastRunnerInstall {
+            case .alreadyPresent, .installed:
+                text = "WebDriverAgent app: installed"
+            case .failed(.notProvisioned):
+                text = "WebDriverAgent app: not signed for this iPhone — re-sign it for this device"
+            case .failed(.deviceLocked):
+                text = "WebDriverAgent app: unlock the iPhone, then retry"
+            case .failed(.other):
+                text = "WebDriverAgent app: install failed"
+            case .noBundle:
+                text = "WebDriverAgent app: status unknown (no bundled installer)"
+            case nil:
+                text = automationEnabled
+                    ? "WebDriverAgent app: checking…"
+                    : "WebDriverAgent app: turn Automation on to check / install"
+            }
+        }
+        iosRunnerLabel.stringValue = text
     }
 
     /// Check installed state / version / staleness off the main thread (it shells
