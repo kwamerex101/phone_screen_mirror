@@ -268,6 +268,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private var emptyStateView: NSView!
     private var emptyStateTitle: NSTextField!
     private var emptyStateHint: NSTextField!
+    private let cameraActionButton = NSButton()
     private var statusLabel: NSTextField!
 
     // Toolbar controls
@@ -569,26 +570,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             .withSymbolConfiguration(.init(pointSize: 52, weight: .ultraLight))
         icon.contentTintColor = .tertiaryLabelColor
 
-        let title = NSTextField(labelWithString: "No iPhone connected")
+        // Wrapping labels so longer copy (e.g. the camera-permission guidance)
+        // wraps to multiple centered lines instead of clipping.
+        let title = NSTextField(wrappingLabelWithString: "No iPhone connected")
         title.font = .systemFont(ofSize: 15, weight: .medium)
         title.textColor = .secondaryLabelColor
         title.alignment = .center
+        title.isSelectable = false
+        title.preferredMaxLayoutWidth = 300
         emptyStateTitle = title
 
-        let hint = NSTextField(labelWithString: "Plug in via USB, unlock, and tap “Trust.”")
+        let hint = NSTextField(wrappingLabelWithString: "Plug in via USB, unlock, and tap “Trust.”")
         hint.font = .systemFont(ofSize: 12)
         hint.textColor = .tertiaryLabelColor
         hint.alignment = .center
+        hint.isSelectable = false
+        hint.preferredMaxLayoutWidth = 300
         emptyStateHint = hint
 
-        let stack = NSStackView(views: [icon, title, hint])
+        // Actionable button, shown only for the camera-permission empty state.
+        cameraActionButton.bezelStyle = .rounded
+        cameraActionButton.title = "Allow Camera Access"
+        cameraActionButton.target = self
+        cameraActionButton.action = #selector(cameraActionTapped)
+        cameraActionButton.isHidden = true
+
+        let stack = NSStackView(views: [icon, title, hint, cameraActionButton])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 6
         stack.setCustomSpacing(16, after: icon)
+        stack.setCustomSpacing(14, after: hint)
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.wantsLayer = true                    // layer-backed so alphaValue animates
         return stack
+    }
+
+    /// Tapped from the camera-permission empty state. If access was never decided,
+    /// this triggers the system prompt (accept/decline). Once the user has denied,
+    /// macOS won't show that prompt again, so open the Camera privacy pane instead.
+    @objc private func cameraActionTapped() {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            configureSession()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                DispatchQueue.main.async {
+                    if granted {
+                        self?.cameraActionButton.isHidden = true
+                        self?.setStatus("Camera access granted.")
+                        self?.configureSession()
+                    } else {
+                        self?.showCameraDenied()
+                    }
+                }
+            }
+        default:  // denied / restricted — the system prompt can't be reshown
+            if let url = URL(string:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") {
+                NSWorkspace.shared.open(url)
+            }
+        }
     }
 
     /// Cross-fade the empty state instead of snapping it — the first mirror frame
@@ -724,13 +766,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     }
 
     /// Camera access is what feeds the mirror; without it there's nothing to show.
-    /// Say so in the primary empty state, not just the footer HUD, so the user
-    /// isn't told to "plug in via USB" when the real fix is a privacy setting.
+    /// Say so in the primary empty state (not just the footer HUD) and offer a
+    /// button: a fresh prompt if the choice was never made, otherwise a shortcut
+    /// to the Camera privacy pane (macOS won't reshow the prompt after a denial).
     private func showCameraDenied() {
-        setEmptyStateReason(title: "Camera access needed",
-                            hint: "Enable it in System Settings ▸ Privacy & Security ▸ Camera, then reopen iMirror.")
+        if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
+            setEmptyStateReason(title: "Camera access needed",
+                hint: "iMirror uses your Mac’s camera permission to show the iPhone’s screen. Allow access to start mirroring.")
+            cameraActionButton.title = "Allow Camera Access"
+        } else {
+            setEmptyStateReason(title: "Camera access needed",
+                hint: "Turn on Camera for iMirror in System Settings ▸ Privacy & Security ▸ Camera.")
+            cameraActionButton.title = "Open Camera Settings"
+        }
+        cameraActionButton.isHidden = false
         setEmptyState(hidden: false)
-        setStatus("Camera access denied — enable in System Settings ▸ Privacy & Security ▸ Camera.")
+        setStatus("Camera access needed — grant it to start mirroring.")
     }
 
     private func configureSession() {
@@ -919,6 +970,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             // Back to no-device: restore the default guidance (a prior failure may
             // have changed it) unless the camera itself is blocked.
             if AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
+                cameraActionButton.isHidden = true       // camera fine — no button here
                 setEmptyStateReason(title: "No iPhone connected",
                                     hint: "Plug in via USB, unlock, and tap “Trust.”")
             }
