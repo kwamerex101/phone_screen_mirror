@@ -18,6 +18,7 @@
 
 import Foundation
 import Network
+import iMirrorCore
 
 // MARK: - Branded WDA runner identity
 //
@@ -248,12 +249,20 @@ final class Transport {
     private var tunnel: ManagedProcess?
     private var wda: ManagedProcess?
     private var forward: ManagedProcess?
-    private var runnerInstallAttempted = false
 
     /// Set by the app to surface a terminal state when the WDA runner can't be
     /// started at all (bad signing / unsupported device) — invoked on the main
     /// thread. Distinct from a transient drop, which self-heals silently.
     var onWDAUnrecoverable: (() -> Void)?
+
+    /// Set by the app to reflect the runner check/install (progress + outcome) in
+    /// the UI. Invoked on the main thread.
+    var onRunnerInstall: ((RunnerInstallEvent) -> Void)?
+
+    private func emitInstall(_ event: RunnerInstallEvent) {
+        guard let cb = onRunnerInstall else { return }
+        DispatchQueue.main.async { cb(event) }
+    }
 
     init() {
         goios = locateGoIOS()
@@ -354,9 +363,10 @@ final class Transport {
         DispatchQueue.global().async { [weak self] in
             guard let self, self.chainGeneration == gen else { return }
             // Install (or verify) the runner in parallel with the tunnel coming up.
+            var installResult: RunnerInstall = .noBundle
             let installDone = DispatchSemaphore(value: 0)
             DispatchQueue.global().async { [weak self] in
-                self?.installRunnerIfMissing(bin: bin)
+                installResult = self?.installRunnerIfMissing(bin: bin) ?? .noBundle
                 installDone.signal()
             }
             // Wait for tunnel readiness, capped so we still proceed (as the old
@@ -369,6 +379,9 @@ final class Transport {
             }
             installDone.wait()                       // runner must exist before runwda
             guard self.chainGeneration == gen else { return }
+            // A failed install with the runner still absent → don't launch runwda;
+            // it would only fail-loop. The UI already showed the failure reason.
+            guard shouldSpawnRunwda(after: installResult) else { return }
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.chainGeneration == gen else { return }
                 let wda = ManagedProcess(
@@ -392,20 +405,48 @@ final class Transport {
 
     /// Install the bundled branded WDA .ipa once per launch, and only if the runner
     /// isn't already on the device. Guarded so it never re-runs on restartChain().
-    private func installRunnerIfMissing(bin: URL) {
-        guard !runnerInstallAttempted else { return }
-        runnerInstallAttempted = true
+    /// Check for the branded runner and install the bundled ipa if it's missing.
+    /// Runs on each bring-up (no once-per-launch guard) — the check is cheap and
+    /// only shells `install` when the runner is actually absent. Emits progress
+    /// via onRunnerInstall and returns the outcome so the caller can decide
+    /// whether launching runwda is worthwhile.
+    private func installRunnerIfMissing(bin: URL) -> RunnerInstall {
+        emitInstall(.checking)
         guard let ipa = Bundle.main.url(forResource: "WebDriverAgent", withExtension: "ipa") else {
-            return  // dev builds ship no bundled ipa; runner installed via build-wda.sh/Xcode
+            // dev builds ship no bundled ipa; runner installed via build-wda.sh/Xcode
+            emitInstall(.done(.noBundle))
+            return .noBundle
         }
-        if runnerIsInstalled(bin: bin) { return }
+        if runnerIsInstalled(bin: bin) {
+            emitInstall(.done(.alreadyPresent))
+            return .alreadyPresent
+        }
+        emitInstall(.installing)
         let p = Process()
         p.executableURL = bin
         p.arguments = ["install", "--path=\(ipa.path)"]
+        let errPipe = Pipe()
         p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        do { try p.run(); p.waitUntilExit() }
-        catch { NSLog("iMirror: WDA install attempt failed: \(error.localizedDescription)") }
+        p.standardError = errPipe
+        let result: RunnerInstall
+        do {
+            try p.run()
+            // Drain stderr before waiting so a full pipe buffer can't deadlock.
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            if p.terminationStatus == 0 {
+                result = .installed
+            } else {
+                let stderr = String(data: errData, encoding: .utf8) ?? ""
+                NSLog("iMirror: WDA install failed (status \(p.terminationStatus)): \(stderr)")
+                result = .failed(classifyInstallError(stderr))
+            }
+        } catch {
+            NSLog("iMirror: WDA install could not run: \(error.localizedDescription)")
+            result = .failed(.other(raw: error.localizedDescription))
+        }
+        emitInstall(.done(result))
+        return result
     }
 
     /// True if the branded runner id already appears in `ios apps --list`.

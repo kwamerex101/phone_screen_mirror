@@ -82,6 +82,51 @@ final class WDAParseTests: XCTestCase {
     }
 }
 
+final class RunnerInstallTests: XCTestCase {
+    func testClassifyNotProvisioned() {
+        // go-ios surfaces the underlying MobileInstallation / signing text.
+        for s in [
+            "ApplicationVerificationFailed: no valid provisioning profile found",
+            "The executable was signed with invalid entitlements",
+            "This device is not eligible for the installed profile",
+            "install failed: 0xe8008015 (A valid provisioning profile was not found)",
+        ] {
+            guard case .notProvisioned = classifyInstallError(s) else {
+                return XCTFail("expected .notProvisioned for: \(s)")
+            }
+        }
+    }
+
+    func testClassifyDeviceLocked() {
+        for s in ["The device is locked.", "Please unlock the device with your passcode"] {
+            guard case .deviceLocked = classifyInstallError(s) else {
+                return XCTFail("expected .deviceLocked for: \(s)")
+            }
+        }
+    }
+
+    func testClassifyOtherKeepsRaw() {
+        guard case .other(let raw) = classifyInstallError("  something weird happened  ") else {
+            return XCTFail("expected .other")
+        }
+        XCTAssertEqual(raw, "something weird happened")   // trimmed
+    }
+
+    func testClassifyCapsLongRaw() {
+        let long = String(repeating: "x", count: 1000)
+        guard case .other(let raw) = classifyInstallError(long) else { return XCTFail() }
+        XCTAssertLessThanOrEqual(raw.count, 301)          // capped (+ ellipsis)
+    }
+
+    func testShouldSpawnRunwda() {
+        XCTAssertTrue(shouldSpawnRunwda(after: .alreadyPresent))
+        XCTAssertTrue(shouldSpawnRunwda(after: .installed))
+        XCTAssertTrue(shouldSpawnRunwda(after: .noBundle))
+        XCTAssertFalse(shouldSpawnRunwda(after: .failed(.deviceLocked(raw: "x"))))
+        XCTAssertFalse(shouldSpawnRunwda(after: .failed(.other(raw: "x"))))
+    }
+}
+
 final class MCPConfigTests: XCTestCase {
     private func parse(_ d: Data) -> [String: Any] {
         try! JSONSerialization.jsonObject(with: d) as! [String: Any]

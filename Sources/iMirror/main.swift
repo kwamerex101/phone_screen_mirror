@@ -310,6 +310,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private var health: Health = .down
     private var healthTimer: Timer?
     private var probing = false
+    // True while the runner ipa is installing on the device. Pauses health probing
+    // and pins the dot to "connecting" so the install progress isn't fought by the
+    // probe loop (WDA legitimately isn't up yet during an install).
+    private var installingRunner = false
     private var creatingSession = false
     private var downSince: Date?
     private var lastWDARestart: Date?
@@ -341,8 +345,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         // (bad signing / unsupported device) rather than looping silently on red.
         transport.onWDAUnrecoverable = { [weak self] in
             guard let self, self.automationEnabled, self.health == .down else { return }
-            self.setStatus("WebDriverAgent isn't starting — check the runner is "
-                         + "installed/trusted for this device (Settings ▸ General ▸ VPN & Device Management).")
+            self.setStatus("WebDriverAgent installed but won't start — trust the developer "
+                         + "on the phone: Settings ▸ General ▸ VPN & Device Management.")
+        }
+        // Reflect the runner check/install (progress + outcome) in the UI. Invoked
+        // on the main thread by Transport.
+        transport.onRunnerInstall = { [weak self] event in
+            guard let self, self.automationEnabled else { return }
+            switch event {
+            case .checking:
+                break                           // fast; no need to flash the status
+            case .installing:
+                self.installingRunner = true
+                self.updateHealthDot()          // pin dot to connecting (pulse)
+                self.setStatus("Installing WebDriverAgent on iPhone… (first time can take ~30s)")
+            case .done(let result):
+                self.installingRunner = false
+                switch result {
+                case .installed:
+                    self.setStatus("WebDriverAgent installed — starting…")
+                case .alreadyPresent, .noBundle:
+                    break                       // normal boot; health monitor takes over
+                case .failed(let err):
+                    self.setHealth(.down)
+                    // Cancel the generic 6s "Starting WebDriverAgent…" text so our
+                    // specific, actionable failure message isn't overwritten.
+                    self.downStatusWorkItem?.cancel(); self.downStatusWorkItem = nil
+                    self.setStatus(self.installFailureMessage(err))
+                }
+                self.updateHealthDot()
+            }
         }
         updateHealthDot()        // grey — automation off
         // Restore the last Automation choice (default off = view-only mirroring).
@@ -1038,6 +1070,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     private func probeNow() {
         guard automationEnabled else { return }   // no WDA to probe when automation is off
+        guard !installingRunner else { return }   // WDA legitimately down mid-install
         guard !probing else { return }
         // Don't probe mid-gesture: a probe GET contends with the in-flight /actions
         // on WDA's single XCUITest queue and can time out into a false .down.
@@ -1155,6 +1188,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
                          a11y: "automation off", pulsing: false)
             return
         }
+        if installingRunner {
+            setHealthDot(.systemYellow, tip: "Installing WebDriverAgent on iPhone…",
+                         a11y: "installing runner", pulsing: true)
+            return
+        }
         switch health {
         case .connected:
             setHealthDot(.systemGreen, tip: "WDA connected — click to re-check",
@@ -1240,6 +1278,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             previewView.resetScroll()
             homeItem?.isEnabled = false
             healthTimer?.invalidate(); healthTimer = nil
+            installingRunner = false
             wda = nil
             transport.stop()
             health = .down; downSince = nil
@@ -1444,6 +1483,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private func setStatus(_ text: String) {
         statusLabel.stringValue = text
         NSLog("iMirror: \(text)")
+    }
+
+    /// Actionable, per-cause message for a failed runner install.
+    private func installFailureMessage(_ err: RunnerInstallError) -> String {
+        switch err {
+        case .notProvisioned:
+            return "Couldn’t install WebDriverAgent — it isn’t signed for this iPhone. "
+                 + "Re-sign it for this device, then turn Automation off and on: "
+                 + "WDA_DESTINATION=<your-udid> ./scripts/build-wda.sh"
+        case .deviceLocked:
+            return "Couldn’t install WebDriverAgent — unlock your iPhone, then turn "
+                 + "Automation off and on to retry."
+        case .other(let raw):
+            return "WebDriverAgent install failed: \(raw)"
+        }
     }
 }
 
