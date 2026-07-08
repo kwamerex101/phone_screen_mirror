@@ -1,10 +1,13 @@
 <div align="center">
 
+<img src="docs/images/logo.png" alt="iMirror" width="128" height="128">
+
 # iMirror
 
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Swift](https://img.shields.io/badge/Swift-F05138?logo=swift&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
+[![Release](https://img.shields.io/github/v/release/kwamerex101/phone_screen_mirror?label=download)](https://github.com/kwamerex101/phone_screen_mirror/releases/latest)
 
 **Mirror a USB-connected iPhone to a macOS window and control it from the Mac — while the phone stays physically usable.**
 
@@ -34,7 +37,16 @@ Features:
   so nothing runs on the phone and iOS shows no "Automation Running" overlay. Turn
   on **Automation** in the Settings (⚙) popover to bring WebDriverAgent up itself
   (no Xcode, no sudo, no terminal) — a toolbar health dot + auto-reconnect. That
-  popover also has a scroll-speed control and a one-click **MCP server install**.
+  popover also has a scroll-speed control, a one-click **MCP server install**, the
+  on-device **WebDriverAgent app status**, and the app version/build.
+- **Auto-installs the runner** — flipping Automation on checks whether the
+  WebDriverAgent app is on the connected iPhone and installs the bundled build if
+  it's missing, with progress and actionable errors (e.g. "not signed for this
+  iPhone — re-sign for this device"). A pre-provisioned device just works.
+- **Guided permissions** — first run prompts for **Camera** (the iOS
+  screen-capture device is gated by the camera privilege — iMirror never uses the
+  Mac camera); if it's denied, the empty state offers a one-click jump to the
+  Camera privacy pane.
 
 The app code is dependency-free Swift (AppKit, AVFoundation, CoreImage,
 CoreMediaIO, Network). Control rides on two vetted, source-built tools —
@@ -44,9 +56,19 @@ CoreMediaIO, Network). Control rides on two vetted, source-built tools —
 
 ## Screenshots
 
-iPhone mirrored live to the Mac. The capture follows the phone's **physical
-orientation**, and tap/drag coordinates adapt automatically — verified in both
-portrait and landscape.
+<div align="center">
+
+<img src="docs/images/mirror.png" alt="iPhone mirrored live to the Mac" width="300">
+&nbsp;&nbsp;
+<img src="docs/images/settings.png" alt="iMirror Settings popover" width="360">
+
+</div>
+
+Left: an iPhone mirrored live to the Mac while the phone stays usable — the
+capture follows the phone's **physical orientation**, and tap/drag coordinates
+adapt automatically. Right: the **Settings (⚙)** popover — Automation toggle,
+scroll-speed, the on-device **WebDriverAgent app status**, one-click **MCP server
+install**, and the app version/build.
 
 ## Requirements
 
