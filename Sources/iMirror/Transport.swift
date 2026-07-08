@@ -329,19 +329,24 @@ final class Transport {
         set { genLock.lock(); _chainGeneration = newValue; genLock.unlock() }
     }
 
-    /// Poll go-ios's own tunnel-agent readiness endpoint (the same signal go-ios
-    /// uses internally) instead of guessing with a fixed sleep. Returns true once
-    /// the agent answers on loopback:60105.
+    /// Poll go-ios's tunnel agent for an *established device tunnel* — not just the
+    /// agent process being up. The `/ready` endpoint returns 200 the moment the
+    /// agent starts, well before the device tunnel exists, so `apps`/`install`
+    /// (which route through the tunnel on iOS 17+) would run too early and fail.
+    /// `/tunnels` instead returns a non-empty list (each entry carries a "udid"
+    /// and "rsdPort") only once a device tunnel is actually established.
     private func tunnelReady() -> Bool {
-        guard let url = URL(string: "http://127.0.0.1:60105/ready") else { return false }
+        guard let url = URL(string: "http://127.0.0.1:60105/tunnels") else { return false }
         var req = URLRequest(url: url)
         req.timeoutInterval = 1.5
         let cfg = URLSessionConfiguration.ephemeral
         cfg.waitsForConnectivity = false
         let sem = DispatchSemaphore(value: 0)
         var ready = false
-        URLSession(configuration: cfg).dataTask(with: req) { _, resp, _ in
-            if let code = (resp as? HTTPURLResponse)?.statusCode, (200..<300).contains(code) {
+        URLSession(configuration: cfg).dataTask(with: req) { data, resp, _ in
+            if let code = (resp as? HTTPURLResponse)?.statusCode, (200..<300).contains(code),
+               let data, let body = String(data: data, encoding: .utf8),
+               body.contains("\"udid\"") {          // at least one device tunnel is up
                 ready = true
             }
             sem.signal()
@@ -350,10 +355,14 @@ final class Transport {
         return ready
     }
 
-    /// Start the go-ios children: the tunnel first, then runwda + forward once the
-    /// tunnel is actually ready. Runner install (usbmuxd, not tunnel-gated) runs
-    /// in parallel so it's off the cold-boot critical path; runwda still waits for
-    /// it since the runner must exist before it can be launched.
+    /// Start the go-ios children: the tunnel first, then — once the tunnel is
+    /// actually ready — check/install the runner and launch runwda + forward.
+    ///
+    /// Ordering matters: on iOS 17+ go-ios routes `apps --list` and `install`
+    /// through the tunnel agent, so they must run AFTER the tunnel is up. (An
+    /// earlier version ran the install in parallel with tunnel bring-up on the
+    /// assumption it was usbmuxd-only; in practice that made the check/install
+    /// fail before the agent was ready.)
     private func startChildren() {
         guard let bin = goios else { return }
         let gen = chainGeneration
@@ -362,22 +371,18 @@ final class Transport {
         tunnel?.start()
         DispatchQueue.global().async { [weak self] in
             guard let self, self.chainGeneration == gen else { return }
-            // Install (or verify) the runner in parallel with the tunnel coming up.
-            var installResult: RunnerInstall = .noBundle
-            let installDone = DispatchSemaphore(value: 0)
-            DispatchQueue.global().async { [weak self] in
-                installResult = self?.installRunnerIfMissing(bin: bin) ?? .noBundle
-                installDone.signal()
-            }
-            // Wait for tunnel readiness, capped so we still proceed (as the old
-            // fixed sleep did) if the endpoint never answers on an odd setup.
+            // Wait for tunnel readiness (poll go-ios's own signal instead of a
+            // blind sleep), capped so we still proceed if the endpoint never
+            // answers on an odd setup.
             let deadline = Date().addingTimeInterval(30)
             while Date() < deadline {
                 if self.chainGeneration != gen { return }
                 if self.tunnelReady() { break }
                 Thread.sleep(forTimeInterval: 0.5)
             }
-            installDone.wait()                       // runner must exist before runwda
+            guard self.chainGeneration == gen else { return }
+            // Now that the tunnel is up, check/install the runner.
+            let installResult = self.installRunnerIfMissing(bin: bin)
             guard self.chainGeneration == gen else { return }
             // A failed install with the runner still absent → don't launch runwda;
             // it would only fail-loop. The UI already showed the failure reason.
@@ -403,8 +408,6 @@ final class Transport {
         }
     }
 
-    /// Install the bundled branded WDA .ipa once per launch, and only if the runner
-    /// isn't already on the device. Guarded so it never re-runs on restartChain().
     /// Check for the branded runner and install the bundled ipa if it's missing.
     /// Runs on each bring-up (no once-per-launch guard) — the check is cheap and
     /// only shells `install` when the runner is actually absent. Emits progress
@@ -422,32 +425,56 @@ final class Transport {
             return .alreadyPresent
         }
         emitInstall(.installing)
-        let p = Process()
-        p.executableURL = bin
-        p.arguments = ["install", "--path=\(ipa.path)"]
-        let errPipe = Pipe()
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = errPipe
-        let result: RunnerInstall
-        do {
-            try p.run()
-            // Drain stderr before waiting so a full pipe buffer can't deadlock.
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            if p.terminationStatus == 0 {
-                result = .installed
+        // `install` routes through the RSD tunnel, which stays unusable for a few
+        // seconds after it first appears in /tunnels — an attempt in that window
+        // bails immediately (no zipconduit progress) rather than reaching the
+        // device. Retry through that warmup, but stop early once we've reached a
+        // real, classifiable failure (device-side ERROR) so we don't retry a
+        // provisioning/lock error that will never succeed.
+        // `install` routes through the RSD tunnel, which is briefly unusable right
+        // after it comes up — an attempt in that window bails without a recognized
+        // error (classifies as .other). Retry those (transient) but break
+        // immediately on a definitive, actionable error (notProvisioned /
+        // deviceLocked) or success — those won't change on retry. The window can
+        // be a handful of seconds, so retry generously (the UI already says the
+        // first install can take a while).
+        let maxAttempts = 8
+        var result: RunnerInstall = .failed(.other(raw: "install did not run"))
+        for attempt in 0..<maxAttempts {
+            let (status, stderr) = runInstallOnce(bin: bin, ipaPath: ipa.path)
+            if status == 0 { result = .installed; break }
+            let cls = classifyInstallError(stderr)
+            result = .failed(cls)
+            if case .other = cls {                          // unrecognized → likely transient
+                if attempt < maxAttempts - 1 { Thread.sleep(forTimeInterval: 2.0); continue }
             } else {
-                let stderr = String(data: errData, encoding: .utf8) ?? ""
-                NSLog("iMirror: WDA install failed (status \(p.terminationStatus)): \(stderr)")
-                result = .failed(classifyInstallError(stderr))
+                break                                       // definitive → stop now
             }
-        } catch {
-            NSLog("iMirror: WDA install could not run: \(error.localizedDescription)")
-            result = .failed(.other(raw: error.localizedDescription))
         }
         emitInstall(.done(result))
         return result
     }
+
+    /// One `ios install` attempt. Returns the exit status and captured stderr
+    /// (go-ios logs progress/errors there as JSON lines).
+    private func runInstallOnce(bin: URL, ipaPath: String) -> (status: Int32, stderr: String) {
+        let p = Process()
+        p.executableURL = bin
+        p.arguments = ["install", "--path=\(ipaPath)"]
+        let errPipe = Pipe()
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = errPipe
+        do {
+            try p.run()
+            // Drain stderr before waiting so a full pipe buffer can't deadlock.
+            let data = errPipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+        } catch {
+            return (-1, error.localizedDescription)
+        }
+    }
+
 
     /// True if the branded runner id already appears in `ios apps --list`.
     private func runnerIsInstalled(bin: URL) -> Bool {
