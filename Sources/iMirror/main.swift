@@ -268,6 +268,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private var emptyStateView: NSView!
     private var emptyStateTitle: NSTextField!
     private var emptyStateHint: NSTextField!
+    private let cameraActionButton = NSButton()
     private var statusLabel: NSTextField!
 
     // Toolbar controls
@@ -281,6 +282,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private let mcpUninstallButton = NSButton()
     private let mcpSpinner = NSProgressIndicator()
     private let mcpStatusLabel = NSTextField(labelWithString: "")
+    private let iosRunnerLabel = NSTextField(labelWithString: "")
+    private var lastRunnerInstall: RunnerInstall?
     private var mcpInstalled = false
     private let healthButton = NSButton()
     private var recordItem: NSToolbarItem!
@@ -361,6 +364,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
                 self.setStatus("Installing WebDriverAgent on iPhone… (first time can take ~30s)")
             case .done(let result):
                 self.installingRunner = false
+                self.lastRunnerInstall = result
+                self.updateRunnerStatusLabel()
                 switch result {
                 case .installed:
                     self.setStatus("WebDriverAgent installed — starting…")
@@ -569,26 +574,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             .withSymbolConfiguration(.init(pointSize: 52, weight: .ultraLight))
         icon.contentTintColor = .tertiaryLabelColor
 
-        let title = NSTextField(labelWithString: "No iPhone connected")
+        // Wrapping labels so longer copy (e.g. the camera-permission guidance)
+        // wraps to multiple centered lines instead of clipping.
+        let title = NSTextField(wrappingLabelWithString: "No iPhone connected")
         title.font = .systemFont(ofSize: 15, weight: .medium)
         title.textColor = .secondaryLabelColor
         title.alignment = .center
+        title.isSelectable = false
+        title.preferredMaxLayoutWidth = 300
         emptyStateTitle = title
 
-        let hint = NSTextField(labelWithString: "Plug in via USB, unlock, and tap “Trust.”")
+        let hint = NSTextField(wrappingLabelWithString: "Plug in via USB, unlock, and tap “Trust.”")
         hint.font = .systemFont(ofSize: 12)
         hint.textColor = .tertiaryLabelColor
         hint.alignment = .center
+        hint.isSelectable = false
+        hint.preferredMaxLayoutWidth = 300
         emptyStateHint = hint
 
-        let stack = NSStackView(views: [icon, title, hint])
+        // Actionable button, shown only for the camera-permission empty state.
+        cameraActionButton.bezelStyle = .rounded
+        cameraActionButton.title = "Allow Camera Access"
+        cameraActionButton.target = self
+        cameraActionButton.action = #selector(cameraActionTapped)
+        cameraActionButton.isHidden = true
+
+        let stack = NSStackView(views: [icon, title, hint, cameraActionButton])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 6
         stack.setCustomSpacing(16, after: icon)
+        stack.setCustomSpacing(14, after: hint)
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.wantsLayer = true                    // layer-backed so alphaValue animates
         return stack
+    }
+
+    /// Tapped from the camera-permission empty state. If access was never decided,
+    /// this triggers the system prompt (accept/decline). Once the user has denied,
+    /// macOS won't show that prompt again, so open the Camera privacy pane instead.
+    @objc private func cameraActionTapped() {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            configureSession()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                DispatchQueue.main.async {
+                    if granted {
+                        self?.cameraActionButton.isHidden = true
+                        self?.setStatus("Camera access granted.")
+                        self?.configureSession()
+                    } else {
+                        self?.showCameraDenied()
+                    }
+                }
+            }
+        default:  // denied / restricted — the system prompt can't be reshown
+            if let url = URL(string:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") {
+                NSWorkspace.shared.open(url)
+            }
+        }
     }
 
     /// Cross-fade the empty state instead of snapping it — the first mirror frame
@@ -724,13 +770,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     }
 
     /// Camera access is what feeds the mirror; without it there's nothing to show.
-    /// Say so in the primary empty state, not just the footer HUD, so the user
-    /// isn't told to "plug in via USB" when the real fix is a privacy setting.
+    /// Say so in the primary empty state (not just the footer HUD) and offer a
+    /// button: a fresh prompt if the choice was never made, otherwise a shortcut
+    /// to the Camera privacy pane (macOS won't reshow the prompt after a denial).
     private func showCameraDenied() {
-        setEmptyStateReason(title: "Camera access needed",
-                            hint: "Enable it in System Settings ▸ Privacy & Security ▸ Camera, then reopen iMirror.")
+        if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
+            setEmptyStateReason(title: "Camera access needed",
+                hint: "iMirror uses your Mac’s camera permission to show the iPhone’s screen. Allow access to start mirroring.")
+            cameraActionButton.title = "Allow Camera Access"
+        } else {
+            setEmptyStateReason(title: "Camera access needed",
+                hint: "Turn on Camera for iMirror in System Settings ▸ Privacy & Security ▸ Camera.")
+            cameraActionButton.title = "Open Camera Settings"
+        }
+        cameraActionButton.isHidden = false
         setEmptyState(hidden: false)
-        setStatus("Camera access denied — enable in System Settings ▸ Privacy & Security ▸ Camera.")
+        setStatus("Camera access needed — grant it to start mirroring.")
     }
 
     private func configureSession() {
@@ -919,6 +974,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             // Back to no-device: restore the default guidance (a prior failure may
             // have changed it) unless the camera itself is blocked.
             if AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
+                cameraActionButton.isHidden = true       // camera fine — no button here
                 setEmptyStateReason(title: "No iPhone connected",
                                     hint: "Plug in via USB, unlock, and tap “Trust.”")
             }
@@ -1306,6 +1362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     @objc private func showSettings() {
         if !settingsBuilt { buildSettingsPopover(); settingsBuilt = true }
+        updateRunnerStatusLabel()   // refresh device/runner status each time it opens
         if settingsPopover.isShown { settingsPopover.close(); return }
         // Anchor to the gear when it's on screen; if it overflowed into the `»` menu
         // its view is detached (no window), so fall back to the window content view.
@@ -1350,6 +1407,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         slider.widthAnchor.constraint(equalToConstant: 150).isActive = true
         scrollRow.addArrangedSubview(slider)
         stack.addArrangedSubview(scrollRow)
+
+        // iPhone section — whether the WebDriverAgent runner is on the device.
+        let devSep = NSBox(); devSep.boxType = .separator
+        devSep.translatesAutoresizingMaskIntoConstraints = false
+        devSep.widthAnchor.constraint(equalToConstant: 268).isActive = true
+        stack.addArrangedSubview(devSep)
+
+        let devTitle = NSTextField(labelWithString: "iPhone")
+        devTitle.font = .boldSystemFont(ofSize: 12)
+        stack.addArrangedSubview(devTitle)
+
+        iosRunnerLabel.font = .systemFont(ofSize: 11)
+        iosRunnerLabel.textColor = .secondaryLabelColor
+        iosRunnerLabel.preferredMaxLayoutWidth = 268
+        iosRunnerLabel.lineBreakMode = .byWordWrapping
+        iosRunnerLabel.maximumNumberOfLines = 0
+        iosRunnerLabel.usesSingleLineMode = false
+        iosRunnerLabel.cell?.wraps = true
+        stack.addArrangedSubview(iosRunnerLabel)
+        updateRunnerStatusLabel()
 
         // MCP server section — one-click register with Claude Code / Claude Desktop.
         let sep = NSBox(); sep.boxType = .separator
@@ -1397,6 +1474,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         stack.addArrangedSubview(mcpStatusLabel)
         refreshMCP(updateLabel: true)
 
+        // Version footer.
+        let verSep = NSBox(); verSep.boxType = .separator
+        verSep.translatesAutoresizingMaskIntoConstraints = false
+        verSep.widthAnchor.constraint(equalToConstant: 268).isActive = true
+        stack.addArrangedSubview(verSep)
+
+        let info = Bundle.main.infoDictionary
+        let ver = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        let versionLabel = NSTextField(labelWithString: "iMirror \(ver) (build \(build))")
+        versionLabel.font = .systemFont(ofSize: 11)
+        versionLabel.textColor = .tertiaryLabelColor
+        stack.addArrangedSubview(versionLabel)
+
         let container = NSView()
         container.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -1414,6 +1505,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     @objc private func scrollGainChanged(_ sender: NSSlider) {
         UserDefaults.standard.set(sender.doubleValue, forKey: "imirror.scrollGain")
+    }
+
+    /// Reflect whether the WebDriverAgent runner is on the connected iPhone. A live
+    /// WDA connection is proof it's installed and running; otherwise fall back to
+    /// the last install outcome, or a prompt to turn Automation on.
+    private func updateRunnerStatusLabel() {
+        let text: String
+        if health == .connected {
+            text = "WebDriverAgent app: installed and running ✓"
+        } else {
+            switch lastRunnerInstall {
+            case .alreadyPresent, .installed:
+                text = "WebDriverAgent app: installed"
+            case .failed(.notProvisioned):
+                text = "WebDriverAgent app: not signed for this iPhone — re-sign it for this device"
+            case .failed(.deviceLocked):
+                text = "WebDriverAgent app: unlock the iPhone, then retry"
+            case .failed(.other):
+                text = "WebDriverAgent app: install failed"
+            case .noBundle:
+                text = "WebDriverAgent app: status unknown (no bundled installer)"
+            case nil:
+                text = automationEnabled
+                    ? "WebDriverAgent app: checking…"
+                    : "WebDriverAgent app: turn Automation on to check / install"
+            }
+        }
+        iosRunnerLabel.stringValue = text
     }
 
     /// Check installed state / version / staleness off the main thread (it shells
