@@ -70,12 +70,35 @@ adapt automatically. Right: the **Settings (⚙)** popover — Automation toggle
 scroll-speed, the on-device **WebDriverAgent app status**, one-click **MCP server
 install**, and the app version/build.
 
-## Requirements
+## Install
 
-Fair warning: **setup is developer-grade**. The app itself is launch-and-go, but
-the one-time WebDriverAgent install needs Xcode, a signing identity, and a USB
-cable — this is an Apple platform constraint, not a choice. After that one-time
-step, day-to-day use is just opening the app.
+Grab the notarized DMG from the
+[**latest release**](https://github.com/kwamerex101/phone_screen_mirror/releases/latest),
+open it, and drag **iMirror** to Applications. The DMG bundles everything the app
+needs — the `go-ios` helper and the WebDriverAgent runner — so there's no Xcode,
+no Go, and no `tools/` setup.
+
+1. Connect your iPhone by USB, unlock it, and tap **Trust**.
+2. Open iMirror and grant **Camera** access (this feeds the mirror; iMirror never
+   uses the Mac camera).
+3. To control the phone, open **Settings (⚙)** and turn on **Automation** — the
+   app installs the WebDriverAgent runner on the phone if it's missing and brings
+   it up; the health dot goes green, then flip **Control**.
+
+> **One Apple caveat:** the bundled runner is dev-signed for registered devices.
+> A brand-new iPhone that isn't in the signing profile can't be auto-installed —
+> the app says so and points you at the re-sign step
+> (`WDA_DESTINATION=id=<udid> ./scripts/build-wda.sh`). This is an Apple
+> code-signing constraint, not a choice. See **Build from source** below.
+
+## Build from source
+
+Everything below is for **building the app yourself** (and producing the DMG
+above). `tools/` is gitignored, so a fresh clone starts empty — the `go-ios`
+binary and the WebDriverAgent `.ipa` are built here and then bundled into the
+`.app` by `scripts/package.sh`.
+
+### Requirements
 
 - macOS 14+ (built/tested on macOS 26, Xcode 26, Swift 6.3)
 - An iPhone connected by USB, unlocked, "Trust This Computer" accepted, with
@@ -85,7 +108,7 @@ step, day-to-day use is just opening the app.
 - For building the `go-ios` helper from source: **Go** and **osv-scanner**
   (`brew install go osv-scanner`)
 
-## Set up `tools/` (one-time)
+### Set up `tools/` (one-time)
 
 `tools/` is not committed (it holds large third-party clones). Populate it at the
 audited, pinned versions — see [SECURITY-AUDIT.md](SECURITY-AUDIT.md) for the
@@ -135,7 +158,7 @@ Then install WebDriverAgent on the device once (Xcode):
    [rebrand design](docs/2026-07-03-rebrand-wda-and-improvements-design.md) for the
    why/how. (The macOS app's `runwda` is already wired to launch the branded id.)
 
-## Run
+### Run (from source)
 
 ```bash
 ./scripts/run.sh            # debug build → bundle (with go-ios + icon) → launch
