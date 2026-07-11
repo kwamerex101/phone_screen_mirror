@@ -250,3 +250,15 @@ final class SimctlParsingTests: XCTestCase {
         XCTAssertEqual(SimctlParsing.parseSimulators(Data("nonsense".utf8)), [])
     }
 }
+
+final class StageMarkerTests: XCTestCase {
+    func testCurrentWhenMarkerMatches() {
+        XCTAssertTrue(StageMarker.isCurrent(marker: "20260708", appBuild: "20260708"))
+    }
+    func testStaleWhenMarkerDiffers() {
+        XCTAssertFalse(StageMarker.isCurrent(marker: "20260101", appBuild: "20260708"))
+    }
+    func testStaleWhenMarkerNil() {
+        XCTAssertFalse(StageMarker.isCurrent(marker: nil, appBuild: "20260708"))
+    }
+}
