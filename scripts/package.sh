@@ -54,6 +54,18 @@ mkdir -p "$APP/Contents/Resources/licenses"
 cp "$ROOT/tools/WebDriverAgent/LICENSE" "$APP/Contents/Resources/licenses/WebDriverAgent-LICENSE.txt" 2>/dev/null || true
 cp "$ROOT/tools/go-ios/LICENSE"        "$APP/Contents/Resources/licenses/go-ios-LICENSE.txt" 2>/dev/null || true
 
+# Bundle the WDA source + sim bring-up script so the "iOS Simulator" Enable flow
+# works from a packaged app (SimulatorController stages these into Application
+# Support and runs sim-wda-up.sh from there). Mirrors the repo layout so the
+# script's $ROOT-relative paths resolve. Only present when the source is vendored.
+if [[ -d "$ROOT/tools/WebDriverAgent" ]]; then
+    echo "==> bundling WDA source + sim scripts (for in-app simulator build)"
+    mkdir -p "$APP/Contents/Resources/tools" "$APP/Contents/Resources/scripts"
+    cp -R "$ROOT/tools/WebDriverAgent" "$APP/Contents/Resources/tools/WebDriverAgent"
+    cp "$ROOT/scripts/sim-wda-up.sh"      "$APP/Contents/Resources/scripts/"
+    cp "$ROOT/scripts/make_ios_icon.swift" "$APP/Contents/Resources/scripts/"
+fi
+
 # Pick a signing identity — by its SHA-1 hash, not its name. Two "Developer ID
 # Application" certs with the same subject (e.g. after a renewal) make a
 # name-based --sign ambiguous and codesign aborts; the hash is unique.
