@@ -27,6 +27,12 @@
 # This runs `xcodebuild test-without-building` in the FOREGROUND and stays attached
 # — WDA lives only as long as this process. Ctrl-C to stop. (Productizing this means
 # supervising/relaunching it the way Transport.swift supervises go-ios.)
+#
+# NOTE: the branded "iMirror" icon this installs on the sim is the XCUITest RUNNER.
+# Do NOT launch it by tapping the icon (or let the OS cold-launch it) — a test
+# runner only works when xcodebuild starts it, which injects the toolchain dylibs
+# (e.g. lib_TestingInterop.dylib). Launched standalone it aborts at load with a
+# "Library not loaded" dyld error. Always bring WDA up through this script.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
