@@ -278,24 +278,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private let settingsButton = NSButton()
     private let settingsPopover = NSPopover()
     private var settingsBuilt = false
-    private let mcpButton = NSButton()
-    private let mcpUninstallButton = NSButton()
-    private let mcpSpinner = NSProgressIndicator()
-    private let mcpStatusLabel = NSTextField(labelWithString: "")
+    private let deviceMCP = MCPSectionUI(profile: .device, noun: "")
+    private let simMCP = MCPSectionUI(profile: .simulator, noun: " (sim)")
     private let simController = SimulatorController()
     private var simDevices: [SimDevice] = []
     private let simPicker = NSPopUpButton()
     private let simEnableButton = NSButton()
     private let simStatusLabel = NSTextField(labelWithString: "")
-    private let mcpSimButton = NSButton()
-    private let mcpSimUninstallButton = NSButton()
-    private let mcpSimSpinner = NSProgressIndicator()
-    private let mcpSimStatusLabel = NSTextField(labelWithString: "")
-    private var mcpSimInstalled = false
     private var simEnabled = false
     private let iosRunnerLabel = NSTextField(labelWithString: "")
     private var lastRunnerInstall: RunnerInstall?
-    private var mcpInstalled = false
     private let healthButton = NSButton()
     private var recordItem: NSToolbarItem!
     private var screenshotItem: NSToolbarItem!
@@ -1457,33 +1449,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         mcpCap.preferredMaxLayoutWidth = 268
         stack.addArrangedSubview(mcpCap)
 
-        mcpButton.bezelStyle = .rounded
-        mcpButton.title = "Install MCP server"
-        mcpButton.target = self
-        mcpButton.action = #selector(primaryMCP)
-        mcpUninstallButton.bezelStyle = .rounded
-        mcpUninstallButton.title = "Uninstall"
-        mcpUninstallButton.target = self
-        mcpUninstallButton.action = #selector(uninstallMCP)
-        mcpUninstallButton.isHidden = true
-        mcpSpinner.style = .spinning
-        mcpSpinner.controlSize = .small
-        mcpSpinner.isDisplayedWhenStopped = false   // invisible until an op runs
-        let mcpButtons = NSStackView(views: [mcpButton, mcpUninstallButton, mcpSpinner])
-        mcpButtons.orientation = .horizontal
-        mcpButtons.spacing = 8
-        stack.addArrangedSubview(mcpButtons)
-
-        mcpStatusLabel.font = .systemFont(ofSize: 11)
-        mcpStatusLabel.textColor = .secondaryLabelColor
-        mcpStatusLabel.preferredMaxLayoutWidth = 268
-        mcpStatusLabel.lineBreakMode = .byWordWrapping   // wrap, don't clip long status
-        mcpStatusLabel.maximumNumberOfLines = 0
-        mcpStatusLabel.usesSingleLineMode = false
-        mcpStatusLabel.cell?.wraps = true
-        mcpStatusLabel.cell?.isScrollable = false
-        stack.addArrangedSubview(mcpStatusLabel)
-        refreshMCP(updateLabel: true)
+        for v in deviceMCP.views() { stack.addArrangedSubview(v) }
+        deviceMCP.refresh(updateLabel: true)
 
         // iOS Simulator section — pick a sim, bring up WDA on :8201, install imirror-sim.
         let simSep = NSBox(); simSep.boxType = .separator
@@ -1519,32 +1486,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         simStatusLabel.maximumNumberOfLines = 0
         stack.addArrangedSubview(simStatusLabel)
 
-        mcpSimButton.bezelStyle = .rounded
-        mcpSimButton.title = "Install MCP server (sim)"
-        mcpSimButton.target = self
-        mcpSimButton.action = #selector(primaryMCPSim)
-        mcpSimUninstallButton.bezelStyle = .rounded
-        mcpSimUninstallButton.title = "Uninstall"
-        mcpSimUninstallButton.target = self
-        mcpSimUninstallButton.action = #selector(uninstallMCPSim)
-        mcpSimUninstallButton.isHidden = true
-        mcpSimSpinner.style = .spinning
-        mcpSimSpinner.controlSize = .small
-        mcpSimSpinner.isDisplayedWhenStopped = false
-        let mcpSimButtons = NSStackView(views: [mcpSimButton, mcpSimUninstallButton, mcpSimSpinner])
-        mcpSimButtons.orientation = .horizontal
-        mcpSimButtons.spacing = 8
-        stack.addArrangedSubview(mcpSimButtons)
-
-        mcpSimStatusLabel.font = .systemFont(ofSize: 11)
-        mcpSimStatusLabel.textColor = .secondaryLabelColor
-        mcpSimStatusLabel.preferredMaxLayoutWidth = 268
-        mcpSimStatusLabel.maximumNumberOfLines = 0
-        stack.addArrangedSubview(mcpSimStatusLabel)
+        for v in simMCP.views() { stack.addArrangedSubview(v) }
 
         simController.onState = { [weak self] state in self?.renderSimState(state) }
         refreshSimulators()
-        refreshMCPSim(updateLabel: true)
+        simMCP.refresh(updateLabel: true)
 
         // Version footer.
         let verSep = NSBox(); verSep.boxType = .separator
@@ -1609,55 +1555,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     /// Check installed state / version / staleness off the main thread (it shells
     /// out) and reflect it in the buttons — and the status line when `updateLabel`.
-    private func refreshMCP(updateLabel: Bool) {
-        if updateLabel { mcpStatusLabel.stringValue = "Checking…" }
-        DispatchQueue.global(qos: .userInitiated).async {
-            let s = MCPInstaller.status()
-            DispatchQueue.main.async {
-                self.mcpInstalled = s.installed
-                self.mcpUninstallButton.isHidden = !s.installed
-                self.mcpButton.title = !s.installed ? "Install MCP server"
-                                     : (s.upToDate ? "Reinstall" : "Update MCP server")
-                if updateLabel {
-                    let ver = s.version.map { " · v\($0)" } ?? ""
-                    self.mcpStatusLabel.stringValue = !s.installed
-                        ? "Not installed."
-                        : "Installed · \(s.clients.joined(separator: ", "))\(ver) · "
-                          + (s.upToDate ? "up to date." : "update available.")
-                }
-            }
-        }
-    }
-
-    @objc private func primaryMCP() {
-        mcpButton.isEnabled = false; mcpUninstallButton.isEnabled = false
-        mcpSpinner.startAnimation(nil)
-        let updating = mcpInstalled          // reinstall/update re-points paths + refreshes deps
-        mcpStatusLabel.stringValue = updating
-            ? "Updating…" : "Installing… (first run sets up Python — up to ~30s)"
-        MCPInstaller.install(update: updating, progress: { [weak self] msg in
-            self?.mcpStatusLabel.stringValue = msg
-        }, completion: { [weak self] r in
-            guard let self else { return }
-            self.mcpSpinner.stopAnimation(nil)
-            self.mcpStatusLabel.stringValue = r.message
-            self.mcpButton.isEnabled = true; self.mcpUninstallButton.isEnabled = true
-            self.refreshMCP(updateLabel: false)
-        })
-    }
-
-    @objc private func uninstallMCP() {
-        mcpButton.isEnabled = false; mcpUninstallButton.isEnabled = false
-        mcpSpinner.startAnimation(nil)
-        mcpStatusLabel.stringValue = "Removing…"
-        MCPInstaller.uninstall { [weak self] r in
-            guard let self else { return }
-            self.mcpSpinner.stopAnimation(nil)
-            self.mcpStatusLabel.stringValue = r.message
-            self.mcpButton.isEnabled = true; self.mcpUninstallButton.isEnabled = true
-            self.refreshMCP(updateLabel: false)
-        }
-    }
 
     private func refreshSimulators() {
         DispatchQueue.global(qos: .userInitiated).async {
@@ -1704,55 +1601,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         case .failed(let m):
             simEnabled = false; simEnableButton.title = "Enable"
             simStatusLabel.stringValue = "Failed: \(m)"
-        }
-    }
-
-    private func refreshMCPSim(updateLabel: Bool) {
-        if updateLabel { mcpSimStatusLabel.stringValue = "Checking…" }
-        DispatchQueue.global(qos: .userInitiated).async {
-            let s = MCPInstaller.status(profile: .simulator)
-            DispatchQueue.main.async {
-                self.mcpSimInstalled = s.installed
-                self.mcpSimUninstallButton.isHidden = !s.installed
-                self.mcpSimButton.title = !s.installed ? "Install MCP server (sim)"
-                                        : (s.upToDate ? "Reinstall" : "Update MCP server (sim)")
-                if updateLabel {
-                    let ver = s.version.map { " · v\($0)" } ?? ""
-                    self.mcpSimStatusLabel.stringValue = !s.installed
-                        ? "Not installed."
-                        : "Installed · \(s.clients.joined(separator: ", "))\(ver) · "
-                          + (s.upToDate ? "up to date." : "update available.")
-                }
-            }
-        }
-    }
-
-    @objc private func primaryMCPSim() {
-        mcpSimButton.isEnabled = false; mcpSimUninstallButton.isEnabled = false
-        mcpSimSpinner.startAnimation(nil)
-        let updating = mcpSimInstalled
-        mcpSimStatusLabel.stringValue = updating ? "Updating…" : "Installing… (first run sets up Python — up to ~30s)"
-        MCPInstaller.install(profile: .simulator, update: updating, progress: { [weak self] msg in
-            self?.mcpSimStatusLabel.stringValue = msg
-        }, completion: { [weak self] r in
-            guard let self else { return }
-            self.mcpSimSpinner.stopAnimation(nil)
-            self.mcpSimStatusLabel.stringValue = r.message
-            self.mcpSimButton.isEnabled = true; self.mcpSimUninstallButton.isEnabled = true
-            self.refreshMCPSim(updateLabel: false)
-        })
-    }
-
-    @objc private func uninstallMCPSim() {
-        mcpSimButton.isEnabled = false; mcpSimUninstallButton.isEnabled = false
-        mcpSimSpinner.startAnimation(nil)
-        mcpSimStatusLabel.stringValue = "Removing…"
-        MCPInstaller.uninstall(profile: .simulator) { [weak self] r in
-            guard let self else { return }
-            self.mcpSimSpinner.stopAnimation(nil)
-            self.mcpSimStatusLabel.stringValue = r.message
-            self.mcpSimButton.isEnabled = true; self.mcpSimUninstallButton.isEnabled = true
-            self.refreshMCPSim(updateLabel: false)
         }
     }
 
