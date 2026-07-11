@@ -31,6 +31,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -68,6 +69,32 @@ def _is_loopback_url(url: str) -> bool:
 WDA = os.environ.get("IMIRROR_WDA", "http://127.0.0.1:8100")
 if not _is_loopback_url(WDA):
     raise SystemExit("Refusing non-loopback WDA target (WDA has no auth on the wire).")
+
+# Which kind of target is behind WDA. "device" (default) is a physical iPhone the
+# iMirror app brought up; "simulator" is a booted Simulator whose WDA was launched
+# by scripts/sim-wda-up.sh. The interaction tools are identical either way — this
+# only switches the few non-WDA paths: app install (go-ios vs `simctl`), the
+# simulator-only sim_* helpers, and the wording of "unreachable"/wedged hints
+# (a simulator has no health dot). See scripts/sim-wda-up.sh.
+TARGET = os.environ.get("IMIRROR_TARGET", "device").strip().lower()
+if TARGET not in ("device", "simulator"):
+    raise SystemExit(f"IMIRROR_TARGET must be 'device' or 'simulator', got {TARGET!r}.")
+_IS_SIM = TARGET == "simulator"
+
+
+def _unreachable_hint() -> str:
+    """Actionable 'why can't I reach WDA' suffix, phrased for the current target."""
+    if _IS_SIM:
+        return (f"Is the simulator's WebDriverAgent running (scripts/sim-wda-up.sh) "
+                f"and reachable at {WDA}?")
+    return "Is the iMirror app running and is the health dot green?"
+
+
+def _wedged_hint() -> str:
+    """Where to look when WDA is up but not answering, phrased for the target."""
+    return ("check the simulator's WebDriverAgent process" if _IS_SIM
+            else "check the iMirror health dot")
+
 
 mcp = FastMCP("imirror")
 
@@ -174,11 +201,10 @@ def _req(method: str, path: str, body: dict | None = None,
         except (socket.timeout, TimeoutError) as e:
             raise RuntimeError(
                 f"WDA timed out after {timeout}s on {path}. It may be busy or "
-                f"wedged — check the iMirror health dot.") from e
+                f"wedged — {_wedged_hint()}.") from e
         except OSError as e:
             raise RuntimeError(
-                f"Cannot reach WDA at {WDA} ({e}). Is the iMirror app running and "
-                f"is the health dot green?") from e
+                f"Cannot reach WDA at {WDA} ({e}). {_unreachable_hint()}") from e
         # HTTP errors (4xx/5xx) come back as a normal response with http.client,
         # not an exception — callers (e.g. _session_post) rely on seeing the code
         # and any JSON error body, so return them rather than raising.
@@ -190,7 +216,7 @@ def _req(method: str, path: str, body: dict | None = None,
             raise
     raise RuntimeError(
         f"WDA dropped the connection repeatedly on {path} ({last_exc}). "
-        f"It may be busy or wedged — check the iMirror health dot.")
+        f"It may be busy or wedged — {_wedged_hint()}.")
 
 
 def _ensure_session() -> str:
@@ -533,6 +559,12 @@ def ios_press_button(name: str = "home") -> str:
     allowed = {"home", "volumeUp", "volumeDown"}
     if name not in allowed:
         raise RuntimeError(f"name must be one of {sorted(allowed)}")
+    if name in ("volumeUp", "volumeDown") and _IS_SIM:
+        # Volume is a physical button; WDA returns an opaque HTTP 500 on a
+        # simulator. Fail early with something the caller can act on.
+        raise RuntimeError(
+            f"{name} is unavailable on a simulator (volume buttons are "
+            "physical-device-only). Use 'home', or run against a device.")
     if name == "home":
         code, j = _req("POST", "/wda/homescreen", {})
         if code >= 400:
@@ -703,14 +735,26 @@ def _ios_bin() -> str:
 
 @mcp.tool()
 def ios_install_app(path: str) -> str:
-    """Install an .ipa (or .app) on the device via the bundled go-ios.
+    """Install an app on the current target (see IMIRROR_TARGET).
 
-    Resolves the go-ios `ios` binary via IMIRROR_IOS_BIN, then a bundled
-    iMirror.app copy, then PATH (see _ios_bin). Needs a signature already valid
-    for the device. Shell-out (not WDA); degrades with a clear error if absent.
+    Device (default): installs an .ipa/.app via the bundled go-ios; needs a
+    signature already valid for the device.
+    Simulator: installs a simulator-SDK .app via `xcrun simctl install booted`.
+    A device .ipa will NOT run on a simulator — build the app for the simulator
+    SDK. Shell-out (not WDA); degrades with a clear error if the tool is absent.
     """
     if not os.path.exists(path):
         raise RuntimeError(f"No such file: {path}")
+    if _IS_SIM:
+        _install_on_simulator(path)
+    else:
+        _install_on_device(path)
+    _record("install_app", path)
+    return f"installed {os.path.basename(path)}"
+
+
+def _install_on_device(path: str) -> None:
+    """Install `path` on the connected device via go-ios (resolved by _ios_bin)."""
     try:
         subprocess.run([_ios_bin(), "install", f"--path={path}"],
                        check=True, capture_output=True, text=True)
@@ -718,8 +762,113 @@ def ios_install_app(path: str) -> str:
         raise RuntimeError("go-ios 'ios' binary not found (set IMIRROR_IOS_BIN).") from e
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"install failed: {(e.stderr or '').strip() or e}") from e
-    _record("install_app", path)
-    return f"installed {os.path.basename(path)}"
+
+
+def _install_on_simulator(path: str) -> None:
+    """Install `path` on the booted simulator via `xcrun simctl install booted`."""
+    try:
+        subprocess.run(["xcrun", "simctl", "install", "booted", path],
+                       check=True, capture_output=True, text=True)
+    except FileNotFoundError as e:
+        raise RuntimeError("`xcrun` not found — install the Xcode command-line tools.") from e
+    except subprocess.CalledProcessError as e:
+        # The single most common mistake is handing a device .ipa to a simulator;
+        # simctl's own error is terse, so add the actionable hint.
+        hint = (" (a device .ipa won't run on a simulator — build the .app for the "
+                "simulator SDK)") if path.endswith(".ipa") else ""
+        raise RuntimeError(
+            f"simctl install failed: {(e.stderr or '').strip() or e}{hint}") from e
+
+
+# ---- Simulator-only helpers (xcrun simctl) -------------------------------------
+# These control the booted simulator directly, doing things WDA/XCUITest can't:
+# deliver push payloads, flip privacy permissions without tapping the system
+# dialog, and freeze the status bar for clean screenshots. simctl only ever talks
+# to simulators, so they require IMIRROR_TARGET=simulator and target `booted`.
+
+def _simctl(*args: str) -> str:
+    """Run `xcrun simctl <args>` and return stdout. Simulator-only.
+
+    Raises a clear error when the current target isn't a simulator, when `xcrun`
+    is missing, or when simctl exits non-zero (surfacing its stderr).
+    """
+    if not _IS_SIM:
+        raise RuntimeError("simctl tools require IMIRROR_TARGET=simulator.")
+    try:
+        r = subprocess.run(["xcrun", "simctl", *args],
+                           check=True, capture_output=True, text=True)
+    except FileNotFoundError as e:
+        raise RuntimeError("`xcrun` not found — install the Xcode command-line tools.") from e
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"simctl {args[0]} failed: {(e.stderr or '').strip() or e}") from e
+    return (r.stdout or "").strip()
+
+
+@mcp.tool()
+def sim_push(bundle_id: str, payload_json: str) -> str:
+    """(Simulator only) Deliver a push notification to `bundle_id`.
+
+    `payload_json` is the full APNs payload as a JSON string, e.g.
+    '{"aps": {"alert": "Hello"}}'. Lets you exercise notification handling without
+    a real APNs round-trip. Requires IMIRROR_TARGET=simulator.
+    """
+    try:
+        json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"payload_json is not valid JSON: {e}") from e
+    # simctl reads the payload from a file; hand it a temp .apns and clean up.
+    with tempfile.NamedTemporaryFile("w", suffix=".apns", delete=False) as f:
+        f.write(payload_json)
+        tmp = f.name
+    try:
+        _simctl("push", "booted", bundle_id, tmp)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    _record("sim_push", bundle_id)
+    return f"pushed to {bundle_id}"
+
+
+@mcp.tool()
+def sim_privacy(action: str, service: str, bundle_id: str = "") -> str:
+    """(Simulator only) Grant, revoke, or reset a privacy permission without
+    tapping the system consent dialog.
+
+    action ∈ {grant, revoke, reset}. service is a simctl service name, e.g.
+    photos, camera, microphone, contacts, calendar, location, all. `bundle_id`
+    scopes grant/revoke to one app (simctl requires it for those); reset accepts
+    a bundle id or `all`. Requires IMIRROR_TARGET=simulator.
+    """
+    if action not in ("grant", "revoke", "reset"):
+        raise RuntimeError("action must be one of ['grant', 'revoke', 'reset'].")
+    args = ["privacy", "booted", action, service]
+    if bundle_id:
+        args.append(bundle_id)
+    _simctl(*args)
+    _record("sim_privacy", f"{action} {service} {bundle_id}".strip())
+    return f"{action} {service}" + (f" for {bundle_id}" if bundle_id else "")
+
+
+@mcp.tool()
+def sim_status_bar(time: str = "9:41", clear: bool = False) -> str:
+    """(Simulator only) Override the status bar for clean screenshots — full
+    signal/wifi bars, 100% battery, and a fixed `time` (default 9:41).
+
+    Pass clear=True to restore the real status bar. Requires
+    IMIRROR_TARGET=simulator.
+    """
+    if clear:
+        _simctl("status_bar", "booted", "clear")
+        _record("sim_status_bar", "clear")
+        return "status bar restored"
+    _simctl("status_bar", "booted", "override",
+            "--time", time, "--batteryState", "charged", "--batteryLevel", "100",
+            "--cellularBars", "4", "--wifiBars", "3", "--dataNetwork", "wifi")
+    _record("sim_status_bar", f"override time={time}")
+    return f"status bar overridden (time {time})"
 
 
 # ---- Test-run recording & report -----------------------------------------------
