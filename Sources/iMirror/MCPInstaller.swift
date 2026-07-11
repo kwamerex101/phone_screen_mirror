@@ -15,8 +15,6 @@ import iMirrorCore
 enum MCPInstaller {
     struct Result { let ok: Bool; let message: String }
 
-    static let serverName = "imirror"
-
     // MARK: Paths
 
     private static var appSupport: URL {
@@ -94,31 +92,33 @@ enum MCPInstaller {
         var installed: Bool { !clients.isEmpty }
     }
 
-    /// Where things stand right now — used to show installed/version/update state
-    /// when the user opens Settings. Runs off the main thread (it may shell out).
-    static func status() -> Status {
+    static func isInstalled(profile: MCPProfile = .device) -> Bool { status(profile: profile).installed }
+
+    /// Where things stand right now for one profile — installed/version/staleness.
+    static func status(profile: MCPProfile = .device) -> Status {
+        let name = profile.serverName
         let desiredScript = scriptURL()?.path
         let venvOK = FileManager.default.isExecutableFile(atPath: venvPython.path)
         var clients: [String] = []
         var stale = false
 
         if let data = try? Data(contentsOf: claudeDesktopConfig),
-           let e = MCPConfig.entry(data, name: serverName) {
+           let e = MCPConfig.entry(data, name: name) {
             clients.append("Claude Desktop")
             if e.command != venvPython.path || e.args.first != desiredScript { stale = true }
+            if MCPConfig.entryEnv(data, name: name) != profile.env { stale = true }
         }
         if let claude = claudeCLI() {
-            let r = run(claude, ["mcp", "get", serverName])
-            if r.code == 0, r.out.contains(serverName) {
+            let r = run(claude, ["mcp", "get", name])
+            if r.code == 0, r.out.contains(name) {
                 clients.append("Claude Code")
                 if let s = desiredScript, !r.out.contains(s) { stale = true }
+                for (k, v) in profile.env where !r.out.contains("\(k)=\(v)") { stale = true }
             }
         }
         return Status(clients: clients, version: currentVersion(),
                       upToDate: !clients.isEmpty && venvOK && !stale)
     }
-
-    static func isInstalled() -> Bool { status().installed }
 
     /// The `__version__` of the current (repo or bundled) server script.
     static func currentVersion() -> String? {
@@ -132,16 +132,16 @@ enum MCPInstaller {
 
     // MARK: Install / uninstall
 
-    static func install(update: Bool = false,
+    static func install(profile: MCPProfile = .device, update: Bool = false,
                         progress: @escaping (String) -> Void,
                         completion: @escaping (Result) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = doInstall(update: update, progress: progress)
+            let result = doInstall(profile: profile, update: update, progress: progress)
             DispatchQueue.main.async { completion(result) }
         }
     }
 
-    private static func doInstall(update: Bool, progress: @escaping (String) -> Void) -> Result {
+    private static func doInstall(profile: MCPProfile, update: Bool, progress: @escaping (String) -> Void) -> Result {
         guard let script = scriptURL() else {
             return Result(ok: false, message: "Couldn't find imirror_mcp.py (repo or bundle).")
         }
@@ -176,14 +176,16 @@ enum MCPInstaller {
         }
 
         var registered: [String] = []
+        let name = profile.serverName
 
-        // 2. Claude Code (idempotent: remove any stale entry, then add).
+        // 2. Claude Code (idempotent: remove any stale entry, then add with env).
         if let claude = claudeCLI() {
             progress("Registering with Claude Code…")
-            _ = run(claude, ["mcp", "remove", serverName, "--scope", "user"])
-            let add = run(claude, ["mcp", "add", serverName, "--scope", "user",
-                                   "--", venvPython.path, script.path])
-            if add.code == 0 { registered.append("Claude Code") }
+            _ = run(claude, ["mcp", "remove", name, "--scope", "user"])
+            var addArgs = ["mcp", "add", name, "--scope", "user"]
+            for (k, v) in profile.env { addArgs += ["-e", "\(k)=\(v)"] }
+            addArgs += ["--", venvPython.path, script.path]
+            if run(claude, addArgs).code == 0 { registered.append("Claude Code") }
         }
 
         // 3. Claude Desktop (only if the app dir exists — i.e. it's installed).
@@ -192,8 +194,9 @@ enum MCPInstaller {
             progress("Updating Claude Desktop config…")
             do {
                 let existing = try? Data(contentsOf: claudeDesktopConfig)
-                let merged = try MCPConfig.merged(into: existing, name: serverName,
-                                                  command: venvPython.path, args: [script.path])
+                let merged = try MCPConfig.merged(into: existing, name: name,
+                                                  command: venvPython.path,
+                                                  args: [script.path], env: profile.env)
                 try merged.write(to: claudeDesktopConfig)
                 registered.append("Claude Desktop (restart it)")
             } catch {
@@ -207,16 +210,17 @@ enum MCPInstaller {
         return Result(ok: true, message: "Installed ✓ — " + registered.joined(separator: ", "))
     }
 
-    static func uninstall(completion: @escaping (Result) -> Void) {
+    static func uninstall(profile: MCPProfile = .device, completion: @escaping (Result) -> Void) {
+        let name = profile.serverName
         DispatchQueue.global(qos: .userInitiated).async {
             var removed: [String] = []
             if let claude = claudeCLI() {
-                if run(claude, ["mcp", "remove", serverName, "--scope", "user"]).code == 0 {
+                if run(claude, ["mcp", "remove", name, "--scope", "user"]).code == 0 {
                     removed.append("Claude Code")
                 }
             }
             if let data = try? Data(contentsOf: claudeDesktopConfig),
-               let out = try? MCPConfig.removed(from: data, name: serverName) {
+               let out = try? MCPConfig.removed(from: data, name: name) {
                 try? out.write(to: claudeDesktopConfig)
                 removed.append("Claude Desktop")
             }
