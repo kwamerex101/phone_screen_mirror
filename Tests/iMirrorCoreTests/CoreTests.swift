@@ -193,10 +193,10 @@ final class MCPConfigTests: XCTestCase {
         let out = try MCPConfig.merged(into: nil, name: "imirror-sim",
                                        command: "/py", args: ["/s.py"],
                                        env: ["IMIRROR_TARGET": "simulator",
-                                             "IMIRROR_WDA": "http://127.0.0.1:8101"])
+                                             "IMIRROR_WDA": "http://127.0.0.1:8201"])
         let env = MCPConfig.entryEnv(out, name: "imirror-sim")
         XCTAssertEqual(env["IMIRROR_TARGET"], "simulator")
-        XCTAssertEqual(env["IMIRROR_WDA"], "http://127.0.0.1:8101")
+        XCTAssertEqual(env["IMIRROR_WDA"], "http://127.0.0.1:8201")
     }
 
     func testEntryEnvEmptyWhenNoEnvOrAbsent() throws {
@@ -217,7 +217,7 @@ final class MCPProfileTests: XCTestCase {
     func testSimulatorProfile() {
         XCTAssertEqual(MCPProfile.simulator.serverName, "imirror-sim")
         XCTAssertEqual(MCPProfile.simulator.env["IMIRROR_TARGET"], "simulator")
-        XCTAssertEqual(MCPProfile.simulator.env["IMIRROR_WDA"], "http://127.0.0.1:8101")
+        XCTAssertEqual(MCPProfile.simulator.env["IMIRROR_WDA"], "http://127.0.0.1:8201")
     }
 }
 

@@ -12,8 +12,8 @@
 
 - Swift tools version 6.0; targets macOS 14+ (`Package.swift`). Language mode v5.
 - Only `iMirrorCore` is unit-tested (`Tests/iMirrorCoreTests`). Put anything you want a unit test for in `iMirrorCore`; never add a test target for `iMirror`.
-- The MCP server talks to WDA on **loopback only** — never widen a host. Device WDA is `http://127.0.0.1:8100`; **simulator WDA is `http://127.0.0.1:8101`** so the two coexist.
-- Simulator MCP server name is **`imirror-sim`**; its env is exactly `IMIRROR_TARGET=simulator` and `IMIRROR_WDA=http://127.0.0.1:8101`.
+- The MCP server talks to WDA on **loopback only** — never widen a host. Device WDA is `http://127.0.0.1:8100`; **simulator WDA is `http://127.0.0.1:8201`** so the two coexist.
+- Simulator MCP server name is **`imirror-sim`**; its env is exactly `IMIRROR_TARGET=simulator` and `IMIRROR_WDA=http://127.0.0.1:8201`.
 - The device MCP path (server name `imirror`, empty env) must remain behavior-for-behavior unchanged.
 - Keep the existing code style: explicit AppKit, no new third-party dependencies.
 - Commit messages end with the repo's trailer: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
@@ -52,10 +52,10 @@
         let out = try MCPConfig.merged(into: nil, name: "imirror-sim",
                                        command: "/py", args: ["/s.py"],
                                        env: ["IMIRROR_TARGET": "simulator",
-                                             "IMIRROR_WDA": "http://127.0.0.1:8101"])
+                                             "IMIRROR_WDA": "http://127.0.0.1:8201"])
         let env = MCPConfig.entryEnv(out, name: "imirror-sim")
         XCTAssertEqual(env["IMIRROR_TARGET"], "simulator")
-        XCTAssertEqual(env["IMIRROR_WDA"], "http://127.0.0.1:8101")
+        XCTAssertEqual(env["IMIRROR_WDA"], "http://127.0.0.1:8201")
     }
 
     func testEntryEnvEmptyWhenNoEnvOrAbsent() throws {
@@ -109,7 +109,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `public struct MCPProfile { public let serverName: String; public let env: [String: String]; static let device: MCPProfile; static let simulator: MCPProfile }`. `.device` = name `"imirror"`, env `[:]`. `.simulator` = name `"imirror-sim"`, env `IMIRROR_TARGET=simulator`, `IMIRROR_WDA=http://127.0.0.1:8101`.
+- Produces: `public struct MCPProfile { public let serverName: String; public let env: [String: String]; static let device: MCPProfile; static let simulator: MCPProfile }`. `.device` = name `"imirror"`, env `[:]`. `.simulator` = name `"imirror-sim"`, env `IMIRROR_TARGET=simulator`, `IMIRROR_WDA=http://127.0.0.1:8201`.
 
 - [ ] **Step 1: Write the failing tests** — add a new class at the end of `Tests/iMirrorCoreTests/CoreTests.swift`:
 
@@ -123,7 +123,7 @@ final class MCPProfileTests: XCTestCase {
     func testSimulatorProfile() {
         XCTAssertEqual(MCPProfile.simulator.serverName, "imirror-sim")
         XCTAssertEqual(MCPProfile.simulator.env["IMIRROR_TARGET"], "simulator")
-        XCTAssertEqual(MCPProfile.simulator.env["IMIRROR_WDA"], "http://127.0.0.1:8101")
+        XCTAssertEqual(MCPProfile.simulator.env["IMIRROR_WDA"], "http://127.0.0.1:8201")
     }
 }
 ```
@@ -137,7 +137,7 @@ Expected: FAIL to build with "cannot find 'MCPProfile' in scope".
 
 ```swift
 // Which MCP server the installer is acting on. `device` drives a physical iPhone
-// (WDA on 8100, no env); `simulator` drives a booted Simulator (WDA on 8101, with
+// (WDA on 8100, no env); `simulator` drives a booted Simulator (WDA on 8201, with
 // IMIRROR_TARGET=simulator so the server takes its simulator code paths). Kept in
 // iMirrorCore so the profile/env values are unit-testable.
 
@@ -156,7 +156,7 @@ public struct MCPProfile: Sendable, Equatable {
     public static let simulator = MCPProfile(
         serverName: "imirror-sim",
         env: ["IMIRROR_TARGET": "simulator",
-              "IMIRROR_WDA": "http://127.0.0.1:8101"])
+              "IMIRROR_WDA": "http://127.0.0.1:8201"])
 }
 ```
 
@@ -463,9 +463,9 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
     - `var onState: ((SimState) -> Void)?`
     - `func xcodeAvailable() -> Bool`
     - `func listSimulators() -> [SimDevice]`
-    - `func enable(udid: String)` — boots the sim and supervises WDA on port 8101, driving `onState`.
+    - `func enable(udid: String)` — boots the sim and supervises WDA on port 8201, driving `onState`.
     - `func disable()` — tears the supervised runner down, state → `.idle`.
-    - `static let port = 8101`
+    - `static let port = 8201`
 
 **Note:** app target, no unit tests. Verify with `swift build`, then a manual integration run (needs Xcode + a sim + the repo checkout).
 
@@ -474,7 +474,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 Create `Sources/iMirror/SimulatorController.swift`:
 
 ```swift
-// Boots an iOS Simulator and brings up WebDriverAgent on it (loopback :8101), so
+// Boots an iOS Simulator and brings up WebDriverAgent on it (loopback :8201), so
 // the imirror-sim MCP server can drive it. Phase 1 delegates the actual WDA build
 // to scripts/sim-wda-up.sh (present in a source checkout) and supervises it with
 // ManagedProcess; Phase 2 will build in-process from bundled source. Viewing is via
@@ -489,7 +489,7 @@ enum SimState: Equatable {
 }
 
 final class SimulatorController {
-    static let port = 8101
+    static let port = 8201
     var onState: ((SimState) -> Void)?
 
     private var wda: ManagedProcess?
@@ -627,7 +627,7 @@ This exercises the real bring-up outside the UI. In a scratch Swift file or via 
 Run (after the controller is wired in Task 6, or ad hoc):
 ```bash
 # with the app running and a sim enabled from Settings:
-curl -s -m 4 http://127.0.0.1:8101/status | grep -o '"ready" : true'
+curl -s -m 4 http://127.0.0.1:8201/status | grep -o '"ready" : true'
 ```
 Expected: `"ready" : true` within a few minutes of first enable (first build is slow).
 
@@ -635,10 +635,10 @@ Expected: `"ready" : true` within a few minutes of first enable (first build is 
 
 ```bash
 git add Sources/iMirror/SimulatorController.swift
-git commit -m "feat(app): SimulatorController — boot sim + supervise WDA on :8101
+git commit -m "feat(app): SimulatorController — boot sim + supervise WDA on :8201
 
 Phase 1 delegates the WDA build to scripts/sim-wda-up.sh under ManagedProcess
-supervision, polls :8101/status for readiness, and gates on full Xcode. Viewing
+supervision, polls :8201/status for readiness, and gates on full Xcode. Viewing
 is via Simulator.app.
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
@@ -680,7 +680,7 @@ Near the existing `private let mcpButton = NSButton()` group (around `main.swift
 In the settings-popover builder, immediately **before** the "Version footer" block (the `verSep` separator around `main.swift:1478`), insert:
 
 ```swift
-        // iOS Simulator section — pick a sim, bring up WDA on :8101, install imirror-sim.
+        // iOS Simulator section — pick a sim, bring up WDA on :8201, install imirror-sim.
         let simSep = NSBox(); simSep.boxType = .separator
         simSep.translatesAutoresizingMaskIntoConstraints = false
         simSep.widthAnchor.constraint(equalToConstant: 268).isActive = true
@@ -692,7 +692,7 @@ In the settings-popover builder, immediately **before** the "Version footer" blo
 
         let simCap = NSTextField(wrappingLabelWithString:
             "Boot a Simulator and drive it from Claude. Enable brings up WebDriverAgent "
-          + "on it (port 8101); view the sim in Apple's Simulator app. Requires Xcode.")
+          + "on it (port 8201); view the sim in Apple's Simulator app. Requires Xcode.")
         simCap.font = .systemFont(ofSize: 11)
         simCap.textColor = .secondaryLabelColor
         simCap.preferredMaxLayoutWidth = 268
@@ -788,7 +788,7 @@ Add these methods to the same class (near `refreshMCP`/`primaryMCP`, around `mai
         case .booting:  simEnabled = true; simEnableButton.title = "Disable"; simStatusLabel.stringValue = "Booting simulator…"
         case .building: simStatusLabel.stringValue = "Building WebDriverAgent (first run ~2–3 min)…"
         case .starting: simStatusLabel.stringValue = "Starting WebDriverAgent…"
-        case .ready:    simStatusLabel.stringValue = "WebDriverAgent ready on :8101 ✓"
+        case .ready:    simStatusLabel.stringValue = "WebDriverAgent ready on :8201 ✓"
         case .failed(let m):
             simEnabled = false; simEnableButton.title = "Enable"
             simStatusLabel.stringValue = "Failed: \(m)"
@@ -858,8 +858,8 @@ swift build && .build/debug/iMirror
 ```
 Then open Settings (gear/toolbar). Expected:
 - An "iOS Simulator" section shows a populated picker (or "Requires Xcode." if absent).
-- Pick a sim → **Enable** → status walks `Booting… → Building… → Starting… → WebDriverAgent ready on :8101 ✓`.
-- **Install MCP server (sim)** → status shows `Installed · Claude Code…`. Verify: `claude mcp get imirror-sim` shows env `IMIRROR_TARGET=simulator`, `IMIRROR_WDA=http://127.0.0.1:8101`.
+- Pick a sim → **Enable** → status walks `Booting… → Building… → Starting… → WebDriverAgent ready on :8201 ✓`.
+- **Install MCP server (sim)** → status shows `Installed · Claude Code…`. Verify: `claude mcp get imirror-sim` shows env `IMIRROR_TARGET=simulator`, `IMIRROR_WDA=http://127.0.0.1:8201`.
 - **Uninstall** removes it. The device MCP section still works unchanged.
 
 - [ ] **Step 6: Run the full Swift test suite (regression)**
@@ -873,7 +873,7 @@ Expected: all tests pass (the Task 1–3 additions plus the pre-existing suite).
 git add Sources/iMirror/main.swift
 git commit -m "feat(app): Settings iOS Simulator section (pick, enable, install MCP)
 
-Boots a chosen sim, brings up WDA on :8101 via SimulatorController, and installs
+Boots a chosen sim, brings up WDA on :8201 via SimulatorController, and installs
 the imirror-sim MCP server. Device section unchanged.
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
@@ -887,9 +887,9 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 - `MCPInstaller.Profile` + env registration + env-aware staleness → Tasks 2, 4. ✓
 - `MCPConfig` env round-trip / `entryEnv` → Task 1. ✓
 - `simctl` JSON → `[Simulator]` (picker source) → Task 3. ✓
-- `SimulatorController` (list, boot, bring-up on 8101, supervision, state, Xcode gate) → Task 5. ✓
+- `SimulatorController` (list, boot, bring-up on 8201, supervision, state, Xcode gate) → Task 5. ✓
 - Settings "iOS Simulator" section (picker, Enable, status, MCP install/uninstall) → Task 6. ✓
-- Ports: device 8100 / sim 8101 coexist → `MCPProfile.simulator` + `SimulatorController.port` (Tasks 2, 5). ✓
+- Ports: device 8100 / sim 8201 coexist → `MCPProfile.simulator` + `SimulatorController.port` (Tasks 2, 5). ✓
 - Manage-only (view via Simulator.app) → Task 5 opens Simulator.app; no capture path. ✓
 - Phase-2-only items (bundle WDA source, in-app build, `package.sh`) are **intentionally excluded** — a separate plan.
 

@@ -1485,7 +1485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         stack.addArrangedSubview(mcpStatusLabel)
         refreshMCP(updateLabel: true)
 
-        // iOS Simulator section — pick a sim, bring up WDA on :8101, install imirror-sim.
+        // iOS Simulator section — pick a sim, bring up WDA on :8201, install imirror-sim.
         let simSep = NSBox(); simSep.boxType = .separator
         simSep.translatesAutoresizingMaskIntoConstraints = false
         simSep.widthAnchor.constraint(equalToConstant: 268).isActive = true
@@ -1497,7 +1497,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
         let simCap = NSTextField(wrappingLabelWithString:
             "Boot a Simulator and drive it from Claude. Enable brings up WebDriverAgent "
-          + "on it (port 8101); view the sim in Apple's Simulator app. Requires Xcode.")
+          + "on it (port 8201); view the sim in Apple's Simulator app. Requires Xcode.")
         simCap.font = .systemFont(ofSize: 11)
         simCap.textColor = .secondaryLabelColor
         simCap.preferredMaxLayoutWidth = 268
@@ -1660,13 +1660,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     }
 
     private func refreshSimulators() {
-        let hasXcode = simController.xcodeAvailable()
-        simPicker.isEnabled = hasXcode
-        simEnableButton.isEnabled = hasXcode
-        if !hasXcode { simStatusLabel.stringValue = "Requires Xcode."; return }
         DispatchQueue.global(qos: .userInitiated).async {
-            let sims = self.simController.listSimulators()
+            let hasXcode = self.simController.xcodeAvailable()
+            let sims = hasXcode ? self.simController.listSimulators() : []
             DispatchQueue.main.async {
+                self.simPicker.isEnabled = hasXcode
+                self.simEnableButton.isEnabled = hasXcode
+                guard hasXcode else { self.simStatusLabel.stringValue = "Requires Xcode."; return }
                 self.simDevices = sims
                 self.simPicker.removeAllItems()
                 for s in sims {
@@ -1700,7 +1700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         case .booting:  simEnabled = true; simEnableButton.title = "Disable"; simStatusLabel.stringValue = "Booting simulator…"
         case .building: simStatusLabel.stringValue = "Building WebDriverAgent (first run ~2–3 min)…"
         case .starting: simStatusLabel.stringValue = "Starting WebDriverAgent…"
-        case .ready:    simStatusLabel.stringValue = "WebDriverAgent ready on :8101 ✓"
+        case .ready:    simStatusLabel.stringValue = "WebDriverAgent ready on :8201 ✓"
         case .failed(let m):
             simEnabled = false; simEnableButton.title = "Enable"
             simStatusLabel.stringValue = "Failed: \(m)"

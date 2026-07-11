@@ -1,5 +1,5 @@
 // Which MCP server the installer is acting on. `device` drives a physical iPhone
-// (WDA on 8100, no env); `simulator` drives a booted Simulator (WDA on 8101, with
+// (WDA on 8100, no env); `simulator` drives a booted Simulator (WDA on 8201, with
 // IMIRROR_TARGET=simulator so the server takes its simulator code paths). Kept in
 // iMirrorCore so the profile/env values are unit-testable.
 
@@ -18,5 +18,5 @@ public struct MCPProfile: Sendable, Equatable {
     public static let simulator = MCPProfile(
         serverName: "imirror-sim",
         env: ["IMIRROR_TARGET": "simulator",
-              "IMIRROR_WDA": "http://127.0.0.1:8101"])
+              "IMIRROR_WDA": "http://127.0.0.1:8201"])
 }

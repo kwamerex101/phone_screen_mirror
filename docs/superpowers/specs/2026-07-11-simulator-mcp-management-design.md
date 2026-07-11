@@ -32,7 +32,7 @@ The work is **phased**:
 - Reuse the app's existing supervision (`ManagedProcess`) and MCP-registration
   machinery rather than duplicating them.
 - Let the device (`imirror`, WDA on `127.0.0.1:8100`) and simulator
-  (`imirror-sim`, WDA on `127.0.0.1:8101`) coexist.
+  (`imirror-sim`, WDA on `127.0.0.1:8201`) coexist.
 - Keep everything testable at the pure-helper layer (no device/sim/Xcode needed
   for unit tests).
 
@@ -56,7 +56,7 @@ The work is **phased**:
 | Sim selection | **Picker** in Settings (`simctl list`) | Explicit control when several sims exist |
 | Orchestration | **Native `SimulatorController`** (Approach A) | Matches how the app already supervises go-ios; real status/restart |
 | Rollout | **Phased** (dev checkout → packaged) | A working sim path fast, then hardening |
-| Port | Sim WDA on **8101** (device stays 8100) | Device and sim can be enabled together |
+| Port | Sim WDA on **8201** (device stays 8100) | Device and sim can be enabled together |
 
 ## Architecture
 
@@ -70,11 +70,11 @@ hard-coded `serverName`:
 ```
 struct Profile {
     let serverName: String        // "imirror" | "imirror-sim"
-    let env: [String: String]     // [:] | [IMIRROR_TARGET: simulator, IMIRROR_WDA: ...8101]
+    let env: [String: String]     // [:] | [IMIRROR_TARGET: simulator, IMIRROR_WDA: ...8201]
     static let device    = Profile(serverName: "imirror", env: [:])
     static let simulator = Profile(serverName: "imirror-sim",
         env: ["IMIRROR_TARGET": "simulator",
-              "IMIRROR_WDA": "http://127.0.0.1:8101"])
+              "IMIRROR_WDA": "http://127.0.0.1:8201"])
 }
 ```
 
@@ -109,7 +109,7 @@ Responsibilities:
 - `listSimulators() -> [Simulator]` — parse `xcrun simctl list devices available -j`
   (JSON) into `{udid, name, runtime, isBooted}`. **Pure/testable** given canned JSON.
 - `boot(udid)` — `xcrun simctl boot <udid>` (no-op if booted) + `open -a Simulator`.
-- `bringUpWDA(udid, port: 8101)`:
+- `bringUpWDA(udid, port: 8201)`:
   - **ensure-built** (see §Build): produce a branded, signed sim runner (cached).
   - spawn `xcodebuild test-without-building` as a **supervised** `ManagedProcess`
     (reuse Transport.swift), with `TEST_RUNNER_USE_PORT=<port>` in the process
@@ -119,7 +119,7 @@ Responsibilities:
 - `xcodeAvailable() -> Bool` — `xcodebuild -version` succeeds (full Xcode, not just
   Command Line Tools). Gates the whole feature.
 
-Port is fixed at **8101** for the sim so it never collides with the device relay
+Port is fixed at **8201** for the sim so it never collides with the device relay
 on 8100.
 
 ### 3. Settings "iOS Simulator" section (`Sources/iMirror/main.swift`)
@@ -171,9 +171,9 @@ version-coupling crash seen with prebuilt runners.
 pick sim → Enable
   → SimulatorController.boot(udid)
   → ensure WDA built (cache hit → skip)
-  → supervised `xcodebuild test-without-building` (TEST_RUNNER_USE_PORT=8101)
-  → poll 127.0.0.1:8101/status == ready
-→ Install MCP (Profile.simulator → registers imirror-sim @ 8101)
+  → supervised `xcodebuild test-without-building` (TEST_RUNNER_USE_PORT=8201)
+  → poll 127.0.0.1:8201/status == ready
+→ Install MCP (Profile.simulator → registers imirror-sim @ 8201)
 → drive via Claude (mcp__imirror-sim__*) + view in Simulator.app
 ```
 
@@ -189,7 +189,7 @@ pick sim → Enable
 - **Standalone runner launch** → the branded iMirror runner on the sim is a test
   runner; launching it by tapping its icon crashes (`lib_TestingInterop.dylib`).
   The status/help text notes this; only the controller launches it via xcodebuild.
-- **Port** → sim fixed at 8101, device at 8100; no collision when both are on.
+- **Port** → sim fixed at 8201, device at 8100; no collision when both are on.
 
 ## Testing
 

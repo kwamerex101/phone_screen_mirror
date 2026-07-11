@@ -1,4 +1,4 @@
-// Boots an iOS Simulator and brings up WebDriverAgent on it (loopback :8101), so
+// Boots an iOS Simulator and brings up WebDriverAgent on it (loopback :8201), so
 // the imirror-sim MCP server can drive it. Phase 1 delegates the actual WDA build
 // to scripts/sim-wda-up.sh (present in a source checkout) and supervises it with
 // ManagedProcess; Phase 2 will build in-process from bundled source. Viewing is via
@@ -13,7 +13,7 @@ enum SimState: Equatable {
 }
 
 final class SimulatorController {
-    static let port = 8101
+    static let port = 8201
     var onState: ((SimState) -> Void)?
 
     private var wda: ManagedProcess?
@@ -72,7 +72,7 @@ final class SimulatorController {
         return FileManager.default.fileExists(atPath: repo.path) ? repo : nil
     }
 
-    /// Boot `udid` and bring up WDA on :8101. Safe to call from the main thread —
+    /// Boot `udid` and bring up WDA on :8201. Safe to call from the main thread —
     /// all blocking work (shell-outs, readiness polling) runs on a background queue;
     /// state is reported back via `onState` on the main thread.
     func enable(udid: String) {
@@ -95,6 +95,7 @@ final class SimulatorController {
             let proc = ManagedProcess(binary: URL(fileURLWithPath: "/bin/bash"),
                                       args: ["-lc", cmd],
                                       label: "sim-wda", restartDelay: 6, workDir: self.workDir)
+            self.wda?.stop()   // never leak a prior runner on a repeated enable
             self.wda = proc
             proc.start()
             self.startPolling()
@@ -114,6 +115,7 @@ final class SimulatorController {
 
     // Poll on the background queue so the ~4s readiness check never blocks the UI.
     private func startPolling() {
+        guard !polling else { return }
         emit(.starting)
         polling = true
         pollTick()
