@@ -1,7 +1,8 @@
 // Boots an iOS Simulator and brings up WebDriverAgent on it (loopback :8201), so
 // the imirror-sim MCP server can drive it. Phase 1 delegates the actual WDA build
-// to scripts/sim-wda-up.sh (present in a source checkout) and supervises it with
-// ManagedProcess; Phase 2 will build in-process from bundled source. Viewing is via
+// to scripts/sim-wda-up.sh and supervises it with ManagedProcess. The script comes
+// from the repo checkout (dev) or a copy of the app's bundled tools/+scripts/ staged
+// into Application Support (packaged). Viewing is via
 // Apple's Simulator.app — this type manages lifecycle + status only.
 
 import Foundation
@@ -56,20 +57,53 @@ final class SimulatorController {
 
     // MARK: Bring-up (Phase 1: delegate to scripts/sim-wda-up.sh)
 
-    /// Repo `scripts/sim-wda-up.sh` (source checkout only in Phase 1).
-    private func scriptURL() -> URL? {
-        let repo = URL(fileURLWithPath: #filePath)          // Sources/iMirror/SimulatorController.swift
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("scripts/sim-wda-up.sh")
-        return FileManager.default.fileExists(atPath: repo.path) ? repo : nil
+    private var stageDir: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("iMirror/wda-stage", isDirectory: true)
     }
 
-    /// Repo `tools/WebDriverAgent/WebDriverAgent.xcodeproj` for the script's WDA_PROJECT.
-    private func wdaProjectURL() -> URL? {
-        let repo = URL(fileURLWithPath: #filePath)
+    /// The directory to run `scripts/sim-wda-up.sh` from: the repo checkout when
+    /// running from source (Phase 1 behavior), otherwise a staged copy of the app's
+    /// bundled `tools/`+`scripts/`. Returns nil when neither is available. Runs on
+    /// `queue` (the stage copy can take a moment); never on the main thread.
+    private func resolvedRoot() -> URL? {
+        let fm = FileManager.default
+        // 1. Dev checkout — the repo tree next to this source file.
+        let repo = URL(fileURLWithPath: #filePath)          // Sources/iMirror/SimulatorController.swift
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("tools/WebDriverAgent/WebDriverAgent.xcodeproj")
-        return FileManager.default.fileExists(atPath: repo.path) ? repo : nil
+        if fm.fileExists(atPath: repo.appendingPathComponent("scripts/sim-wda-up.sh").path) {
+            return repo
+        }
+        // 2. Packaged — stage the bundled copy into a writable dir, once per app build.
+        guard let res = Bundle.main.resourceURL,
+              fm.fileExists(atPath: res.appendingPathComponent("scripts/sim-wda-up.sh").path)
+        else { return nil }
+        return stageBundledResources(from: res)
+    }
+
+    /// Copy the bundled `tools/`+`scripts/` into `stageDir` when missing or stale
+    /// (marker != current app build), then return `stageDir`. nil on copy failure.
+    private func stageBundledResources(from res: URL) -> URL? {
+        let fm = FileManager.default
+        let dir = stageDir
+        let marker = dir.appendingPathComponent(".app-build")
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        let current = try? String(contentsOf: marker, encoding: .utf8)
+        let present = fm.fileExists(atPath: dir.appendingPathComponent("scripts/sim-wda-up.sh").path)
+        if !present || !StageMarker.isCurrent(marker: current, appBuild: build) {
+            try? fm.removeItem(at: dir)
+            do {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                try fm.copyItem(at: res.appendingPathComponent("tools"),
+                                to: dir.appendingPathComponent("tools"))
+                try fm.copyItem(at: res.appendingPathComponent("scripts"),
+                                to: dir.appendingPathComponent("scripts"))
+                try build.write(to: marker, atomically: true, encoding: .utf8)
+            } catch {
+                return nil
+            }
+        }
+        return dir
     }
 
     /// Boot `udid` and bring up WDA on :8201. Safe to call from the main thread —
@@ -80,9 +114,11 @@ final class SimulatorController {
         queue.async { [weak self] in
             guard let self else { return }
             guard self.xcodeAvailable() else { return self.emit(.failed("Requires Xcode.")) }
-            guard let script = self.scriptURL(), let proj = self.wdaProjectURL() else {
-                return self.emit(.failed("Simulator bring-up needs a source checkout (Phase 1)."))
+            guard let root = self.resolvedRoot() else {
+                return self.emit(.failed("Simulator support isn't available in this build."))
             }
+            let script = root.appendingPathComponent("scripts/sim-wda-up.sh")
+            let proj = root.appendingPathComponent("tools/WebDriverAgent/WebDriverAgent.xcodeproj")
             _ = self.run("/usr/bin/xcrun", ["simctl", "boot", udid])   // no-op if already booted
             _ = self.run("/usr/bin/open", ["-a", "Simulator"])
 
