@@ -124,7 +124,10 @@ cp "$ASSETS/Assets.car" "$RUNNER/Assets.car"
 cp "$ASSETS"/AppIcon*.png "$RUNNER/" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $DISPLAY_NAME" "$RUNNER/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $DISPLAY_NAME" "$RUNNER/Info.plist"
-/usr/libexec/PlistBuddy -c "Merge $ASSETS/partial.plist" "$RUNNER/Info.plist"
+# Quote the merged path inside the -c command: PlistBuddy word-splits the command
+# string on spaces, so an unquoted path under "Application Support" (the staged
+# location) is mis-parsed as a bogus entry arg ("... Entry Does Not Exist").
+/usr/libexec/PlistBuddy -c "Merge '$ASSETS/partial.plist'" "$RUNNER/Info.plist"
 
 # Ad-hoc re-sign so the modified bundle stays valid for the simulator.
 if [[ -s "$ASSETS/ent.plist" ]]; then
