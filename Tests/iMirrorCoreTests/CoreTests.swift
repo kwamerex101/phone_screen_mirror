@@ -220,3 +220,33 @@ final class MCPProfileTests: XCTestCase {
         XCTAssertEqual(MCPProfile.simulator.env["IMIRROR_WDA"], "http://127.0.0.1:8101")
     }
 }
+
+final class SimctlParsingTests: XCTestCase {
+    private let json = """
+    {"devices":{
+      "com.apple.CoreSimulator.SimRuntime.iOS-26-5":[
+        {"udid":"AAA","name":"iPhone 17 Pro","state":"Booted","isAvailable":true},
+        {"udid":"BBB","name":"iPhone 17","state":"Shutdown","isAvailable":true}
+      ],
+      "com.apple.CoreSimulator.SimRuntime.watchOS-11-0":[
+        {"udid":"WWW","name":"Apple Watch","state":"Shutdown","isAvailable":true}
+      ]
+    }}
+    """.data(using: .utf8)!
+
+    func testParsesAndSortsBootedFirst() {
+        let sims = SimctlParsing.parseSimulators(json)
+        XCTAssertEqual(sims.map(\.udid), ["AAA", "BBB", "WWW"])
+        XCTAssertEqual(sims[0], SimDevice(udid: "AAA", name: "iPhone 17 Pro",
+                                          runtime: "iOS 26.5", isBooted: true))
+    }
+
+    func testRuntimeHumanized() {
+        let sims = SimctlParsing.parseSimulators(json)
+        XCTAssertEqual(sims.first(where: { $0.udid == "WWW" })?.runtime, "watchOS 11.0")
+    }
+
+    func testEmptyOnGarbage() {
+        XCTAssertEqual(SimctlParsing.parseSimulators(Data("nonsense".utf8)), [])
+    }
+}
