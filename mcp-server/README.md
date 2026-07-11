@@ -98,6 +98,11 @@ build — so the sim's App Library / Spotlight shows iMirror, not a stock
 (see `scripts/build-wda.sh`); in a worktree, point it at your main checkout with
 `WDA_PROJECT=/path/to/WebDriverAgent.xcodeproj`.
 
+That iMirror icon is the XCUITest **runner** — don't tap it to launch it. A test
+runner only works when `xcodebuild` starts it (the script does this); launched
+standalone it crashes at load with a `Library not loaded: …lib_TestingInterop.dylib`
+dyld error. If you see that dialog, click **Ignore** and start WDA via the script.
+
 ## Test reports (opt-in)
 
 The server can record a **test run** and emit a self-contained HTML report — a
