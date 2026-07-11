@@ -47,6 +47,10 @@ Features:
   screen-capture device is gated by the camera privilege — iMirror never uses the
   Mac camera); if it's denied, the empty state offers a one-click jump to the
   Camera privacy pane.
+- **iOS Simulator support** — no physical phone required: **Settings (⚙) → iOS
+  Simulator** picks a booted simulator, brings up WebDriverAgent on it, and
+  registers a dedicated `imirror-sim` MCP server, so an agent can drive and test
+  simulator builds too. You view the sim in Apple's Simulator app; requires Xcode.
 
 The app code is dependency-free Swift (AppKit, AVFoundation, CoreImage,
 CoreMediaIO, Network). Control rides on two vetted, source-built tools —
@@ -252,7 +256,8 @@ self-contained HTML report — cover page with verdict, pass/fail donut and stat
 cards, a failures-first panel, a "what was tested" table of contents, every
 step with embedded screenshots, and a looping timelapse of the whole run.
 Ask Claude to "test the login flow and give me a report" and you get reviewable
-evidence from a *real* device, not a simulator.
+evidence from a *real* device — the distinctive part. (Prefer a simulator? See
+**iOS Simulator** below.)
 
 **One-click install.** The app's **Settings (⚙) → MCP server** section registers
 this server with your MCP client(s) in one click — it makes a Python venv
@@ -266,6 +271,15 @@ It talks to the same loopback WDA the app brings up, so **turn on Automation**
 (Settings ⚙) and wait for the green dot before driving the phone. See
 [mcp-server/README.md](mcp-server/README.md) for the tool table and report
 walkthrough.
+
+**iOS Simulator (optional).** No phone handy, or testing a simulator build?
+**Settings (⚙) → iOS Simulator** lists your simulators; pick one and **Enable** to
+boot it and bring WebDriverAgent up on it (loopback `:8201`, so it coexists with a
+physical device on `:8100`), then **Install** the `imirror-sim` MCP server. You
+view and drive the sim through Apple's Simulator app and Claude — same `ios_*`
+tools, plus simulator-only `sim_push` / `sim_privacy` / `sim_status_bar`.
+**Requires Xcode**; the packaged app bundles the WebDriverAgent source and builds
+it once with your Xcode on first Enable (cached afterward).
 
 ## Packaging / distribution
 
@@ -301,8 +315,10 @@ with the App Sandbox; distribute the notarized DMG directly.
   (tens–hundreds of ms per action — fine, not frame-tight). Scrolling is not
   frame-tight and has no inertial coast (a WDA limitation, not a tuning knob).
 - **Not reachable** (XCUITest limitation): App Switcher, Control Center, Siri.
-- **One device at a time** — the transport assumes a single phone and fixed
-  loopback ports (8100/8101). Multi-device would need per-device port plumbing.
+- **One physical device at a time** — the transport assumes a single phone and
+  fixed loopback ports (8100/8101). Multi-device would need per-device port
+  plumbing. A booted **iOS Simulator** runs on a separate WDA (`:8201`), so it can
+  be enabled alongside a physical device.
 - **Maintenance reality:** control depends on go-ios + WebDriverAgent tracking
   Apple's private wire protocols, so a new iOS major version can break the chain
   until those projects catch up. Pinned versions in
