@@ -17,7 +17,8 @@ final class SimulatorController {
     var onState: ((SimState) -> Void)?
 
     private var wda: ManagedProcess?
-    private var poll: Timer?
+    private let queue = DispatchQueue(label: "com.imirror.sim", qos: .userInitiated)
+    private var polling = false
     private let workDir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("iMirror/sim", isDirectory: true)
@@ -71,45 +72,62 @@ final class SimulatorController {
         return FileManager.default.fileExists(atPath: repo.path) ? repo : nil
     }
 
+    /// Boot `udid` and bring up WDA on :8101. Safe to call from the main thread —
+    /// all blocking work (shell-outs, readiness polling) runs on a background queue;
+    /// state is reported back via `onState` on the main thread.
     func enable(udid: String) {
-        guard xcodeAvailable() else { return emit(.failed("Requires Xcode.")) }
-        guard let script = scriptURL(), let proj = wdaProjectURL() else {
-            return emit(.failed("Simulator bring-up needs a source checkout (Phase 1)."))
-        }
         emit(.booting)
-        _ = run("/usr/bin/xcrun", ["simctl", "boot", udid])   // no-op if already booted
-        _ = run("/usr/bin/open", ["-a", "Simulator"])
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard self.xcodeAvailable() else { return self.emit(.failed("Requires Xcode.")) }
+            guard let script = self.scriptURL(), let proj = self.wdaProjectURL() else {
+                return self.emit(.failed("Simulator bring-up needs a source checkout (Phase 1)."))
+            }
+            _ = self.run("/usr/bin/xcrun", ["simctl", "boot", udid])   // no-op if already booted
+            _ = self.run("/usr/bin/open", ["-a", "Simulator"])
 
-        // Supervise: PORT + WDA_PROJECT as env, the chosen sim as the arg. The script
-        // builds (branding/sign) then execs `xcodebuild test-without-building`, so the
-        // child stays alive as long as WDA runs; ManagedProcess restarts it if it dies.
-        emit(.building)
-        let cmd = "PORT=\(Self.port) WDA_PROJECT='\(proj.path)' '\(script.path)' '\(udid)'"
-        let proc = ManagedProcess(binary: URL(fileURLWithPath: "/bin/bash"),
-                                  args: ["-lc", cmd],
-                                  label: "sim-wda", restartDelay: 6, workDir: workDir)
-        wda = proc
-        proc.start()
-        startPolling()
+            // The script builds (branding/sign) then execs `xcodebuild test-without-building`,
+            // so the child stays alive as long as WDA runs; ManagedProcess restarts it if it dies.
+            self.emit(.building)
+            let cmd = "PORT=\(Self.port)"
+                + " WDA_PROJECT='\(self.shellEscape(proj.path))'"
+                + " '\(self.shellEscape(script.path))' '\(self.shellEscape(udid))'"
+            let proc = ManagedProcess(binary: URL(fileURLWithPath: "/bin/bash"),
+                                      args: ["-lc", cmd],
+                                      label: "sim-wda", restartDelay: 6, workDir: self.workDir)
+            self.wda = proc
+            proc.start()
+            self.startPolling()
+        }
     }
 
     func disable() {
-        poll?.invalidate(); poll = nil
-        wda?.stop(); wda = nil
-        emit(.idle)
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.polling = false
+            self.wda?.stop(); self.wda = nil
+            self.emit(.idle)
+        }
     }
 
     // MARK: Readiness
 
+    // Poll on the background queue so the ~4s readiness check never blocks the UI.
     private func startPolling() {
         emit(.starting)
-        poll?.invalidate()
-        let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            if self.wdaReady() { self.poll?.invalidate(); self.poll = nil; self.emit(.ready) }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        poll = timer
+        polling = true
+        pollTick()
+    }
+
+    private func pollTick() {
+        guard polling else { return }
+        if wdaReady() { polling = false; emit(.ready); return }
+        queue.asyncAfter(deadline: .now() + 2) { [weak self] in self?.pollTick() }
+    }
+
+    /// Escape a string for safe embedding inside single quotes in a `bash -lc` command.
+    private func shellEscape(_ s: String) -> String {
+        s.replacingOccurrences(of: "'", with: "'\\''")
     }
 
     private func wdaReady() -> Bool {
