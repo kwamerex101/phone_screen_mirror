@@ -207,3 +207,16 @@ final class MCPConfigTests: XCTestCase {
         XCTAssertEqual(MCPConfig.entryEnv(nil, name: "imirror"), [:])
     }
 }
+
+final class MCPProfileTests: XCTestCase {
+    func testDeviceProfile() {
+        XCTAssertEqual(MCPProfile.device.serverName, "imirror")
+        XCTAssertTrue(MCPProfile.device.env.isEmpty)
+    }
+
+    func testSimulatorProfile() {
+        XCTAssertEqual(MCPProfile.simulator.serverName, "imirror-sim")
+        XCTAssertEqual(MCPProfile.simulator.env["IMIRROR_TARGET"], "simulator")
+        XCTAssertEqual(MCPProfile.simulator.env["IMIRROR_WDA"], "http://127.0.0.1:8101")
+    }
+}
