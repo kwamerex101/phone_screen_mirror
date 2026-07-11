@@ -30,15 +30,9 @@ public enum SimctlParsing {
                 out.append(SimDevice(udid: udid, name: name, runtime: runtime, isBooted: booted))
             }
         }
-        // Booted first, then by runtime, then by name — stable, useful default for a picker.
+        // Booted first, then by name — stable, useful default for a picker.
         return out.sorted {
-            if $0.isBooted != $1.isBooted {
-                return $0.isBooted
-            } else if $0.runtime != $1.runtime {
-                return $0.runtime < $1.runtime
-            } else {
-                return $0.name < $1.name
-            }
+            $0.isBooted != $1.isBooted ? $0.isBooted : $0.name < $1.name
         }
     }
 

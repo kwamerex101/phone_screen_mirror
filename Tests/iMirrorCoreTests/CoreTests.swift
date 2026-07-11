@@ -236,7 +236,7 @@ final class SimctlParsingTests: XCTestCase {
 
     func testParsesAndSortsBootedFirst() {
         let sims = SimctlParsing.parseSimulators(json)
-        XCTAssertEqual(sims.map(\.udid), ["AAA", "BBB", "WWW"])
+        XCTAssertEqual(sims.map(\.udid), ["AAA", "WWW", "BBB"])
         XCTAssertEqual(sims[0], SimDevice(udid: "AAA", name: "iPhone 17 Pro",
                                           runtime: "iOS 26.5", isBooted: true))
     }
