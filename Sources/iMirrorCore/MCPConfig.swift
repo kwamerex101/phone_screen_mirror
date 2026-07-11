@@ -48,6 +48,15 @@ public enum MCPConfig {
         return (cmd, (e["args"] as? [String]) ?? [])
     }
 
+    /// The `env` dict a named server is registered with, or `[:]` if it has none.
+    /// Lets the installer detect a stale/missing environment (not just a stale path).
+    public static func entryEnv(_ existing: Data?, name: String) -> [String: String] {
+        guard let servers = object(from: existing)["mcpServers"] as? [String: Any],
+              let e = servers[name] as? [String: Any],
+              let env = e["env"] as? [String: String] else { return [:] }
+        return env
+    }
+
     private static func object(from data: Data?) -> [String: Any] {
         guard let data, !data.isEmpty,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]

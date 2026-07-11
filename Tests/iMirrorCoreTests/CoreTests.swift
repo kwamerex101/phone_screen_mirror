@@ -188,4 +188,65 @@ final class MCPConfigTests: XCTestCase {
         XCTAssertEqual(e?.args, ["/old/x.py"])          // used to detect a stale registration
         XCTAssertNil(MCPConfig.entry(cfg, name: "nope"))
     }
+
+    func testEntryEnvReadsEnvBack() throws {
+        let out = try MCPConfig.merged(into: nil, name: "imirror-sim",
+                                       command: "/py", args: ["/s.py"],
+                                       env: ["IMIRROR_TARGET": "simulator",
+                                             "IMIRROR_WDA": "http://127.0.0.1:8201"])
+        let env = MCPConfig.entryEnv(out, name: "imirror-sim")
+        XCTAssertEqual(env["IMIRROR_TARGET"], "simulator")
+        XCTAssertEqual(env["IMIRROR_WDA"], "http://127.0.0.1:8201")
+    }
+
+    func testEntryEnvEmptyWhenNoEnvOrAbsent() throws {
+        let out = try MCPConfig.merged(into: nil, name: "imirror",
+                                       command: "/py", args: ["/s.py"])
+        XCTAssertEqual(MCPConfig.entryEnv(out, name: "imirror"), [:])
+        XCTAssertEqual(MCPConfig.entryEnv(out, name: "nope"), [:])
+        XCTAssertEqual(MCPConfig.entryEnv(nil, name: "imirror"), [:])
+    }
+}
+
+final class MCPProfileTests: XCTestCase {
+    func testDeviceProfile() {
+        XCTAssertEqual(MCPProfile.device.serverName, "imirror")
+        XCTAssertTrue(MCPProfile.device.env.isEmpty)
+    }
+
+    func testSimulatorProfile() {
+        XCTAssertEqual(MCPProfile.simulator.serverName, "imirror-sim")
+        XCTAssertEqual(MCPProfile.simulator.env["IMIRROR_TARGET"], "simulator")
+        XCTAssertEqual(MCPProfile.simulator.env["IMIRROR_WDA"], "http://127.0.0.1:8201")
+    }
+}
+
+final class SimctlParsingTests: XCTestCase {
+    private let json = """
+    {"devices":{
+      "com.apple.CoreSimulator.SimRuntime.iOS-26-5":[
+        {"udid":"AAA","name":"iPhone 17 Pro","state":"Booted","isAvailable":true},
+        {"udid":"BBB","name":"iPhone 17","state":"Shutdown","isAvailable":true}
+      ],
+      "com.apple.CoreSimulator.SimRuntime.watchOS-11-0":[
+        {"udid":"WWW","name":"Apple Watch","state":"Shutdown","isAvailable":true}
+      ]
+    }}
+    """.data(using: .utf8)!
+
+    func testParsesAndSortsBootedFirst() {
+        let sims = SimctlParsing.parseSimulators(json)
+        XCTAssertEqual(sims.map(\.udid), ["AAA", "WWW", "BBB"])
+        XCTAssertEqual(sims[0], SimDevice(udid: "AAA", name: "iPhone 17 Pro",
+                                          runtime: "iOS 26.5", isBooted: true))
+    }
+
+    func testRuntimeHumanized() {
+        let sims = SimctlParsing.parseSimulators(json)
+        XCTAssertEqual(sims.first(where: { $0.udid == "WWW" })?.runtime, "watchOS 11.0")
+    }
+
+    func testEmptyOnGarbage() {
+        XCTAssertEqual(SimctlParsing.parseSimulators(Data("nonsense".utf8)), [])
+    }
 }
