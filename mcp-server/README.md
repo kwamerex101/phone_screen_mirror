@@ -31,6 +31,9 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 | `ios_run_section(title)` | start a named section — groups following steps under it in the report + TOC |
 | `ios_run_note(text, status)` | add a checkpoint — `info` / `pass` / `fail` |
 | `ios_finish_run(video)` | write the HTML report (+ `gif`/`mp4` timelapse) and stop recording |
+| `sim_push(bundle_id, payload_json)` | *(simulator only)* deliver a push notification from an APNs payload |
+| `sim_privacy(action, service, bundle_id)` | *(simulator only)* grant/revoke/reset a permission without the consent dialog |
+| `sim_status_bar(time, clear)` | *(simulator only)* freeze the status bar (full bars, 100%, fixed time) for clean screenshots |
 
 ## Setup
 
@@ -66,6 +69,34 @@ wait for the green dot, and the tools are live.
 
 Override the target (default `http://127.0.0.1:8100`) with `IMIRROR_WDA` — it must
 stay on loopback.
+
+## Running against an iOS Simulator
+
+The same tools drive a booted Simulator — a simulator shares the Mac's loopback,
+so there's no tunnel/relay and (unlike a device) no signing or paid team. Bring
+WDA up on the sim, then point the server at it with `IMIRROR_TARGET=simulator`:
+
+```bash
+# 1) build + launch WDA on the booted sim (stays in the foreground; Ctrl-C stops)
+PORT=8100 ./scripts/sim-wda-up.sh              # or: ./scripts/sim-wda-up.sh "iPhone 16 Pro"
+
+# 2) run the MCP server against it
+IMIRROR_TARGET=simulator IMIRROR_WDA=http://127.0.0.1:8100 \
+  mcp-server/.venv/bin/python mcp-server/imirror_mcp.py
+```
+
+`IMIRROR_TARGET` (`device` default, or `simulator`) switches the few non-WDA
+paths: `ios_install_app` uses `xcrun simctl install booted` instead of go-ios,
+the volume buttons are rejected up front (physical-device-only), the `sim_*`
+tools become available, and "can't reach WDA" hints drop the health-dot wording.
+The interaction tools are identical either way.
+
+`sim-wda-up.sh` rebrands the runner to iMirror (app icon + "iMirror" display name
++ the `com.local.imirror.WebDriverAgentRunner` bundle id), matching the on-device
+build — so the sim's App Library / Spotlight shows iMirror, not a stock
+`WebDriverAgentRunner-Runner`. It needs the vendored WebDriverAgent under `tools/`
+(see `scripts/build-wda.sh`); in a worktree, point it at your main checkout with
+`WDA_PROJECT=/path/to/WebDriverAgent.xcodeproj`.
 
 ## Test reports (opt-in)
 

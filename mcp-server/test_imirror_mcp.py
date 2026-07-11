@@ -18,6 +18,7 @@ import pytest
 def mod(monkeypatch):
     """Import a fresh copy of the module with a clean session, on a loopback target."""
     monkeypatch.setenv("IMIRROR_WDA", "http://127.0.0.1:8100")
+    monkeypatch.delenv("IMIRROR_TARGET", raising=False)  # default (device) mode
     sys.modules.pop("imirror_mcp", None)
     m = importlib.import_module("imirror_mcp")
     m._session["id"] = None
@@ -67,6 +68,17 @@ def wda(mod, monkeypatch):
     fake = FakeWDA()
     monkeypatch.setattr(mod, "_req", fake)
     return fake
+
+
+@pytest.fixture()
+def sim_mod(monkeypatch):
+    """A fresh module imported in simulator mode (IMIRROR_TARGET=simulator)."""
+    monkeypatch.setenv("IMIRROR_WDA", "http://127.0.0.1:8100")
+    monkeypatch.setenv("IMIRROR_TARGET", "simulator")
+    sys.modules.pop("imirror_mcp", None)
+    m = importlib.import_module("imirror_mcp")
+    m._session["id"] = None
+    return m
 
 
 # ---- loopback guard ------------------------------------------------------------
@@ -879,6 +891,159 @@ def test_install_app_reports_go_ios_failure(mod, monkeypatch, tmp_path):
     monkeypatch.setattr(mod.subprocess, "run", boom)
     with pytest.raises(RuntimeError, match="install failed: device locked"):
         mod.ios_install_app(str(ipa))
+
+
+# ---- target mode (IMIRROR_TARGET) ----------------------------------------------
+
+def test_target_defaults_to_device(mod):
+    assert mod.TARGET == "device" and mod._IS_SIM is False
+
+
+def test_target_simulator_flag_set(sim_mod):
+    assert sim_mod.TARGET == "simulator" and sim_mod._IS_SIM is True
+
+
+def test_target_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("IMIRROR_WDA", "http://127.0.0.1:8100")
+    monkeypatch.setenv("IMIRROR_TARGET", "emulator")
+    sys.modules.pop("imirror_mcp", None)
+    with pytest.raises(SystemExit):
+        importlib.import_module("imirror_mcp")
+
+
+def test_unreachable_hint_is_target_specific(mod, sim_mod):
+    assert "health dot" in mod._unreachable_hint()
+    assert "sim-wda-up.sh" in sim_mod._unreachable_hint()
+
+
+# ---- install app on a simulator (xcrun simctl) ---------------------------------
+
+def test_install_app_uses_simctl_on_simulator(sim_mod, monkeypatch, tmp_path):
+    app = tmp_path / "App.app"; app.mkdir()
+    seen = {}
+    def fake_run(args, **kw):
+        seen["args"] = args
+        class R: returncode = 0; stderr = ""
+        return R()
+    monkeypatch.setattr(sim_mod.subprocess, "run", fake_run)
+    out = sim_mod.ios_install_app(str(app))
+    assert seen["args"] == ["xcrun", "simctl", "install", "booted", str(app)]
+    assert "installed" in out
+
+
+def test_install_app_simulator_ipa_gets_hint(sim_mod, monkeypatch, tmp_path):
+    import subprocess
+    ipa = tmp_path / "App.ipa"; ipa.write_bytes(b"x")
+    def boom(args, **kw):
+        raise subprocess.CalledProcessError(1, args, stderr="Unable to install")
+    monkeypatch.setattr(sim_mod.subprocess, "run", boom)
+    with pytest.raises(RuntimeError, match="won't run on a simulator"):
+        sim_mod.ios_install_app(str(ipa))
+
+
+def test_install_app_simulator_missing_xcrun(sim_mod, monkeypatch, tmp_path):
+    app = tmp_path / "App.app"; app.mkdir()
+    def gone(args, **kw):
+        raise FileNotFoundError()
+    monkeypatch.setattr(sim_mod.subprocess, "run", gone)
+    with pytest.raises(RuntimeError, match="xcrun.*not found"):
+        sim_mod.ios_install_app(str(app))
+
+
+# ---- volume-button gating on a simulator ---------------------------------------
+
+def test_press_volume_rejected_on_simulator(sim_mod, monkeypatch):
+    # Must fail before any WDA call — flag it if the request layer is touched.
+    monkeypatch.setattr(sim_mod, "_session_post",
+                        lambda *a, **k: pytest.fail("volume hit WDA on a simulator"))
+    with pytest.raises(RuntimeError, match="unavailable on a simulator"):
+        sim_mod.ios_press_button("volumeUp")
+
+
+def test_press_home_still_works_on_simulator(sim_mod, monkeypatch):
+    calls = []
+    monkeypatch.setattr(sim_mod, "_req", lambda m, p, b=None, t=None: (calls.append(p), (200, {}))[1])
+    assert sim_mod.ios_press_button("home") == "pressed home"
+    assert calls == ["/wda/homescreen"]
+
+
+# ---- simulator-only simctl tools -----------------------------------------------
+
+def _fake_simctl(mod, monkeypatch):
+    seen = {"args": None}
+    def fake_run(args, **kw):
+        seen["args"] = args
+        class R: returncode = 0; stdout = ""; stderr = ""
+        return R()
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    return seen
+
+
+def test_sim_push_writes_payload_and_calls_simctl(sim_mod, monkeypatch):
+    seen = _fake_simctl(sim_mod, monkeypatch)
+    out = sim_mod.sim_push("com.acme.app", '{"aps": {"alert": "hi"}}')
+    args = seen["args"]
+    assert args[:4] == ["xcrun", "simctl", "push", "booted"]
+    assert args[4] == "com.acme.app" and args[5].endswith(".apns")
+    assert "pushed to com.acme.app" in out
+
+
+def test_sim_push_rejects_bad_json(sim_mod, monkeypatch):
+    # Never reach simctl with an invalid payload.
+    monkeypatch.setattr(sim_mod.subprocess, "run",
+                        lambda *a, **k: pytest.fail("simctl called with bad JSON"))
+    with pytest.raises(RuntimeError, match="not valid JSON"):
+        sim_mod.sim_push("com.acme.app", "{not json")
+
+
+def test_sim_push_cleans_up_temp_file(sim_mod, monkeypatch):
+    captured = {}
+    def fake_run(args, **kw):
+        captured["payload_path"] = args[5]
+        class R: returncode = 0; stdout = ""; stderr = ""
+        return R()
+    monkeypatch.setattr(sim_mod.subprocess, "run", fake_run)
+    sim_mod.sim_push("com.acme.app", "{}")
+    assert not os.path.exists(captured["payload_path"])  # temp file removed
+
+
+def test_sim_privacy_builds_args(sim_mod, monkeypatch):
+    seen = _fake_simctl(sim_mod, monkeypatch)
+    sim_mod.sim_privacy("grant", "photos", "com.acme.app")
+    assert seen["args"] == ["xcrun", "simctl", "privacy", "booted",
+                            "grant", "photos", "com.acme.app"]
+
+
+def test_sim_privacy_omits_bundle_when_absent(sim_mod, monkeypatch):
+    seen = _fake_simctl(sim_mod, monkeypatch)
+    sim_mod.sim_privacy("reset", "all")
+    assert seen["args"] == ["xcrun", "simctl", "privacy", "booted", "reset", "all"]
+
+
+def test_sim_privacy_rejects_bad_action(sim_mod, monkeypatch):
+    monkeypatch.setattr(sim_mod.subprocess, "run",
+                        lambda *a, **k: pytest.fail("simctl called on bad action"))
+    with pytest.raises(RuntimeError, match="grant.*revoke.*reset"):
+        sim_mod.sim_privacy("allow", "photos")
+
+
+def test_sim_status_bar_override_and_clear(sim_mod, monkeypatch):
+    seen = _fake_simctl(sim_mod, monkeypatch)
+    sim_mod.sim_status_bar(time="12:34")
+    assert seen["args"][:5] == ["xcrun", "simctl", "status_bar", "booted", "override"]
+    assert "12:34" in seen["args"]
+    sim_mod.sim_status_bar(clear=True)
+    assert seen["args"] == ["xcrun", "simctl", "status_bar", "booted", "clear"]
+
+
+def test_sim_tools_require_simulator_mode(mod, monkeypatch):
+    # In device mode the simctl-backed tools refuse rather than shelling out.
+    monkeypatch.setattr(mod.subprocess, "run",
+                        lambda *a, **k: pytest.fail("simctl invoked in device mode"))
+    with pytest.raises(RuntimeError, match="IMIRROR_TARGET=simulator"):
+        mod.sim_push("com.acme.app", "{}")
+    with pytest.raises(RuntimeError, match="IMIRROR_TARGET=simulator"):
+        mod.sim_privacy("reset", "all")
 
 
 # ---- assertions ----------------------------------------------------------------
