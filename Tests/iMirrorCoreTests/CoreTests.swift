@@ -188,4 +188,22 @@ final class MCPConfigTests: XCTestCase {
         XCTAssertEqual(e?.args, ["/old/x.py"])          // used to detect a stale registration
         XCTAssertNil(MCPConfig.entry(cfg, name: "nope"))
     }
+
+    func testEntryEnvReadsEnvBack() throws {
+        let out = try MCPConfig.merged(into: nil, name: "imirror-sim",
+                                       command: "/py", args: ["/s.py"],
+                                       env: ["IMIRROR_TARGET": "simulator",
+                                             "IMIRROR_WDA": "http://127.0.0.1:8101"])
+        let env = MCPConfig.entryEnv(out, name: "imirror-sim")
+        XCTAssertEqual(env["IMIRROR_TARGET"], "simulator")
+        XCTAssertEqual(env["IMIRROR_WDA"], "http://127.0.0.1:8101")
+    }
+
+    func testEntryEnvEmptyWhenNoEnvOrAbsent() throws {
+        let out = try MCPConfig.merged(into: nil, name: "imirror",
+                                       command: "/py", args: ["/s.py"])
+        XCTAssertEqual(MCPConfig.entryEnv(out, name: "imirror"), [:])
+        XCTAssertEqual(MCPConfig.entryEnv(out, name: "nope"), [:])
+        XCTAssertEqual(MCPConfig.entryEnv(nil, name: "imirror"), [:])
+    }
 }
