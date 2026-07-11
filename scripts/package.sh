@@ -61,7 +61,10 @@ cp "$ROOT/tools/go-ios/LICENSE"        "$APP/Contents/Resources/licenses/go-ios-
 if [[ -d "$ROOT/tools/WebDriverAgent" ]]; then
     echo "==> bundling WDA source + sim scripts (for in-app simulator build)"
     mkdir -p "$APP/Contents/Resources/tools" "$APP/Contents/Resources/scripts"
-    cp -R "$ROOT/tools/WebDriverAgent" "$APP/Contents/Resources/tools/WebDriverAgent"
+    # Exclude the vendored clone's .git — tools/ is populated by `git clone`, so a
+    # plain cp -R would seal WDA's whole git history into the signed app (and every
+    # staged copy). rsync ships with macOS.
+    rsync -a --exclude='.git' "$ROOT/tools/WebDriverAgent/" "$APP/Contents/Resources/tools/WebDriverAgent/"
     cp "$ROOT/scripts/sim-wda-up.sh"      "$APP/Contents/Resources/scripts/"
     cp "$ROOT/scripts/make_ios_icon.swift" "$APP/Contents/Resources/scripts/"
 fi
