@@ -291,6 +291,7 @@ def test_screenshot_reports_jpeg_when_wda_sends_jpeg(mod, wda):
 
 
 def test_screenshot_quality_env(mod, monkeypatch):
+    """mod is device-mode (see the `mod` fixture) so the fallback default is 1."""
     monkeypatch.delenv("IMIRROR_SCREENSHOT_QUALITY", raising=False)
     assert mod._screenshot_quality() == 1
     monkeypatch.setenv("IMIRROR_SCREENSHOT_QUALITY", "0")
@@ -301,6 +302,15 @@ def test_screenshot_quality_env(mod, monkeypatch):
     assert mod._screenshot_quality() == 1
     monkeypatch.setenv("IMIRROR_SCREENSHOT_QUALITY", "junk")  # non-int
     assert mod._screenshot_quality() == 1
+
+
+def test_screenshot_quality_default_on_simulator(sim_mod, monkeypatch):
+    """On the simulator, WDA ignores the JPEG path and higher quality values only
+    bloat the PNG, so the fallback default is 0 (lossless PNG) instead of 1."""
+    monkeypatch.delenv("IMIRROR_SCREENSHOT_QUALITY", raising=False)
+    assert sim_mod._screenshot_quality() == 0
+    monkeypatch.setenv("IMIRROR_SCREENSHOT_QUALITY", "2")
+    assert sim_mod._screenshot_quality() == 2
 
 
 def test_ensure_session_sends_screenshot_quality(mod, wda):

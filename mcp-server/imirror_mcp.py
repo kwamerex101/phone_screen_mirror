@@ -221,13 +221,20 @@ def _req(method: str, path: str, body: dict | None = None,
 
 def _screenshot_quality() -> int:
     """IMIRROR_SCREENSHOT_QUALITY as 0 (lossless PNG), 1 (medium JPEG), or 2
-    (low JPEG). Unset or invalid falls back to 1 — the default that trades
-    imperceptible fidelity for a large latency/size win. Never raises."""
+    (low JPEG). Unset/invalid falls back to a target-aware default: 0 on the
+    simulator (where WDA ignores the JPEG path and higher values only bloat the
+    PNG) and 1 on a physical device (where 1/2 make WDA JPEG-encode device-side,
+    cutting encode time and payload). An explicit valid env value always wins.
+    Never raises."""
+    default = 0 if _IS_SIM else 1
+    raw = os.environ.get("IMIRROR_SCREENSHOT_QUALITY")
+    if raw is None:
+        return default
     try:
-        q = int(os.environ.get("IMIRROR_SCREENSHOT_QUALITY", "1"))
+        q = int(raw)
     except (ValueError, TypeError):
-        return 1
-    return q if q in (0, 1, 2) else 1
+        return default
+    return q if q in (0, 1, 2) else default
 
 
 def _ensure_session() -> str:
@@ -425,9 +432,9 @@ def _img_kind(data: bytes) -> tuple[str, str]:
 
 @mcp.tool()
 def ios_screenshot() -> Image:
-    """Capture the iPhone's current screen. Returns a PNG by default, or JPEG when
-    IMIRROR_SCREENSHOT_QUALITY is 1 (medium) or 2 (low) — faster and smaller for
-    agent loops.
+    """Capture the iPhone's current screen. Returns a PNG by default. On a
+    physical device, IMIRROR_SCREENSHOT_QUALITY=1/2 makes WDA return smaller,
+    faster JPEG frames; the simulator always returns PNG.
 
     Returns a full-resolution device screenshot. Needs no macOS Screen Recording
     permission (the frame comes from WebDriverAgent, not a Mac screen capture).
