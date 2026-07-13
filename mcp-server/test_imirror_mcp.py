@@ -270,6 +270,21 @@ def test_screenshot_raises_when_empty(mod, wda):
         mod.ios_screenshot()
 
 
+def test_img_kind_sniffs_magic_bytes(mod):
+    assert mod._img_kind(b"\xff\xd8\xff\xe0stuff") == ("jpeg", ".jpg")
+    assert mod._img_kind(b"\x89PNG\r\n\x1a\nfake") == ("png", ".png")
+    assert mod._img_kind(b"garbage") == ("png", ".png")
+
+
+def test_screenshot_reports_jpeg_when_wda_sends_jpeg(mod, wda):
+    import base64
+    jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 16
+    wda.script("/screenshot", (200, {"value": base64.b64encode(jpeg).decode()}))
+    img = mod.ios_screenshot()
+    assert img.data == jpeg
+    assert img._mime_type == "image/jpeg"
+
+
 # ---- gestures ------------------------------------------------------------------
 
 def test_tap_emits_pointer_sequence(mod, wda):
@@ -413,6 +428,28 @@ def test_full_run_records_and_renders_report(mod, wda, monkeypatch, tmp_path):
     assert "logged in" in htmltext
     assert base64.b64encode(png).decode() in htmltext   # screenshot embedded
     assert "PASS" in htmltext
+
+
+def test_full_run_with_jpeg_screenshot_embeds_jpeg_mime(mod, wda, monkeypatch, tmp_path):
+    wda.allow("/actions", "/wda/keys")
+    import base64
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 16
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    wda.script("/status", (200, {"value": {
+        "device": "iPhone 15", "os": {"version": "17.4"}}}))
+    wda.script("/screenshot", (200, {"value": base64.b64encode(jpeg).decode()}))
+
+    mod.ios_start_run("login flow")
+    mod.ios_screenshot()           # saved to the run dir as .jpg + recorded
+    report = mod.ios_finish_run(video="none")
+
+    run_dir = mod._run["dir"]
+    assert os.path.exists(os.path.join(run_dir, "001.jpg"))
+
+    htmltext = open(report, encoding="utf-8").read()
+    assert "data:image/jpeg" in htmltext
+    assert base64.b64encode(jpeg).decode() in htmltext
 
 
 def test_failed_note_marks_report_fail(mod, wda, monkeypatch, tmp_path):

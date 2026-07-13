@@ -392,9 +392,21 @@ def ios_window_size() -> str:
     return json.dumps(j.get("value", j))
 
 
+def _img_kind(data: bytes) -> tuple[str, str]:
+    """Sniff image bytes -> (fastmcp_format, file_extension).
+
+    WDA returns PNG by default and JPEG when a lower screenshot quality is
+    configured. Default to PNG on anything unrecognized so a screenshot that
+    came back always returns rather than erroring on an odd header.
+    """
+    if data[:2] == b"\xff\xd8":
+        return "jpeg", ".jpg"
+    return "png", ".png"
+
+
 @mcp.tool()
 def ios_screenshot() -> Image:
-    """Capture the iPhone's current screen as a PNG.
+    """Capture the iPhone's current screen as an image (PNG by default).
 
     Returns a full-resolution device screenshot. Needs no macOS Screen Recording
     permission (the frame comes from WebDriverAgent, not a Mac screen capture).
@@ -405,6 +417,7 @@ def ios_screenshot() -> Image:
     if not b64:
         raise RuntimeError(f"No screenshot returned: {j}")
     data = base64.b64decode(b64)
+    fmt, ext = _img_kind(data)
     if _run["active"]:
         # Cap saved screenshots per run so a looping agent can't fill the disk
         # (~0.5 MB each). Past the cap the screenshot still returns to the caller;
@@ -412,7 +425,7 @@ def ios_screenshot() -> Image:
         cap = int(os.environ.get("IMIRROR_MAX_RUN_SHOTS", "500"))
         saved = sum(1 for s in _run["steps"] if s["screenshot"])
         if saved < cap:
-            fname = f"{len(_run['steps']) + 1:03d}.png"
+            fname = f"{len(_run['steps']) + 1:03d}{ext}"
             with open(os.path.join(_run["dir"], fname), "wb") as f:
                 f.write(data)
             _record("screenshot", screenshot=fname)
@@ -420,7 +433,7 @@ def ios_screenshot() -> Image:
             _run["cap_noted"] = True
             _record("note", f"screenshot cap reached ({cap}); further shots not saved",
                     note="info")
-    return Image(data=data, format="png")
+    return Image(data=data, format=fmt)
 
 
 @mcp.tool()
@@ -1047,8 +1060,8 @@ def _make_timelapse(fmt: str) -> tuple[str | None, str]:
     out = f"timelapse.{fmt}"
     out_path = os.path.join(run_dir, out)
     scale = "scale=480:-1:flags=lanczos"
-    # Entries are bare relative names (NNN.png), so concat's default safe mode
-    # accepts them — no -safe 0, which keeps path traversal out of the listfile.
+    # Entries are bare relative names like NNN.png / NNN.jpg, so concat's default
+    # safe mode accepts them — no -safe 0, which keeps path traversal out of the listfile.
     concat = ["-f", "concat", "-i", listfile]
     try:
         if fmt == "gif":
@@ -1077,9 +1090,10 @@ def _ffmpeg(args: list[str]) -> None:
 
 def _screenshot_img(name: str, alt: str) -> str:
     """Embed a run screenshot as a clickable base64 <img>, or a missing marker."""
+    mime = "image/jpeg" if name.endswith((".jpg", ".jpeg")) else "image/png"
     try:
         with open(os.path.join(_run["dir"], name), "rb") as fh:
-            uri = "data:image/png;base64," + base64.b64encode(fh.read()).decode()
+            uri = f"data:{mime};base64," + base64.b64encode(fh.read()).decode()
         return (f'<a href="{uri}" target="_blank">'
                 f'<img class="shot" src="{uri}" alt="{html.escape(alt)}"></a>')
     except OSError:
