@@ -16,7 +16,7 @@ its self-managed transport (userspace tunnel + runwda + forward + relay).
 |------|--------------|
 | `ios_status` | WDA ready? + iOS version / device name |
 | `ios_window_size` | logical screen size (points) for the current orientation |
-| `ios_screenshot` | full-res device screenshot (PNG) — no macOS Screen Recording perm needed |
+| `ios_screenshot` | full-res device screenshot (PNG, or JPEG on a device via `IMIRROR_SCREENSHOT_QUALITY`) — no macOS Screen Recording perm needed |
 | `ios_tap(x, y)` | tap at a point (points, top-left origin) |
 | `ios_swipe(from_x, from_y, to_x, to_y, duration_ms, settle_ms)` | swipe / drag / scroll; `settle_ms` waits after so a following screenshot/source isn't mid-scroll |
 | `ios_scroll(direction, distance_pct, x_pct, y_pct, duration_ms, settle_ms)` | scroll by content direction (`up`/`down`/`left`/`right`) a % of the screen; returns the from/to points + distance |
@@ -69,6 +69,11 @@ wait for the green dot, and the tools are live.
 
 Override the target (default `http://127.0.0.1:8100`) with `IMIRROR_WDA` — it must
 stay on loopback.
+
+Screenshots are PNG by default. On a physical device, set `IMIRROR_SCREENSHOT_QUALITY`
+to `1` (medium JPEG) or `2` (low JPEG) for smaller, faster-to-encode frames; `0` keeps
+lossless PNG. The default is target-aware — `1` on a device, `0` on the simulator,
+where WDA ignores the JPEG path and returns PNG regardless.
 
 ## Running against an iOS Simulator
 
