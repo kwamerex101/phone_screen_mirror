@@ -259,12 +259,16 @@ def test_source_uses_long_timeout(mod, wda):
 def test_screenshot_decodes_base64(mod, wda):
     import base64
     png = b"\x89PNG\r\n\x1a\nfake"
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     wda.script("/screenshot", (200, {"value": base64.b64encode(png).decode()}))
     img = mod.ios_screenshot()
     assert img.data == png
 
 
 def test_screenshot_raises_when_empty(mod, wda):
+    # _ensure_session() runs BEFORE the GET /screenshot, so /session must be
+    # scripted for the RuntimeError("No screenshot") assertion to be reached.
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     wda.script("/screenshot", (200, {"value": None}))
     with pytest.raises(RuntimeError, match="No screenshot"):
         mod.ios_screenshot()
@@ -279,10 +283,53 @@ def test_img_kind_sniffs_magic_bytes(mod):
 def test_screenshot_reports_jpeg_when_wda_sends_jpeg(mod, wda):
     import base64
     jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 16
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     wda.script("/screenshot", (200, {"value": base64.b64encode(jpeg).decode()}))
     img = mod.ios_screenshot()
     assert img.data == jpeg
     assert img._mime_type == "image/jpeg"
+
+
+def test_screenshot_quality_env(mod, monkeypatch):
+    monkeypatch.delenv("IMIRROR_SCREENSHOT_QUALITY", raising=False)
+    assert mod._screenshot_quality() == 1
+    monkeypatch.setenv("IMIRROR_SCREENSHOT_QUALITY", "0")
+    assert mod._screenshot_quality() == 0
+    monkeypatch.setenv("IMIRROR_SCREENSHOT_QUALITY", "2")
+    assert mod._screenshot_quality() == 2
+    monkeypatch.setenv("IMIRROR_SCREENSHOT_QUALITY", "5")     # out of range
+    assert mod._screenshot_quality() == 1
+    monkeypatch.setenv("IMIRROR_SCREENSHOT_QUALITY", "junk")  # non-int
+    assert mod._screenshot_quality() == 1
+
+
+def test_ensure_session_sends_screenshot_quality(mod, wda):
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod._ensure_session()
+    bodies = [b for m, p, b in wda.calls if p.endswith("/appium/settings")]
+    assert any(b["settings"].get("screenshotQuality") == 1 for b in bodies)
+
+
+def test_ensure_session_sends_screenshot_quality_override(mod, wda, monkeypatch):
+    monkeypatch.setenv("IMIRROR_SCREENSHOT_QUALITY", "2")
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    mod._ensure_session()
+    bodies = [b for m, p, b in wda.calls if p.endswith("/appium/settings")]
+    assert any(b["settings"].get("screenshotQuality") == 2 for b in bodies)
+
+
+def test_screenshot_first_call_applies_quality(mod, wda):
+    """Fable risk #1 regression guard: quality must be applied even when a
+    screenshot is the very first tool call of a session."""
+    import base64
+    assert mod._session["id"] is None
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
+    png = b"\x89PNG\r\n\x1a\nfake"
+    wda.script("/screenshot", (200, {"value": base64.b64encode(png).decode()}))
+    mod.ios_screenshot()
+    assert any(p == "/session" for m, p, _ in wda.calls)
+    bodies = [b for m, p, b in wda.calls if p.endswith("/appium/settings")]
+    assert any("screenshotQuality" in b["settings"] for b in bodies)
 
 
 # ---- gestures ------------------------------------------------------------------
@@ -725,6 +772,7 @@ def test_timelapse_skipped_when_too_few_shots(mod, wda, monkeypatch, tmp_path):
     import base64
     monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
     wda.script("/status", (200, {"value": {}}))
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     wda.script("/screenshot",
                (200, {"value": base64.b64encode(b"\x89PNGx").decode()}))
     mod.ios_start_run("one")
@@ -829,6 +877,7 @@ def test_screenshot_cap_stops_saving(mod, wda, monkeypatch, tmp_path):
     monkeypatch.setenv("IMIRROR_MAX_RUN_SHOTS", "2")
     png = base64.b64encode(b"\x89PNGfake").decode()
     wda.script("/status", (200, {"value": {}}))
+    wda.script("/session", (200, {"value": {"sessionId": "s"}}))
     wda.script("/screenshot", *[(200, {"value": png})] * 4)
     mod.ios_start_run("capped")
     for _ in range(4):

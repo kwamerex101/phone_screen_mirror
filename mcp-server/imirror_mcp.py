@@ -219,6 +219,17 @@ def _req(method: str, path: str, body: dict | None = None,
         f"It may be busy or wedged — {_wedged_hint()}.")
 
 
+def _screenshot_quality() -> int:
+    """IMIRROR_SCREENSHOT_QUALITY as 0 (lossless PNG), 1 (medium JPEG), or 2
+    (low JPEG). Unset or invalid falls back to 1 — the default that trades
+    imperceptible fidelity for a large latency/size win. Never raises."""
+    try:
+        q = int(os.environ.get("IMIRROR_SCREENSHOT_QUALITY", "1"))
+    except (ValueError, TypeError):
+        return 1
+    return q if q in (0, 1, 2) else 1
+
+
 def _ensure_session() -> str:
     if _session["id"]:
         return _session["id"]  # type: ignore[return-value]
@@ -240,6 +251,14 @@ def _ensure_session() -> str:
     try:
         _req("POST", f"/session/{sid}/appium/settings",
              {"settings": {"waitForIdleTimeout": 0, "animationCoolOffTimeout": 0}}, timeout=5)
+    except Exception:
+        pass
+    # Ask WDA to JPEG-encode screenshots device-side (screenshotQuality 1/2) —
+    # cuts encode time and payload vs lossless PNG. Separate best-effort POST so
+    # a build that rejects the key can't also drop the idle-wait settings above.
+    try:
+        _req("POST", f"/session/{sid}/appium/settings",
+             {"settings": {"screenshotQuality": _screenshot_quality()}}, timeout=5)
     except Exception:
         pass
     return sid
@@ -406,12 +425,20 @@ def _img_kind(data: bytes) -> tuple[str, str]:
 
 @mcp.tool()
 def ios_screenshot() -> Image:
-    """Capture the iPhone's current screen as an image (PNG by default).
+    """Capture the iPhone's current screen. Returns a PNG by default, or JPEG when
+    IMIRROR_SCREENSHOT_QUALITY is 1 (medium) or 2 (low) — faster and smaller for
+    agent loops.
 
     Returns a full-resolution device screenshot. Needs no macOS Screen Recording
     permission (the frame comes from WebDriverAgent, not a Mac screen capture).
     Use it to see the device state before/after an action.
     """
+    # Ensure a session exists first so the screenshotQuality settings POST (in
+    # _ensure_session) has run even when a screenshot is the very first tool call
+    # of a session — otherwise the sessionless /screenshot route below returns a
+    # full PNG because quality settings were never applied. Cheap/cached after
+    # the first call.
+    _ensure_session()
     _, j = _req("GET", "/screenshot")
     b64 = j.get("value")
     if not b64:
