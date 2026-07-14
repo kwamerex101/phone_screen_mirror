@@ -25,9 +25,9 @@ APP="$ROOT/build/iMirror.app"
 DMG="$ROOT/build/iMirror.dmg"
 ENT="$ROOT/Resources/iMirror.entitlements"
 
-echo "==> swift build (release)"
-swift build -c release
-BIN="$(swift build -c release --show-bin-path)/iMirror"
+echo "==> swift build (release, universal2: arm64 + x86_64)"
+swift build -c release --arch arm64 --arch x86_64
+BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/iMirror"
 
 echo "==> assembling app"
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -35,6 +35,27 @@ cp "$BIN" "$APP/Contents/MacOS/iMirror"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 [[ -f "$ROOT/Resources/AppIcon.icns" ]] && cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 [[ -x "$ROOT/tools/go-ios/bin/ios" ]] && cp "$ROOT/tools/go-ios/bin/ios" "$APP/Contents/Resources/ios"
+
+# One-DMG-everywhere gate: every shipped native binary must be universal2, or
+# the DMG would silently fail to launch on one architecture. Fail loudly here,
+# before signing/notarizing, rather than in a user's hands.
+assert_universal() {
+    local f="$1"
+    local archs; archs="$(lipo -archs "$f" 2>/dev/null || true)"
+    case "$archs" in
+        *x86_64*arm64*|*arm64*x86_64*) echo "    universal ($archs): $f" ;;
+        *) echo "NOT universal ($archs): $f" >&2
+           echo "    (rebuild go-ios with scripts/build-go-ios.sh; build the app with --arch arm64 --arch x86_64)" >&2
+           exit 1 ;;
+    esac
+}
+echo "==> verifying universal binaries"
+assert_universal "$APP/Contents/MacOS/iMirror"
+if [[ -f "$APP/Contents/Resources/ios" ]]; then
+    assert_universal "$APP/Contents/Resources/ios"
+else
+    echo "    WARNING: go-ios not bundled — DMG cannot drive a device on any arch" >&2
+fi
 
 # Bundle the MCP server so the in-app one-click MCP install works from a DMG.
 mkdir -p "$APP/Contents/Resources/mcp-server"
