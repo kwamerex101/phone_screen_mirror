@@ -104,7 +104,8 @@ binary and the WebDriverAgent `.ipa` are built here and then bundled into the
 
 ### Requirements
 
-- macOS 14+ (built/tested on macOS 26, Xcode 26, Swift 6.3)
+- macOS 14+ on **Apple Silicon or Intel** — the released DMG is a universal2
+  build (built/tested on macOS 26, Xcode 26, Swift 6.3)
 - An iPhone connected by USB, unlocked, "Trust This Computer" accepted, with
   **Developer Mode** on (Settings → Privacy & Security → Developer Mode)
 - A **paid Apple Developer account** to sign WebDriverAgent (a free account works
@@ -127,12 +128,11 @@ git clone --depth 1 --branch v9.9.0 https://github.com/appium/WebDriverAgent
 osv-scanner scan source -r --no-ignore --include-git-root go-ios
 osv-scanner scan source -r --no-ignore --include-git-root WebDriverAgent
 
-# build the go-ios CLI from source, patching vulnerable transitive deps:
-cd go-ios
-GOWORK=off go get golang.org/x/crypto@v0.52.0 golang.org/x/net@v0.55.0 \
-                  github.com/quic-go/quic-go@v0.49.1
-GOWORK=off go mod tidy
-GOWORK=off go build -o bin/ios .
+# build the go-ios CLI from source as a universal2 (arm64 + x86_64) binary,
+# patching vulnerable transitive deps — one helper that runs on both Intel and
+# Apple Silicon, so the packaged DMG does too:
+cd ..            # back to repo root
+./scripts/build-go-ios.sh
 ```
 
 Then install WebDriverAgent on the device once (Xcode):

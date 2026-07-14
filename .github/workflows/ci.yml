@@ -17,3 +17,14 @@ jobs:
         run: swift build -v
       - name: Test
         run: swift test
+      - name: Build universal (arm64 + x86_64)
+        run: swift build -c release --arch arm64 --arch x86_64
+      - name: Assert app binary is universal
+        run: |
+          BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/iMirror"
+          archs="$(lipo -archs "$BIN")"
+          echo "archs: $archs"
+          case "$archs" in
+            *x86_64*arm64*|*arm64*x86_64*) echo "OK: universal" ;;
+            *) echo "NOT universal: $archs" >&2; exit 1 ;;
+          esac
