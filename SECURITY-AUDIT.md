@@ -27,8 +27,10 @@ at runtime. No `curl | sh`, no unsigned binaries.
 - Role: USB transport — tunnel (iOS 17+), launch WDA, forward port 8100. Runs on
   the Mac. We build ONLY the root `ios` CLI; the `ncm/` and `restapi/`
   submodules are not built or run.
-- Built from source with `GOWORK=off` (root module only) and the following
-  vulnerable transitive deps patched:
+- Built from source with `GOWORK=off` (root module only), cross-compiled for
+  both `arm64` and `amd64` (`CGO_ENABLED=0`) and `lipo`-merged into a universal2
+  binary by `scripts/build-go-ios.sh` — still source-built, no prebuilt-binary
+  trust. Patched transitive deps:
 
   | Package | Pinned in tag | Patched to | Status |
   |---|---|---|---|
