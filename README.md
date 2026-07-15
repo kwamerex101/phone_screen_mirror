@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/images/logo.png" alt="iMirror" width="128" height="128">
+<img src=".github/assets/hero.svg" alt="iMirror — mirror and control a real iPhone from macOS while the phone stays live" width="100%">
 
 # iMirror
 
