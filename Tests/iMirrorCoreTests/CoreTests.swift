@@ -278,57 +278,118 @@ final class StageMarkerTests: XCTestCase {
 //   11:15:53.790 StopStream  (killed 2.81s in, no frame yet)
 final class CaptureLivenessTests: XCTestCase {
 
+    private func state(visible: Bool = true,
+                       hasInput: Bool = true,
+                       sessionRunning: Bool = true,
+                       secondsSinceLastFrame: TimeInterval,
+                       secondsSinceRecoveryStarted: TimeInterval?,
+                       consecutiveFailedRecoveries: Int = 0) -> CaptureWatchdogState {
+        CaptureWatchdogState(visible: visible,
+                             hasInput: hasInput,
+                             sessionRunning: sessionRunning,
+                             secondsSinceLastFrame: secondsSinceLastFrame,
+                             secondsSinceRecoveryStarted: secondsSinceRecoveryStarted,
+                             consecutiveFailedRecoveries: consecutiveFailedRecoveries)
+    }
+
     /// The exact failing cycle: a recovery began 15s ago, its 12.2s teardown ate
     /// the clock, and the freshly started stream has not delivered a frame yet.
-    /// The watchdog must NOT kill it -- that is what makes the loop permanent.
+    /// The watchdog must NOT kill it -- that is what made the loop permanent.
     func testDoesNotPreemptAnInFlightRecovery() {
-        let i = CaptureLivenessInput(visible: true,
-                                     hasInput: true,
-                                     sessionRunning: true,
-                                     secondsSinceLastFrame: 15,
-                                     secondsSinceRecoveryStarted: 15)
-        XCTAssertEqual(captureLivenessDecision(i), .idle,
+        let d = captureWatchdogDecision(state(secondsSinceLastFrame: 15, secondsSinceRecoveryStarted: 15))
+        XCTAssertEqual(d.action, .idle,
                        "watchdog preempted its own recovery before the first frame could land")
     }
 
-    /// A stream that is still frameless well past the grace window is genuinely
-    /// stuck -- recovery must still fire, or a real stall would never heal.
+    /// A stream still frameless past the grace window is genuinely stuck --
+    /// recovery must still fire, or a real stall would never heal.
     func testRecoversWhenStalledPastGrace() {
-        let i = CaptureLivenessInput(visible: true,
-                                     hasInput: true,
-                                     sessionRunning: true,
-                                     secondsSinceLastFrame: 30,
-                                     secondsSinceRecoveryStarted: 30)
-        XCTAssertEqual(captureLivenessDecision(i), .recover(reason: "no frames >5s"))
+        let d = captureWatchdogDecision(state(secondsSinceLastFrame: 30, secondsSinceRecoveryStarted: 30))
+        XCTAssertEqual(d.action, .recover(reason: "no frames >5s"))
     }
 
     /// First stall of a session (no prior recovery) must fire immediately.
     func testRecoversOnFirstStallWithNoPriorRecovery() {
-        let i = CaptureLivenessInput(visible: true,
-                                     hasInput: true,
-                                     sessionRunning: true,
-                                     secondsSinceLastFrame: 6,
-                                     secondsSinceRecoveryStarted: nil)
-        XCTAssertEqual(captureLivenessDecision(i), .recover(reason: "no frames >5s"))
+        let d = captureWatchdogDecision(state(secondsSinceLastFrame: 6, secondsSinceRecoveryStarted: nil))
+        XCTAssertEqual(d.action, .recover(reason: "no frames >5s"))
     }
 
-    /// A healthy stream is left alone.
+    /// A healthy stream is left alone and reported healthy.
     func testHealthyStreamIsIdle() {
-        let i = CaptureLivenessInput(visible: true,
-                                     hasInput: true,
-                                     sessionRunning: true,
-                                     secondsSinceLastFrame: 1,
-                                     secondsSinceRecoveryStarted: nil)
-        XCTAssertEqual(captureLivenessDecision(i), .idle)
+        let d = captureWatchdogDecision(state(secondsSinceLastFrame: 1, secondsSinceRecoveryStarted: nil))
+        XCTAssertEqual(d.action, .idle)
+        XCTAssertTrue(d.sourceHealthy)
+        XCTAssertFalse(d.sourceLikelyDead)
     }
 
-    /// Hidden window pauses frame delivery -- never recover on that.
+    /// Hidden window pauses frame delivery -- never recover, never call it dead.
     func testHiddenWindowIsIdle() {
-        let i = CaptureLivenessInput(visible: false,
-                                     hasInput: true,
-                                     sessionRunning: true,
-                                     secondsSinceLastFrame: 99,
-                                     secondsSinceRecoveryStarted: nil)
-        XCTAssertEqual(captureLivenessDecision(i), .idle)
+        let d = captureWatchdogDecision(state(visible: false,
+                                              secondsSinceLastFrame: 99,
+                                              secondsSinceRecoveryStarted: nil,
+                                              consecutiveFailedRecoveries: 9))
+        XCTAssertEqual(d.action, .idle)
+        XCTAssertFalse(d.sourceHealthy)
+        XCTAssertFalse(d.sourceLikelyDead)
+    }
+
+    // MARK: dead-source detection (issue #31)
+
+    /// After deadAfterFailedRecoveries frameless recoveries, the source is dead:
+    /// surface replug guidance instead of claiming to mirror.
+    func testDeclaresSourceDeadAfterThreshold() {
+        let d = captureWatchdogDecision(state(secondsSinceLastFrame: 40,
+                                              secondsSinceRecoveryStarted: 100,
+                                              consecutiveFailedRecoveries: 3))
+        XCTAssertTrue(d.sourceLikelyDead)
+    }
+
+    /// Just below the threshold is NOT dead yet -- still ordinary recovery.
+    func testNotDeadJustBelowThreshold() {
+        let d = captureWatchdogDecision(state(secondsSinceLastFrame: 40,
+                                              secondsSinceRecoveryStarted: 100,
+                                              consecutiveFailedRecoveries: 2))
+        XCTAssertFalse(d.sourceLikelyDead)
+        XCTAssertEqual(d.action, .recover(reason: "no frames >5s"))
+    }
+
+    /// A dead source retries slowly: within deadRetryInterval it stays idle (no
+    /// thrash) but keeps reporting dead so the message stays up.
+    func testDeadSourceRetriesSlowly() {
+        let d = captureWatchdogDecision(state(secondsSinceLastFrame: 40,
+                                              secondsSinceRecoveryStarted: 30,
+                                              consecutiveFailedRecoveries: 5))
+        XCTAssertEqual(d.action, .idle, "dead source should not rebind every grace window")
+        XCTAssertTrue(d.sourceLikelyDead)
+    }
+
+    /// Past deadRetryInterval a dead source DOES retry once -- so a replug that
+    /// re-inits the endpoint heals on its own without an app restart.
+    func testDeadSourceRetriesAfterInterval() {
+        let d = captureWatchdogDecision(state(secondsSinceLastFrame: 40,
+                                              secondsSinceRecoveryStarted: 65,
+                                              consecutiveFailedRecoveries: 5))
+        XCTAssertEqual(d.action, .recover(reason: "no frames >5s"))
+        XCTAssertTrue(d.sourceLikelyDead)
+    }
+
+    /// The false-alarm guard: a transient stall recovers within the grace window,
+    /// so the counter never climbs to the dead threshold. A frame arriving after
+    /// even many prior failures reports healthy, so the caller resets to 0.
+    func testFrameArrivalReportsHealthyRegardlessOfHistory() {
+        let d = captureWatchdogDecision(state(secondsSinceLastFrame: 1,
+                                              secondsSinceRecoveryStarted: 2,
+                                              consecutiveFailedRecoveries: 5))
+        XCTAssertTrue(d.sourceHealthy)
+        XCTAssertFalse(d.sourceLikelyDead)
+        XCTAssertEqual(d.action, .idle)
+    }
+
+    /// A stopped session (not merely frameless) still recovers, with its own reason.
+    func testStoppedSessionRecovers() {
+        let d = captureWatchdogDecision(state(sessionRunning: false,
+                                              secondsSinceLastFrame: 1,
+                                              secondsSinceRecoveryStarted: nil))
+        XCTAssertEqual(d.action, .recover(reason: "session stopped"))
     }
 }

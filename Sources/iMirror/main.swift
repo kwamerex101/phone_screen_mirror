@@ -334,6 +334,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     // green WDA dot over a black screen).
     private var captureWatchdogTimer: Timer?
     private var lastCaptureRecovery: Date?
+    // Consecutive frameless recoveries. Reset to 0 the moment frames flow again;
+    // once it crosses CaptureLiveness.deadAfterFailedRecoveries the source is
+    // treated as dead (see checkCaptureLiveness).
+    private var consecutiveCaptureRecoveries = 0
+    // True while the "iPhone stopped sending video" guidance is shown, so the
+    // message is surfaced and cleared exactly once per dead/alive transition.
+    private var captureSourceDead = false
 
     // True while the window shows any pixels. When it's fully hidden (miniaturized
     // or occluded) we pause the screenshot frame-grabber and the capture watchdog
@@ -896,15 +903,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     /// can't deliver (e.g. truly unplugged) isn't bounced every tick.
     private func checkCaptureLiveness() {
         let now = Date()
-        let decision = captureLivenessDecision(
-            CaptureLivenessInput(
+        let decision = captureWatchdogDecision(
+            CaptureWatchdogState(
                 visible: appVisible,
                 hasInput: currentInput != nil,
                 sessionRunning: session.isRunning,
                 secondsSinceLastFrame: frameGrabber.secondsSinceLastFrame,
-                secondsSinceRecoveryStarted: lastCaptureRecovery.map { now.timeIntervalSince($0) }))
-        guard case .recover(let reason) = decision else { return }
-        recoverCapture(reason)
+                secondsSinceRecoveryStarted: lastCaptureRecovery.map { now.timeIntervalSince($0) },
+                consecutiveFailedRecoveries: consecutiveCaptureRecoveries))
+        if decision.sourceHealthy {
+            // Frames are flowing again — undo any dead-source state and reset the
+            // failure streak so a future stall starts counting from zero.
+            if captureSourceDead {
+                captureSourceDead = false
+                clearDeadSourceUI()
+            }
+            consecutiveCaptureRecoveries = 0
+            return
+        }
+        if decision.sourceLikelyDead, !captureSourceDead {
+            captureSourceDead = true
+            showDeadSourceUI()
+        }
+        if case .recover(let reason) = decision.action {
+            consecutiveCaptureRecoveries += 1
+            recoverCapture(reason)
+        }
     }
 
     /// Rebuild the current device's input (a fresh AVCaptureDeviceInput forces the
@@ -912,7 +936,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     /// a stopped session (runtime error) and a silently dead stream (USB churn).
     private func recoverCapture(_ reason: String) {
         guard let device = currentInput?.device else { refreshDevices(); return }
-        // Stamped before the rebind: the grace window in captureLivenessDecision
+        // Stamped before the rebind: the grace window in captureWatchdogDecision
         // measures from here, so it spans the CMIO teardown (up to ~12s) and the
         // stream's first-frame latency. Stamping it after would let the watchdog
         // re-fire immediately and kill the stream it just restarted.
@@ -928,6 +952,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             self.frameGrabber.markActive()
             mirrorLog.notice("capture rebind complete; stream restarted")
         }
+    }
+
+    /// The capture device is enumerated and the session is running, but no app can
+    /// get a frame from it (an iPhone screen-capture endpoint that has wedged).
+    /// iMirror can't fix that from the Mac, so stop claiming to mirror and tell the
+    /// user how to recover instead of showing a black rectangle labelled "Mirroring".
+    private func showDeadSourceUI() {
+        mirrorLog.error("capture source appears dead after \(self.consecutiveCaptureRecoveries) frameless recoveries — surfacing replug guidance")
+        setStatus("iPhone stopped sending video — unplug and replug the cable.")
+        setEmptyStateReason(title: "iPhone stopped sending video",
+                            hint: "Unplug and replug the USB cable. If that doesn't help, restart the phone.")
+        cameraActionButton.isHidden = true
+        setEmptyState(hidden: false)
+    }
+
+    /// Frames returned (e.g. after a replug) — restore the normal mirroring UI.
+    private func clearDeadSourceUI() {
+        mirrorLog.notice("capture source recovered; frames flowing again")
+        if let name = currentInput?.device.localizedName {
+            setStatus("Mirroring \(name) — phone stays usable.")
+        }
+        setEmptyState(hidden: true)
+        setEmptyStateReason(title: "No iPhone connected",
+                            hint: "Plug in via USB, unlock, and tap “Trust.”")
     }
 
     private func refreshDevices() {
