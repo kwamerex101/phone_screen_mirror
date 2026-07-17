@@ -11,3 +11,6 @@ __pycache__/
 # scratch / tooling state (not project code)
 .superpowers/
 .remember/
+
+# macOS finder metadata
+.DS_Store

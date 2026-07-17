@@ -15,6 +15,11 @@ import AVFoundation
 import CoreImage
 import CoreMediaIO
 import iMirrorCore
+import os
+
+/// Unified-logging channel. NSLog output was not reaching `log show`, which made
+/// field reports (black mirror on a user's Mac) undiagnosable without a debugger.
+let mirrorLog = Logger(subsystem: "com.local.imirror", category: "capture")
 
 // MARK: - Enable CoreMediaIO screen-capture (DAL) devices
 
@@ -865,7 +870,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     @objc private func sessionRuntimeError(_ note: Notification) {
         let err = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
-        NSLog("[iMirror] AVCaptureSession runtime error: \(err?.localizedDescription ?? "unknown")")
+        mirrorLog.error("AVCaptureSession runtime error: \(err?.localizedDescription ?? "unknown", privacy: .public)")
         DispatchQueue.main.async { [weak self] in self?.recoverCapture("runtime error") }
     }
 
@@ -890,13 +895,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     /// the input to restart the CoreMediaIO stream. Rate-limited so a device that
     /// can't deliver (e.g. truly unplugged) isn't bounced every tick.
     private func checkCaptureLiveness() {
-        guard appVisible else { return }                        // hidden — frame delivery is paused
-        guard currentInput != nil else { return }               // no device selected — nothing to recover
-        let stalled = frameGrabber.secondsSinceLastFrame > 5
-        let stopped = !session.isRunning
-        guard stalled || stopped else { return }
-        if let last = lastCaptureRecovery, Date().timeIntervalSince(last) < 8 { return }
-        recoverCapture(stopped ? "session stopped" : "no frames >5s")
+        let now = Date()
+        let decision = captureLivenessDecision(
+            CaptureLivenessInput(
+                visible: appVisible,
+                hasInput: currentInput != nil,
+                sessionRunning: session.isRunning,
+                secondsSinceLastFrame: frameGrabber.secondsSinceLastFrame,
+                secondsSinceRecoveryStarted: lastCaptureRecovery.map { now.timeIntervalSince($0) }))
+        guard case .recover(let reason) = decision else { return }
+        recoverCapture(reason)
     }
 
     /// Rebuild the current device's input (a fresh AVCaptureDeviceInput forces the
@@ -904,12 +912,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     /// a stopped session (runtime error) and a silently dead stream (USB churn).
     private func recoverCapture(_ reason: String) {
         guard let device = currentInput?.device else { refreshDevices(); return }
+        // Stamped before the rebind: the grace window in captureLivenessDecision
+        // measures from here, so it spans the CMIO teardown (up to ~12s) and the
+        // stream's first-frame latency. Stamping it after would let the watchdog
+        // re-fire immediately and kill the stream it just restarted.
         lastCaptureRecovery = Date()
-        NSLog("[iMirror] recovering capture (\(reason)) on \(device.localizedName)")
+        mirrorLog.notice("recovering capture (\(reason, privacy: .public)) on \(device.localizedName, privacy: .public)")
         switchToDevice(device)                                  // begin/commit config on main; rebinds input
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self, !self.session.isRunning else { return }
-            self.session.startRunning()
+            guard let self else { return }
+            if !self.session.isRunning { self.session.startRunning() }
+            // The rebind resets the liveness clock at bind time, but the stream
+            // only starts delivering after the teardown completes. Re-stamp here
+            // so secondsSinceLastFrame measures from the *restarted* stream.
+            self.frameGrabber.markActive()
+            mirrorLog.notice("capture rebind complete; stream restarted")
         }
     }
 
