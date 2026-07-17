@@ -8,7 +8,12 @@ on:
 
 jobs:
   build-test:
-    runs-on: macos-15
+    # macos-26 gives Swift 6.3 (Xcode 26), the toolchain we build and ship the
+    # DMG with. macos-15's Swift 6.1.2 hits SwiftPM PIF bug #7958 on the
+    # multi-arch build (.swiftLanguageMode(.v5) -> unsupported SWIFT_VERSION),
+    # which is fixed in 6.2+. Testing on an older toolchain than we ship was how
+    # the universal-build step silently broke from #28 onward.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Swift version
