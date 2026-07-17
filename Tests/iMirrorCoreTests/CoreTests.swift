@@ -262,3 +262,73 @@ final class StageMarkerTests: XCTestCase {
         XCTAssertFalse(StageMarker.isCurrent(marker: nil, appBuild: "20260708"))
     }
 }
+
+// MARK: - Capture watchdog liveness
+//
+// Regression cover for the 2026-07-17 livelock: after the iPhone's CMIO device
+// re-enumerated (Dying 46 -> Publishing 48), each recovery's producer teardown
+// took ~12.2s. markActive() reset the liveness clock *before* that blocking
+// teardown, so by the time StartStream landed the clock already read ~12s --
+// past the 5s stall threshold. The watchdog then killed the stream ~2.8s later,
+// before the phone could deliver its first frame, and looped forever.
+//
+// Measured from the real log:
+//   11:15:38.787 StopStream  -> 12.19s teardown
+//   11:15:50.977 StartStream -> stream alive
+//   11:15:53.790 StopStream  (killed 2.81s in, no frame yet)
+final class CaptureLivenessTests: XCTestCase {
+
+    /// The exact failing cycle: a recovery began 15s ago, its 12.2s teardown ate
+    /// the clock, and the freshly started stream has not delivered a frame yet.
+    /// The watchdog must NOT kill it -- that is what makes the loop permanent.
+    func testDoesNotPreemptAnInFlightRecovery() {
+        let i = CaptureLivenessInput(visible: true,
+                                     hasInput: true,
+                                     sessionRunning: true,
+                                     secondsSinceLastFrame: 15,
+                                     secondsSinceRecoveryStarted: 15)
+        XCTAssertEqual(captureLivenessDecision(i), .idle,
+                       "watchdog preempted its own recovery before the first frame could land")
+    }
+
+    /// A stream that is still frameless well past the grace window is genuinely
+    /// stuck -- recovery must still fire, or a real stall would never heal.
+    func testRecoversWhenStalledPastGrace() {
+        let i = CaptureLivenessInput(visible: true,
+                                     hasInput: true,
+                                     sessionRunning: true,
+                                     secondsSinceLastFrame: 30,
+                                     secondsSinceRecoveryStarted: 30)
+        XCTAssertEqual(captureLivenessDecision(i), .recover(reason: "no frames >5s"))
+    }
+
+    /// First stall of a session (no prior recovery) must fire immediately.
+    func testRecoversOnFirstStallWithNoPriorRecovery() {
+        let i = CaptureLivenessInput(visible: true,
+                                     hasInput: true,
+                                     sessionRunning: true,
+                                     secondsSinceLastFrame: 6,
+                                     secondsSinceRecoveryStarted: nil)
+        XCTAssertEqual(captureLivenessDecision(i), .recover(reason: "no frames >5s"))
+    }
+
+    /// A healthy stream is left alone.
+    func testHealthyStreamIsIdle() {
+        let i = CaptureLivenessInput(visible: true,
+                                     hasInput: true,
+                                     sessionRunning: true,
+                                     secondsSinceLastFrame: 1,
+                                     secondsSinceRecoveryStarted: nil)
+        XCTAssertEqual(captureLivenessDecision(i), .idle)
+    }
+
+    /// Hidden window pauses frame delivery -- never recover on that.
+    func testHiddenWindowIsIdle() {
+        let i = CaptureLivenessInput(visible: false,
+                                     hasInput: true,
+                                     sessionRunning: true,
+                                     secondsSinceLastFrame: 99,
+                                     secondsSinceRecoveryStarted: nil)
+        XCTAssertEqual(captureLivenessDecision(i), .idle)
+    }
+}
