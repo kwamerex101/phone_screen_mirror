@@ -856,7 +856,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         // preview layer is driven separately and unaffected). On reveal, reset the
         // liveness clock so the watchdog doesn't fire on the hidden gap.
         videoDataOutput.connection(with: .video)?.isEnabled = visible
-        if visible { frameGrabber.markActive() }
+        // Only refresh the liveness clock if the mirror was actually healthy before
+        // it hid. Revealing the window mid-stall (e.g. during a phone call) must NOT
+        // fake a frame — that would report the source healthy and flip the UI back to
+        // "Mirroring" over a black preview, reintroducing the bug this state machine
+        // fixes. A source that was already waiting stays waiting until real frames
+        // return.
+        if visible, captureUIState == .mirroring { frameGrabber.markActive() }
     }
 
     @objc private func deviceChanged(_ note: Notification) {
@@ -1049,8 +1055,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             }
         }
         session.commitConfiguration()
-        // A silent recovery rebind leaves all mirror chrome to the watchdog.
-        if isRecovery { return }
+        // A silent recovery rebind that SUCCEEDED leaves all mirror chrome to the
+        // watchdog (it owns the waiting/mirroring state). If the rebind failed
+        // (currentInput is nil), fall through so the no-device guidance is restored
+        // rather than leaving a stale "Waiting for video" overlay up with no source.
+        if isRecovery, currentInput != nil { return }
         if currentInput == nil {
             // Back to no-device: restore the default guidance (a prior failure may
             // have changed it) unless the camera itself is blocked.

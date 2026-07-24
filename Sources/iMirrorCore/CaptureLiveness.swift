@@ -64,10 +64,13 @@ public struct CaptureWatchdogDecision: Equatable {
     /// What the watchdog should do this tick.
     public var action: CaptureWatchdogAction
     /// Frames are flowing right now -- the caller should reset its recovery
-    /// counter and clear any "source dead" UI.
+    /// counter and restore the live mirror UI.
     public var sourceHealthy: Bool
-    /// The source has failed enough recoveries to be treated as dead; the caller
-    /// should surface the replug guidance instead of claiming to mirror.
+    /// The source has failed enough recoveries to be treated as dead. This governs
+    /// the retry cadence (a dead source rebinds at deadRetryInterval, not the tighter
+    /// recoveryGrace) and is asserted by the watchdog tests. The live UI now shows one
+    /// unified "waiting for video" overlay for any stall, so the caller no longer
+    /// branches on this flag to pick a distinct message.
     public var sourceLikelyDead: Bool
 
     public init(action: CaptureWatchdogAction, sourceHealthy: Bool, sourceLikelyDead: Bool) {
