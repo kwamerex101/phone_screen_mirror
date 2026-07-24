@@ -338,9 +338,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     // once it crosses CaptureLiveness.deadAfterFailedRecoveries the source is
     // treated as dead (see checkCaptureLiveness).
     private var consecutiveCaptureRecoveries = 0
-    // True while the "iPhone stopped sending video" guidance is shown, so the
-    // message is surfaced and cleared exactly once per dead/alive transition.
-    private var captureSourceDead = false
+    /// Whether the mirror is currently showing live frames or the "waiting for
+    /// video" overlay. Driven solely by real frame delivery via the watchdog.
+    private enum CaptureUIState { case mirroring, waiting }
+    private var captureUIState: CaptureUIState = .mirroring
 
     // True while the window shows any pixels. When it's fully hidden (miniaturized
     // or occluded) we pause the screenshot frame-grabber and the capture watchdog
@@ -855,7 +856,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         // preview layer is driven separately and unaffected). On reveal, reset the
         // liveness clock so the watchdog doesn't fire on the hidden gap.
         videoDataOutput.connection(with: .video)?.isEnabled = visible
-        if visible { frameGrabber.markActive() }
+        // Only refresh the liveness clock if the mirror was actually healthy before
+        // it hid. Revealing the window mid-stall (e.g. during a phone call) must NOT
+        // fake a frame — that would report the source healthy and flip the UI back to
+        // "Mirroring" over a black preview, reintroducing the bug this state machine
+        // fixes. A source that was already waiting stays waiting until real frames
+        // return.
+        if visible, captureUIState == .mirroring { frameGrabber.markActive() }
     }
 
     @objc private func deviceChanged(_ note: Notification) {
@@ -912,18 +919,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
                 secondsSinceRecoveryStarted: lastCaptureRecovery.map { now.timeIntervalSince($0) },
                 consecutiveFailedRecoveries: consecutiveCaptureRecoveries))
         if decision.sourceHealthy {
-            // Frames are flowing again — undo any dead-source state and reset the
-            // failure streak so a future stall starts counting from zero.
-            if captureSourceDead {
-                captureSourceDead = false
-                clearDeadSourceUI()
+            // Real frames are flowing (only real delivery can set this now that a
+            // recovery rebind no longer fakes the liveness clock). Restore mirroring
+            // and reset the streak so a future stall counts from zero.
+            if captureUIState != .mirroring {
+                captureUIState = .mirroring
+                showMirroringUI()
             }
             consecutiveCaptureRecoveries = 0
             return
         }
-        if decision.sourceLikelyDead, !captureSourceDead {
-            captureSourceDead = true
-            showDeadSourceUI()
+        // Not healthy. Only surface the waiting overlay when a phone is actually
+        // bound and the window is visible — a hidden window or a no-device state has
+        // its own UI and must not be overwritten.
+        if appVisible, currentInput != nil, captureUIState != .waiting {
+            captureUIState = .waiting
+            showWaitingUI()
         }
         if case .recover(let reason) = decision.action {
             consecutiveCaptureRecoveries += 1
@@ -938,38 +949,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         guard let device = currentInput?.device else { refreshDevices(); return }
         // Stamped before the rebind: the grace window in captureWatchdogDecision
         // measures from here, so it spans the CMIO teardown (up to ~12s) and the
-        // stream's first-frame latency. Stamping it after would let the watchdog
-        // re-fire immediately and kill the stream it just restarted.
+        // stream's first-frame latency. That window -- not a faked frame -- is what
+        // stops the watchdog re-firing mid-recovery.
         lastCaptureRecovery = Date()
         mirrorLog.notice("recovering capture (\(reason, privacy: .public)) on \(device.localizedName, privacy: .public)")
-        switchToDevice(device)                                  // begin/commit config on main; rebinds input
+        // isRecovery: rebind WITHOUT faking the liveness clock. Only real delivered
+        // frames may report the source healthy -- otherwise a source that rebinds but
+        // never delivers (an iPhone on a call, a wedged endpoint) would look healthy
+        // every cycle, reset the failed-recovery counter, and never be declared dead.
+        switchToDevice(device, isRecovery: true)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             if !self.session.isRunning { self.session.startRunning() }
-            // The rebind resets the liveness clock at bind time, but the stream
-            // only starts delivering after the teardown completes. Re-stamp here
-            // so secondsSinceLastFrame measures from the *restarted* stream.
-            self.frameGrabber.markActive()
             mirrorLog.notice("capture rebind complete; stream restarted")
         }
     }
 
-    /// The capture device is enumerated and the session is running, but no app can
-    /// get a frame from it (an iPhone screen-capture endpoint that has wedged).
-    /// iMirror can't fix that from the Mac, so stop claiming to mirror and tell the
-    /// user how to recover instead of showing a black rectangle labelled "Mirroring".
-    private func showDeadSourceUI() {
-        mirrorLog.error("capture source appears dead after \(self.consecutiveCaptureRecoveries) frameless recoveries — surfacing replug guidance")
-        setStatus("iPhone stopped sending video — unplug and replug the cable.")
-        setEmptyStateReason(title: "iPhone stopped sending video",
-                            hint: "Unplug and replug the USB cable. If that doesn't help, restart the phone.")
+    /// Frames stopped arriving while a phone is bound. We can't tell a transient
+    /// telephony pause (frames resume when the call ends) from a wedged capture
+    /// endpoint (needs a replug), so the message covers both honestly instead of
+    /// claiming to mirror over a black rectangle.
+    private func showWaitingUI() {
+        mirrorLog.notice("no frames from bound device — showing waiting-for-video guidance")
+        setStatus("Waiting for video from iPhone…")
+        setEmptyStateReason(title: "Waiting for video",
+                            hint: "If you’re on a phone call, the screen resumes when the call ends. If it stays blank, unplug and replug the USB cable.")
         cameraActionButton.isHidden = true
         setEmptyState(hidden: false)
     }
 
-    /// Frames returned (e.g. after a replug) — restore the normal mirroring UI.
-    private func clearDeadSourceUI() {
-        mirrorLog.notice("capture source recovered; frames flowing again")
+    /// Real frames returned — restore the normal mirroring UI.
+    private func showMirroringUI() {
+        mirrorLog.notice("frames flowing again; restoring mirror UI")
         if let name = currentInput?.device.localizedName {
             setStatus("Mirroring \(name) — phone stays usable.")
         }
@@ -1015,7 +1026,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         switchToDevice(devices[index])
     }
 
-    private func switchToDevice(_ device: AVCaptureDevice?) {
+    /// Bind (or clear) the mirrored device. `isRecovery` marks a silent watchdog
+    /// rebind: it must not fake the liveness clock (only real frames may report the
+    /// source healthy) and must leave the mirror chrome to the watchdog, which owns
+    /// the waiting/mirroring state during a stall.
+    private func switchToDevice(_ device: AVCaptureDevice?, isRecovery: Bool = false) {
         session.beginConfiguration()
         if let currentInput { session.removeInput(currentInput) }
         currentInput = nil
@@ -1025,8 +1040,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
                 if session.canAddInput(input) {
                     session.addInput(input)
                     currentInput = input
-                    frameGrabber.markActive()   // start the watchdog's grace window from this bind
-                    setStatus("Mirroring \(device.localizedName) — phone stays usable.")
+                    if !isRecovery {
+                        frameGrabber.markActive()   // fresh bind: start the watchdog's grace window
+                        setStatus("Mirroring \(device.localizedName) — phone stays usable.")
+                    }
                     recordItem?.isEnabled = true
                     screenshotItem?.isEnabled = true
                     audioItem?.isEnabled = true
@@ -1038,6 +1055,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             }
         }
         session.commitConfiguration()
+        // A silent recovery rebind that SUCCEEDED leaves all mirror chrome to the
+        // watchdog (it owns the waiting/mirroring state). If the rebind failed
+        // (currentInput is nil), fall through so the no-device guidance is restored
+        // rather than leaving a stale "Waiting for video" overlay up with no source.
+        if isRecovery, currentInput != nil { return }
         if currentInput == nil {
             // Back to no-device: restore the default guidance (a prior failure may
             // have changed it) unless the camera itself is blocked.

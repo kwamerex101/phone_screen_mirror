@@ -392,4 +392,49 @@ final class CaptureLivenessTests: XCTestCase {
                                               secondsSinceRecoveryStarted: nil))
         XCTAssertEqual(d.action, .recover(reason: "session stopped"))
     }
+
+    // MARK: regression — recovery must not fake the liveness clock (2026-07-24)
+    //
+    // A phone on an active call stops delivering frames. The watchdog rebinds, but
+    // the rebind used to call markActive(), stamping a fresh frame time. The next
+    // tick then read secondsSinceLastFrame ~= 0, reported healthy, and reset the
+    // failed-recovery counter to 0 — so it never reached the dead threshold and the
+    // mirror rebind-stormed forever behind a black screen still labelled "Mirroring".
+    // Frames now come only from real delivery, so a frameless source climbs to dead.
+
+    /// Drives the watchdog tick-by-tick over simulated time against a source that
+    /// never delivers a real frame. `fakesFrameOnRecovery` reproduces the old
+    /// markActive()-on-rebind behaviour; the fixed code passes false.
+    private func reachesDead(fakesFrameOnRecovery: Bool) -> Bool {
+        let tick: TimeInterval = 3
+        var t: TimeInterval = 0
+        var lastRealFrame: TimeInterval = -100   // no real frame ever arrives
+        var lastRecovery: TimeInterval? = nil
+        var failures = 0
+        while t < 600 {                          // 10 min, far past the ~60s dead threshold
+            let d = captureWatchdogDecision(
+                state(secondsSinceLastFrame: t - lastRealFrame,
+                      secondsSinceRecoveryStarted: lastRecovery.map { t - $0 },
+                      consecutiveFailedRecoveries: failures))
+            if d.sourceLikelyDead { return true }
+            if d.sourceHealthy { failures = 0 }
+            if case .recover = d.action {
+                failures += 1
+                lastRecovery = t
+                if fakesFrameOnRecovery { lastRealFrame = t }   // the bug
+            }
+            t += tick
+        }
+        return false
+    }
+
+    func testFramelessSourceReachesDeadWhenRecoveryDoesNotFakeFrames() {
+        XCTAssertTrue(reachesDead(fakesFrameOnRecovery: false),
+                      "a source delivering no frames must eventually be declared dead")
+    }
+
+    func testFakingAFrameOnRecoveryHidesADeadSourceForever() {
+        XCTAssertFalse(reachesDead(fakesFrameOnRecovery: true),
+                       "regression: markActive() on recovery reset the counter and hid the dead source")
+    }
 }
