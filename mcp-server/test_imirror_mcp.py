@@ -513,6 +513,24 @@ def test_await_idle_records_info_verdict_step_without_failing_run(mod, monkeypat
     assert ">PASS<" in htmltext or "0 failures" in htmltext
 
 
+def test_await_idle_settled_when_static_but_shorter_than_min_stable(mod, monkeypatch):
+    """A static screen (fingerprint identical every read) must be reported as
+    'settled', even when the observed span never reaches min_stable_ms —
+    labeling it 'still-moving' would misreport a screen that never moved."""
+    # start=0.0, then two reads 0.4s apart; the second read already sits past
+    # timeout_s=0.3 (well short of min_stable_ms=600ms), so the loop times
+    # out right after that second read.
+    _fake_monotonic(monkeypatch, mod, [0.0, 0.0, 0.4])
+    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(mod, "_win_size", lambda: (100.0, 100.0))
+    tree = _button_tree("Same")
+    monkeypatch.setattr(mod, "_fetch_source_tree", lambda: tree)
+    out = json.loads(mod.ios_await_idle(timeout_s=0.3, min_stable_ms=600))
+    assert out["verdict"] == "settled"
+    assert out["reads"] == 2
+    assert out["stable_ms"] == pytest.approx(400.0)
+
+
 def test_await_idle_still_moving_when_fingerprint_keeps_changing(mod, monkeypatch):
     _fake_monotonic(monkeypatch, mod, [0.0, 0.0, 0.4, 0.8, 1.2, 1.6, 2.0])
     monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
@@ -861,6 +879,80 @@ def test_wait_for_uses_visible_only_predicate(mod, wda):
     assert "visible == 1" in body["value"]
 
 
+def test_find_element_or_timeout_swallows_wedged(mod, monkeypatch):
+    def wedged(*a, **k):
+        raise mod.MCPToolError("timed out", kind=mod.ErrorKind.WEDGED)
+    monkeypatch.setattr(mod, "_find_element", wedged)
+    eid, err = mod._find_element_or_timeout("X")
+    assert eid is None
+    assert isinstance(err, mod.MCPToolError)
+    assert err.error_kind == mod.ErrorKind.WEDGED
+
+
+def test_find_element_or_timeout_reraises_non_timeout(mod, monkeypatch):
+    def unreachable(*a, **k):
+        raise mod.MCPToolError("down", kind=mod.ErrorKind.UNREACHABLE)
+    monkeypatch.setattr(mod, "_find_element", unreachable)
+    with pytest.raises(mod.MCPToolError) as excinfo:
+        mod._find_element_or_timeout("X")
+    assert excinfo.value.error_kind == mod.ErrorKind.UNREACHABLE
+
+
+def test_wait_for_transient_timeout_keeps_polling(mod, monkeypatch):
+    """A single slow-but-not-wedged lookup (WEDGED from the PROBE-tier POST)
+    must not abort the whole timeout_s budget after one attempt — it's a
+    transient miss, so the loop keeps polling and can still succeed."""
+    m = mod
+    calls = {"i": 0}
+
+    def flaky(*a, **k):
+        calls["i"] += 1
+        if calls["i"] == 1:
+            raise m.MCPToolError("WDA timed out after 5s on /element.",
+                                 kind=m.ErrorKind.WEDGED)
+        return "e1"
+    monkeypatch.setattr(m, "_find_element", flaky)
+    monkeypatch.setattr(m.time, "sleep", lambda *_: None)
+    out = m.ios_wait_for("Settings", timeout_s=10)
+    assert "found" in out
+    assert calls["i"] == 2  # did not abort on the first timeout
+
+
+def test_wait_for_wedged_for_entire_budget_raises_wedged(mod, monkeypatch):
+    """If EVERY lookup times out for the whole timeout_s window, ios_wait_for
+    must re-raise the WEDGED error after the deadline (not after one
+    attempt) — the caller still learns it was a wedge, not a plain miss."""
+    m = mod
+    it = iter([0.0, 0.4, 0.9, 1.5])
+    monkeypatch.setattr(m.time, "monotonic", lambda: next(it))
+
+    def always_wedged(*a, **k):
+        raise m.MCPToolError("WDA timed out after 5s on /element.",
+                             kind=m.ErrorKind.WEDGED)
+    monkeypatch.setattr(m, "_find_element", always_wedged)
+    monkeypatch.setattr(m.time, "sleep", lambda *_: None)
+    with pytest.raises(m.MCPToolError) as excinfo:
+        m.ios_wait_for("Ghost", timeout_s=1.0)
+    assert excinfo.value.error_kind == m.ErrorKind.WEDGED
+
+
+def test_wait_for_non_timeout_error_propagates_immediately(mod, monkeypatch):
+    """A non-timeout failure (e.g. WDA unreachable) must fail fast, not be
+    swallowed and retried like a transient timeout."""
+    m = mod
+    calls = {"i": 0}
+
+    def unreachable(*a, **k):
+        calls["i"] += 1
+        raise m.MCPToolError("Cannot reach WDA", kind=m.ErrorKind.UNREACHABLE)
+    monkeypatch.setattr(m, "_find_element", unreachable)
+    monkeypatch.setattr(m.time, "sleep", lambda *_: None)
+    with pytest.raises(m.MCPToolError) as excinfo:
+        m.ios_wait_for("Ghost", timeout_s=10)
+    assert excinfo.value.error_kind == m.ErrorKind.UNREACHABLE
+    assert calls["i"] == 1
+
+
 def test_wait_for_timeout_appends_tree_snapshot(mod, monkeypatch):
     """On timeout, the error names what was actually on screen (a compact-tree
     snapshot), not just 'did not appear' — the failure path's one extra heavy
@@ -1176,6 +1268,33 @@ def test_ios_scroll_to_raises_after_cap(mod, monkeypatch):
     assert len(scrolls) == 3                           # capped at max_swipes
 
 
+def test_ios_scroll_to_transient_timeout_then_found(mod, monkeypatch):
+    """A timeout-class lookup failure is a transient miss — it must not abort
+    the scroll search outright."""
+    seq_err = [True, False, False]
+
+    def flaky(*a, **k):
+        if seq_err.pop(0):
+            raise mod.MCPToolError("timed out", kind=mod.ErrorKind.WEDGED)
+        return "e1"
+    monkeypatch.setattr(mod, "_find_element", flaky)
+    monkeypatch.setattr(mod, "_scroll_once", lambda *a, **k: None)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+    out = json.loads(mod.ios_scroll_to("Privacy", max_swipes=5))
+    assert out["found"] is True
+
+
+def test_ios_scroll_to_wedged_for_entire_budget_raises_wedged(mod, monkeypatch):
+    def always_wedged(*a, **k):
+        raise mod.MCPToolError("timed out", kind=mod.ErrorKind.WEDGED)
+    monkeypatch.setattr(mod, "_find_element", always_wedged)
+    monkeypatch.setattr(mod, "_scroll_once", lambda *a, **k: None)
+    monkeypatch.setattr(mod.time, "sleep", lambda *_: None)
+    with pytest.raises(mod.MCPToolError) as excinfo:
+        mod.ios_scroll_to("Ghost", max_swipes=2)
+    assert excinfo.value.error_kind == mod.ErrorKind.WEDGED
+
+
 def test_swipe_settle_sleeps(mod, wda, monkeypatch):
     wda.allow("/actions")
     wda.script("/session", (200, {"value": {"sessionId": "s"}}))
@@ -1297,16 +1416,23 @@ class _FakeRecorderProc:
 
 
 def _fake_popen_spy(monkeypatch, mod, proc=None):
-    """Patch mod.subprocess.Popen with a spy; returns (calls, proc)."""
+    """Patch mod.subprocess.Popen with a spy; returns (calls, proc, kwarg_calls).
+
+    `calls` collects the positional args list per invocation; `kwarg_calls`
+    collects the matching kwargs dict so tests can assert on things like
+    `stderr=`.
+    """
     proc = proc or _FakeRecorderProc()
     calls: list[list[str]] = []
+    kwarg_calls: list[dict] = []
 
     def fake_popen(args, **kwargs):
         calls.append(args)
+        kwarg_calls.append(kwargs)
         return proc
 
     monkeypatch.setattr(mod.subprocess, "Popen", fake_popen)
-    return calls, proc
+    return calls, proc, kwarg_calls
 
 
 def _touch_recording(m, size=100):
@@ -1333,7 +1459,7 @@ def _stub_status(m, monkeypatch):
 def test_sim_start_run_spawns_recorder(sim_mod, monkeypatch, tmp_path):
     monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
     _stub_status(sim_mod, monkeypatch)
-    calls, proc = _fake_popen_spy(monkeypatch, sim_mod)
+    calls, proc, kwarg_calls = _fake_popen_spy(monkeypatch, sim_mod)
 
     out = sim_mod.ios_start_run("rec")
 
@@ -1344,6 +1470,10 @@ def test_sim_start_run_spawns_recorder(sim_mod, monkeypatch, tmp_path):
     assert "recordVideo" in args
     assert os.path.join(sim_mod._run["dir"], "recording.mp4") in args
     assert sim_mod._run["recorder"] is proc
+    # I12 finding #4.1: stderr must be drained (DEVNULL), not left as an
+    # unread PIPE — a long run can otherwise fill the buffer and block the
+    # recorder child, stalling the recording.
+    assert kwarg_calls[0]["stderr"] is sim_mod.subprocess.DEVNULL
 
 
 def test_sim_finish_run_uses_real_recording(sim_mod, monkeypatch, tmp_path):
@@ -1406,7 +1536,7 @@ def test_sim_finish_run_falls_back_when_recording_missing(sim_mod, monkeypatch, 
 def test_device_start_run_does_not_spawn_recorder(mod, monkeypatch, tmp_path):
     monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
     _stub_status(mod, monkeypatch)
-    calls, _ = _fake_popen_spy(monkeypatch, mod)
+    calls, _, _ = _fake_popen_spy(monkeypatch, mod)
 
     mod.ios_start_run("device-run")
 
@@ -1460,6 +1590,107 @@ def test_stop_sim_recording_kills_on_timeout(sim_mod, monkeypatch, tmp_path):
 def test_stop_sim_recording_no_recorder_is_noop(sim_mod):
     clip, note = sim_mod._stop_sim_recording()
     assert (clip, note) == (None, "")
+
+
+# ---- I12 finding #4: atexit cleanup + recorder lock ----------------------------
+
+def test_stop_sim_recording_registered_with_atexit(monkeypatch):
+    """I12 #4.2: module load must register _stop_sim_recording as an atexit
+    cleanup, so a server exit between ios_start_run and ios_finish_run doesn't
+    orphan the recordVideo child. Patch atexit.register before importing so we
+    can observe what the module hands it."""
+    import atexit
+    registered = []
+    monkeypatch.setattr(atexit, "register", lambda f, *a, **k: registered.append(f))
+    monkeypatch.setenv("IMIRROR_WDA", "http://127.0.0.1:8100")
+    monkeypatch.delenv("IMIRROR_TARGET", raising=False)
+    sys.modules.pop("imirror_mcp", None)
+    m = importlib.import_module("imirror_mcp")
+    assert m._stop_sim_recording in registered
+
+
+def test_atexit_handler_stops_active_recorder(sim_mod, monkeypatch, tmp_path):
+    """I12 #4.2: invoking the registered handler (simulating interpreter
+    shutdown) with a fake active recorder sends SIGINT and clears
+    _run["recorder"], same as a normal _stop_sim_recording call."""
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    _stub_status(sim_mod, monkeypatch)
+    _fake_popen_spy(monkeypatch, sim_mod)
+    sim_mod.ios_start_run("rec")
+    proc = sim_mod._run["recorder"]
+    assert proc is not None
+
+    sim_mod._stop_sim_recording()  # the exact callable atexit.register was given
+
+    assert sim_mod.signal.SIGINT in proc.signals
+    assert sim_mod._run["recorder"] is None
+
+
+def test_start_sim_recording_uses_recorder_lock(sim_mod, monkeypatch, tmp_path):
+    """I12 #4.3: the spawn must happen while holding _recorder_lock, so a
+    concurrent stop/start can't interleave with it."""
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    os.makedirs(tmp_path, exist_ok=True)
+    _fake_popen_spy(monkeypatch, sim_mod)
+
+    held_during_popen = []
+
+    real_popen = sim_mod.subprocess.Popen
+
+    def spying_popen(*a, **k):
+        # RLock.acquire(blocking=False) succeeds here (same thread already
+        # holds it), and _is_owned confirms the current thread is the owner.
+        held_during_popen.append(sim_mod._recorder_lock._is_owned())
+        return real_popen(*a, **k)
+    monkeypatch.setattr(sim_mod.subprocess, "Popen", spying_popen)
+
+    sim_mod._start_sim_recording(str(tmp_path))
+
+    assert held_during_popen == [True]
+
+
+def test_stop_sim_recording_uses_recorder_lock(sim_mod, monkeypatch, tmp_path):
+    """I12 #4.3: the stop handshake (signal + _run mutation) must happen while
+    holding _recorder_lock."""
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    _stub_status(sim_mod, monkeypatch)
+    _fake_popen_spy(monkeypatch, sim_mod)
+    sim_mod.ios_start_run("rec")
+    proc = sim_mod._run["recorder"]
+
+    held_during_signal = []
+    real_send_signal = proc.send_signal
+
+    def spying_send_signal(sig):
+        held_during_signal.append(sim_mod._recorder_lock._is_owned())
+        return real_send_signal(sig)
+    proc.send_signal = spying_send_signal
+
+    sim_mod._stop_sim_recording()
+
+    assert held_during_signal == [True]
+
+
+def test_ios_start_run_holds_lock_across_stop_reset_start(sim_mod, monkeypatch, tmp_path):
+    """I12 #4.3: ios_start_run must hold _recorder_lock across stopping any
+    prior recorder, resetting the recorder keys, and starting the new one —
+    otherwise a concurrent ios_start_run could interleave and orphan a
+    recorder handle."""
+    monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
+    _stub_status(sim_mod, monkeypatch)
+    _fake_popen_spy(monkeypatch, sim_mod)
+
+    held = []
+    real_start = sim_mod._start_sim_recording
+
+    def spying_start(run_dir):
+        held.append(sim_mod._recorder_lock._is_owned())
+        return real_start(run_dir)
+    monkeypatch.setattr(sim_mod, "_start_sim_recording", spying_start)
+
+    sim_mod.ios_start_run("rec")
+
+    assert held == [True]
 
 
 # ---- verified-review fixes -------------------------------------------------------
@@ -1694,13 +1925,35 @@ def test_clipboard_set_sim_uses_simctl_fast_path(sim_mod, monkeypatch):
 def test_clipboard_get_sim_uses_simctl_fast_path(sim_mod, monkeypatch):
     """On the simulator, a working simctl reads the clipboard without ever
     touching WDA."""
-    monkeypatch.setattr(sim_mod, "_simctl",
-                        lambda *args: "clip text" if args == ("pbpaste", "booted")
-                        else pytest.fail(f"unexpected simctl args {args}"))
+    def fake_simctl(*args, **kwargs):
+        if args == ("pbpaste", "booted"):
+            return "clip text"
+        pytest.fail(f"unexpected simctl args {args} kwargs {kwargs}")
+    monkeypatch.setattr(sim_mod, "_simctl", fake_simctl)
     monkeypatch.setattr(sim_mod, "_req",
                         lambda *a, **k: pytest.fail("WDA should not be called"))
 
     assert sim_mod.ios_clipboard_get() == "clip text"
+
+
+def test_clipboard_get_sim_preserves_whitespace_e3(sim_mod, monkeypatch):
+    """E3: pbpaste output must round-trip verbatim, including leading/trailing
+    whitespace and a trailing newline — _simctl's default strip=True (correct
+    for UDID/device-list callers) would silently corrupt clipboard content
+    like an indented snippet or a password ending in a space."""
+    seen_kwargs = {}
+    raw = "  hi there \n"
+
+    def fake_simctl(*args, **kwargs):
+        assert args == ("pbpaste", "booted")
+        seen_kwargs.update(kwargs)
+        return raw
+    monkeypatch.setattr(sim_mod, "_simctl", fake_simctl)
+    monkeypatch.setattr(sim_mod, "_req",
+                        lambda *a, **k: pytest.fail("WDA should not be called"))
+
+    assert sim_mod.ios_clipboard_get() == raw
+    assert seen_kwargs == {"strip": False}
 
 
 def test_clipboard_set_sim_falls_back_to_wda_on_simctl_failure(sim_mod, monkeypatch):
@@ -1729,7 +1982,7 @@ def test_clipboard_get_sim_falls_back_to_wda_on_simctl_failure(sim_mod, monkeypa
     reads the clipboard."""
     import base64
 
-    def fail_simctl(*args):
+    def fail_simctl(*args, **kwargs):
         raise RuntimeError("boom")
     monkeypatch.setattr(sim_mod, "_simctl", fail_simctl)
 
@@ -1866,6 +2119,27 @@ def test_press_home_still_works_on_simulator(sim_mod, monkeypatch):
 
 # ---- simulator-only simctl tools -----------------------------------------------
 
+def test_simctl_strips_by_default(sim_mod, monkeypatch):
+    """Every pre-existing caller (UDID/device-list output) relies on the
+    default strip=True — this must keep working unchanged."""
+    def fake_run(args, **kw):
+        class R: returncode = 0; stdout = "  some-udid  \n"; stderr = ""
+        return R()
+    monkeypatch.setattr(sim_mod.subprocess, "run", fake_run)
+    assert sim_mod._simctl("list") == "some-udid"
+
+
+def test_simctl_strip_false_preserves_whitespace(sim_mod, monkeypatch):
+    """E3: strip=False must return stdout verbatim, for callers like
+    ios_clipboard_get where surrounding whitespace is meaningful content."""
+    raw = "  hi there \n"
+    def fake_run(args, **kw):
+        class R: returncode = 0; stdout = raw; stderr = ""
+        return R()
+    monkeypatch.setattr(sim_mod.subprocess, "run", fake_run)
+    assert sim_mod._simctl("pbpaste", "booted", strip=False) == raw
+
+
 def _fake_simctl(mod, monkeypatch):
     seen = {"args": None}
     def fake_run(args, **kw):
@@ -1990,6 +2264,52 @@ def test_assert_not_visible_fails_records_single_verdict_step(mod, monkeypatch, 
     assert "Ghost" in fails[0]["verdict"]["reason"]
 
 
+def test_assert_visible_transient_timeout_keeps_polling(mod, monkeypatch):
+    m = mod
+    calls = {"i": 0}
+
+    def flaky(*a, **k):
+        calls["i"] += 1
+        if calls["i"] == 1:
+            raise m.MCPToolError("timed out", kind=m.ErrorKind.WEDGED)
+        return "e1"
+    monkeypatch.setattr(m, "_find_element", flaky)
+    monkeypatch.setattr(m.time, "sleep", lambda *_: None)
+    out = m.ios_assert_visible("Welcome", timeout_s=10)
+    assert "PASS" in out
+    assert calls["i"] == 2  # did not abort on the first timeout
+
+
+def test_assert_visible_wedged_for_entire_budget_raises_wedged(mod, monkeypatch):
+    m = mod
+
+    def always_wedged(*a, **k):
+        raise m.MCPToolError("timed out", kind=m.ErrorKind.WEDGED)
+    monkeypatch.setattr(m, "_find_element", always_wedged)
+    monkeypatch.setattr(m.time, "sleep", lambda *_: None)
+    with pytest.raises(m.MCPToolError) as excinfo:
+        m.ios_assert_visible("Ghost", timeout_s=0)
+    assert excinfo.value.error_kind == m.ErrorKind.WEDGED
+
+
+def test_assert_not_visible_transient_timeout_keeps_polling(mod, monkeypatch):
+    """A timeout doesn't confirm absence — it must not be mistaken for
+    'element not found' and pass the assertion prematurely."""
+    m = mod
+    calls = {"i": 0}
+
+    def flaky(*a, **k):
+        calls["i"] += 1
+        if calls["i"] == 1:
+            raise m.MCPToolError("timed out", kind=m.ErrorKind.WEDGED)
+        return None
+    monkeypatch.setattr(m, "_find_element", flaky)
+    monkeypatch.setattr(m.time, "sleep", lambda *_: None)
+    out = m.ios_assert_not_visible("Spinner", timeout_s=10)
+    assert "PASS" in out
+    assert calls["i"] == 2
+
+
 def test_assert_not_visible_passes_when_absent(mod, monkeypatch, tmp_path):
     monkeypatch.setenv("IMIRROR_RUNS_DIR", str(tmp_path))
     monkeypatch.setattr(mod, "_req", lambda *a, **k: (200, {"value": {}}))
@@ -2024,6 +2344,37 @@ def test_find_and_tap_retries_until_present(mod, wda, monkeypatch):
     out = mod.ios_find_and_tap("Continue", retries=1)
     assert "tapped" in out
     assert seq == []                         # both attempts consumed
+
+
+def test_find_and_tap_transient_timeout_counts_as_used_attempt(mod, monkeypatch):
+    """A timeout-class failure from _find_element must not abort the retry
+    loop outright, but it still consumes one of the `retries` slots — same
+    as a plain miss would."""
+    m = mod
+    calls = {"i": 0}
+
+    def flaky(*a, **k):
+        calls["i"] += 1
+        if calls["i"] == 1:
+            raise m.MCPToolError("timed out", kind=m.ErrorKind.WEDGED)
+        return None  # clean miss for the remaining attempts
+    monkeypatch.setattr(m, "_find_element", flaky)
+    monkeypatch.setattr(m.time, "sleep", lambda *_: None)
+    with pytest.raises(RuntimeError, match="No element matching"):
+        m.ios_find_and_tap("Ghost", retries=2)
+    assert calls["i"] == 3  # initial timeout + 2 clean-miss retries, all used
+
+
+def test_find_and_tap_wedged_for_entire_budget_raises_wedged(mod, monkeypatch):
+    m = mod
+
+    def always_wedged(*a, **k):
+        raise m.MCPToolError("timed out", kind=m.ErrorKind.WEDGED)
+    monkeypatch.setattr(m, "_find_element", always_wedged)
+    monkeypatch.setattr(m.time, "sleep", lambda *_: None)
+    with pytest.raises(m.MCPToolError) as excinfo:
+        m.ios_find_and_tap("Ghost", retries=2)
+    assert excinfo.value.error_kind == m.ErrorKind.WEDGED
 
 
 # ---- review-fix coverage -------------------------------------------------------

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 __version__ = "1.2.0"
 
+import atexit
 import base64
 import functools
 import html
@@ -469,6 +470,13 @@ def _pointer(steps: list[dict]) -> dict:
 # agents (or test threads) sharing one MCP server, the lock prevents that.
 _gesture_lock = threading.Lock()
 
+# Serialise the simulator recorder handoff (start/stop) across threads. Two
+# racing ios_start_run calls could otherwise interleave their _run["recorder"]
+# mutations and orphan a recordVideo child with no reference left to kill it.
+# RLock so a thread already holding it (ios_start_run) can call into
+# _start_sim_recording/_stop_sim_recording, which also take the lock.
+_recorder_lock = threading.RLock()
+
 
 def _gesture(steps: list[dict]) -> None:
     if not _gesture_lock.acquire(timeout=5):
@@ -562,6 +570,32 @@ def _find_element(text: str, visible_only: bool = False, _retry: bool = True) ->
         return _find_element(text, visible_only=visible_only, _retry=False)
     return (j.get("value") or {}).get("ELEMENT") or \
            (j.get("value") or {}).get("element-6066-11e4-a52e-4f735466cecf")
+
+
+def _find_element_or_timeout(text: str, visible_only: bool = False) -> tuple[str | None, MCPToolError | None]:
+    """Call `_find_element`, catching a timeout-class failure so poll loops can
+    treat a slow-but-not-wedged lookup as a transient miss instead of
+    aborting their whole retry/timeout budget after one attempt.
+
+    `_find_element` posts at the PROBE tier (5s) so poll loops can surface a
+    wedged WDA fast — but that same short tier means a legitimately slow
+    (>5s, not wedged) lookup also raises. Swallowing only WEDGED/TIMEOUT here
+    lets the caller keep polling toward its own deadline; anything else
+    (unreachable, wda_http, ...) still propagates immediately so callers fail
+    fast when WDA is genuinely down rather than confused with WDA slow.
+
+    Returns `(element_id_or_None, error_or_None)`. `error` is set only when
+    this attempt was a caught timeout — callers use it to decide, once their
+    budget is exhausted, whether to report a plain "not found" (at least one
+    attempt read cleanly) or re-raise the timeout (every attempt timed out,
+    meaning WDA was wedged the whole time).
+    """
+    try:
+        return _find_element(text, visible_only=visible_only), None
+    except MCPToolError as e:
+        if e.error_kind in (ErrorKind.WEDGED, ErrorKind.TIMEOUT):
+            return None, e
+        raise
 
 
 # ---- Compact accessibility tree (ios_source text mode) --------------------------
@@ -992,8 +1026,14 @@ def ios_await_idle(timeout_s: float = 5.0, min_stable_ms: int = 600) -> str:
 
     NEVER raises for a non-settle outcome — it always returns a JSON verdict
     `{"verdict", "elapsed_s", "reads", "stable_ms"}`, where verdict is one of:
-      "settled"       — the structure held stable before timeout_s elapsed.
-      "still-moving"  — timed out while the fingerprint kept changing.
+      "settled"       — the fingerprint was stable across the whole observed
+                        window: either it held for min_stable_ms before
+                        timeout_s elapsed, or it simply never changed across
+                        every read taken (even if that span fell short of
+                        min_stable_ms — a screen that never moved is settled,
+                        not "still moving").
+      "still-moving"  — the fingerprint actually changed at least once and
+                        never re-stabilized before timeout_s elapsed.
       "empty"         — the tree had no elements for the whole window (a blank
                         screen, or a read that isn't returning content).
       "too-few-reads" — timed out before enough reads landed to judge either
@@ -1010,6 +1050,7 @@ def ios_await_idle(timeout_s: float = 5.0, min_stable_ms: int = 600) -> str:
     deadline = start + max(0.0, timeout_s)
     reads = 0
     any_elements_seen = False
+    ever_changed = False
     candidate_fp: tuple | None = None
     candidate_ts: float | None = None
     last_ts = start
@@ -1021,6 +1062,10 @@ def ios_await_idle(timeout_s: float = 5.0, min_stable_ms: int = 600) -> str:
         if fp:
             any_elements_seen = True
             if fp != candidate_fp:
+                if candidate_fp is not None:
+                    # A real change from one non-empty fingerprint to another
+                    # (not just the first read establishing a candidate).
+                    ever_changed = True
                 candidate_fp, candidate_ts = fp, ts
             else:
                 stable_ms = (ts - candidate_ts) * 1000.0  # type: ignore[operator]
@@ -1041,6 +1086,11 @@ def ios_await_idle(timeout_s: float = 5.0, min_stable_ms: int = 600) -> str:
         verdict = "too-few-reads"
     elif not any_elements_seen:
         verdict = "empty"
+    elif not ever_changed:
+        # The fingerprint held for the entire observation window — even
+        # though the span never reached min_stable_ms, it's still static,
+        # not animating. Report the real (shorter) observed stable span.
+        verdict = "settled"
     else:
         verdict = "still-moving"
     # Idle verdicts always annotate the run, never fail it (see I8): recorded
@@ -1145,14 +1195,23 @@ def ios_scroll_to(text: str, direction: str = "down", max_swipes: int = 10,
     cap = min(max_swipes, 20)
     if max_swipes > 20:
         _record("scroll_to", f"max_swipes {max_swipes} capped at 20")
+    any_clean = False
+    last_timeout_err: MCPToolError | None = None
     for n in range(cap + 1):
-        if _find_element(text):
-            _record("scroll_to", f"'{text}' {direction}: found after {n} swipe(s)")
-            return json.dumps({"found": True, "swipes": n})
+        eid, err = _find_element_or_timeout(text)
+        if err is not None:
+            last_timeout_err = err
+        else:
+            any_clean = True
+            if eid:
+                _record("scroll_to", f"'{text}' {direction}: found after {n} swipe(s)")
+                return json.dumps({"found": True, "swipes": n})
         if n == cap:
             break
         _scroll_once(direction, distance_pct, 50, 50, 300)
         time.sleep(settle_ms / 1000.0)
+    if last_timeout_err is not None and not any_clean:
+        raise last_timeout_err  # WDA was wedged for the whole search — say so
     # The @_recorded decorator logs the fail step (with a structured verdict)
     # when this raises, so the report's pass/fail rollup sees it without a
     # manual note here.
@@ -1212,15 +1271,23 @@ def ios_find_and_tap(text: str, retries: int = 0, retry_delay_s: float = 0.5) ->
     back to ios_source to inspect, or ios_tap with coordinates.
     """
     attempt = 0
+    any_clean = False
+    last_timeout_err: MCPToolError | None = None
     while True:
-        eid = _find_element(text)
-        if eid:
-            # The click leg goes through _session_post so a stale-session 404 retries
-            # and a WDA error raises — returning "tapped" on a failed click would mislead.
-            _session_post(f"/element/{eid}/click", {})
-            _record("find_and_tap", text)
-            return f"tapped element '{text}'"
+        eid, err = _find_element_or_timeout(text)
+        if err is not None:
+            last_timeout_err = err
+        else:
+            any_clean = True
+            if eid:
+                # The click leg goes through _session_post so a stale-session 404 retries
+                # and a WDA error raises — returning "tapped" on a failed click would mislead.
+                _session_post(f"/element/{eid}/click", {})
+                _record("find_and_tap", text)
+                return f"tapped element '{text}'"
         if attempt >= retries:
+            if last_timeout_err is not None and not any_clean:
+                raise last_timeout_err  # WDA was wedged for every attempt — say so
             raise RuntimeError(f"No element matching '{text}'. Use ios_source to inspect.")
         attempt += 1
         time.sleep(retry_delay_s)
@@ -1241,12 +1308,21 @@ def ios_wait_for(text: str, timeout_s: float = 10.0) -> str:
     """
     deadline = time.monotonic() + max(0.0, timeout_s)
     attempts = 0
+    any_clean = False
+    last_timeout_err: MCPToolError | None = None
     while True:
         attempts += 1
-        if _find_element(text, visible_only=True):
-            _record("wait_for", f"'{text}' (found after {attempts} check(s))")
-            return f"found '{text}' after {attempts} check(s)"
+        eid, err = _find_element_or_timeout(text, visible_only=True)
+        if err is not None:
+            last_timeout_err = err
+        else:
+            any_clean = True
+            if eid:
+                _record("wait_for", f"'{text}' (found after {attempts} check(s))")
+                return f"found '{text}' after {attempts} check(s)"
         if time.monotonic() >= deadline:
+            if last_timeout_err is not None and not any_clean:
+                raise last_timeout_err  # WDA was wedged for every attempt — say so
             raise MCPToolError(
                 f"'{text}' did not appear within {timeout_s}s.\n"
                 f"{_wait_for_timeout_snapshot()}", kind=ErrorKind.NOT_FOUND)
@@ -1391,7 +1467,11 @@ def ios_clipboard_get() -> str:
     """
     if _IS_SIM:
         try:
-            text = _simctl("pbpaste", "booted")
+            # strip=False: pbpaste's stdout IS the clipboard content verbatim —
+            # trailing newlines, indentation, and other meaningful whitespace
+            # must round-trip unchanged (unlike UDID/device-list callers, where
+            # _simctl's default strip=True is correct).
+            text = _simctl("pbpaste", "booted", strip=False)
             _record("clipboard_get", f"{len(text)} chars")
             return text
         except (RuntimeError, OSError):
@@ -1476,11 +1556,16 @@ def _install_on_simulator(path: str) -> None:
 # dialog, and freeze the status bar for clean screenshots. simctl only ever talks
 # to simulators, so they require IMIRROR_TARGET=simulator and target `booted`.
 
-def _simctl(*args: str) -> str:
+def _simctl(*args: str, strip: bool = True) -> str:
     """Run `xcrun simctl <args>` and return stdout. Simulator-only.
 
     Raises a clear error when the current target isn't a simulator, when `xcrun`
     is missing, or when simctl exits non-zero (surfacing its stderr).
+
+    `strip` defaults to True (matching every existing caller — UDIDs, device
+    lists, and other structured output where surrounding whitespace is noise).
+    Pass `strip=False` for output where whitespace is meaningful, e.g.
+    clipboard content read via `pbpaste`.
     """
     if not _IS_SIM:
         raise RuntimeError("simctl tools require IMIRROR_TARGET=simulator.")
@@ -1492,7 +1577,8 @@ def _simctl(*args: str) -> str:
     except subprocess.CalledProcessError as e:
         raise RuntimeError(
             f"simctl {args[0]} failed: {(e.stderr or '').strip() or e}") from e
-    return (r.stdout or "").strip()
+    out = r.stdout or ""
+    return out.strip() if strip else out
 
 
 def _start_sim_recording(run_dir: str) -> None:
@@ -1505,17 +1591,22 @@ def _start_sim_recording(run_dir: str) -> None:
     timelapse) rather than raising.
     """
     path = os.path.join(run_dir, "recording.mp4")
-    try:
-        proc = subprocess.Popen(
-            ["xcrun", "simctl", "io", "booted", "recordVideo",
-             "--codec=h264", "--force", path],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    except Exception:
-        _run["recorder"] = None
-        _run["recording"] = None
-        return
-    _run["recorder"] = proc
-    _run["recording"] = path
+    with _recorder_lock:
+        try:
+            proc = subprocess.Popen(
+                ["xcrun", "simctl", "io", "booted", "recordVideo",
+                 "--codec=h264", "--force", path],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                # DEVNULL, not PIPE: nothing ever reads this pipe, and a long
+                # run can fill the ~64KB stderr buffer and block the child,
+                # stalling the recording.
+                stderr=subprocess.DEVNULL)
+        except Exception:
+            _run["recorder"] = None
+            _run["recording"] = None
+            return
+        _run["recorder"] = proc
+        _run["recording"] = path
 
 
 def _stop_sim_recording() -> tuple[str | None, str]:
@@ -1531,27 +1622,36 @@ def _stop_sim_recording() -> tuple[str | None, str]:
     same run directory. (None, "") when no recorder was running; (None,
     reason) when one ran but produced no usable file.
     """
-    proc = _run.get("recorder")
-    path = _run.get("recording")
-    if proc is None:
+    with _recorder_lock:
+        proc = _run.get("recorder")
+        path = _run.get("recording")
+        if proc is None:
+            _run["recorder"] = None
+            _run["recording"] = None
+            return None, ""
+        note = ""
+        try:
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            note = "recording stop timed out; clip may be incomplete"
+        except Exception:
+            pass
         _run["recorder"] = None
         _run["recording"] = None
-        return None, ""
-    note = ""
-    try:
-        proc.send_signal(signal.SIGINT)
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        note = "recording stop timed out; clip may be incomplete"
-    except Exception:
-        pass
-    _run["recorder"] = None
-    _run["recording"] = None
     if path and os.path.exists(path) and os.path.getsize(path) > 0:
         return os.path.basename(path), note
     return None, note or "recording skipped: no output produced"
+
+
+# Best-effort cleanup so a server exit (normal exit, sys.exit, an unhandled
+# exception, or a client disconnect) between ios_start_run and ios_finish_run
+# doesn't leave the recordVideo child running and writing forever. This can
+# only catch orderly interpreter shutdown — a hard SIGKILL of the server
+# process still leaves the recorder orphaned, same as any other atexit hook.
+atexit.register(_stop_sim_recording)
 
 
 @mcp.tool()
@@ -1642,9 +1742,6 @@ def ios_start_run(label: str = "test") -> str:
     if _run["active"]:
         warn = (f"WARNING: discarded in-progress run '{_run['label']}' "
                 f"({len(_run['steps'])} steps) — only one run records at a time. ")
-    # A replaced run must not leak the previous run's recorder process; stop it
-    # (discarding the clip) before we reset state for the new run.
-    _stop_sim_recording()
     base = os.environ.get("IMIRROR_RUNS_DIR", os.path.expanduser("~/.imirror/runs"))
     slug = re.sub(r"[^A-Za-z0-9_-]+", "-", label).strip("-") or "test"
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -1657,13 +1754,21 @@ def ios_start_run(label: str = "test") -> str:
         device, ios_ver = v.get("device"), v.get("os", {}).get("version")
     except Exception:
         pass
-    _run.update(active=True, dir=run_dir, label=label, started=time.time(),
-                device=device, ios=ios_ver, steps=[], cap_noted=False,
-                recorder=None, recording=None)
-    if _IS_SIM:
-        # Best-effort: a failed recorder start must never fail the run or
-        # change what's returned here (see _start_sim_recording).
-        _start_sim_recording(run_dir)
+    # Hold the recorder lock across the whole stop -> reset -> start handoff so
+    # a concurrent ios_start_run can't interleave and orphan a recorder handle
+    # (one thread's reset overwriting another's just-set recorder with no
+    # reference left to kill it). A replaced run must not leak the previous
+    # run's recorder process, so stop it (discarding the clip) before
+    # resetting state for the new run.
+    with _recorder_lock:
+        _stop_sim_recording()
+        _run.update(active=True, dir=run_dir, label=label, started=time.time(),
+                    device=device, ios=ios_ver, steps=[], cap_noted=False,
+                    recorder=None, recording=None)
+        if _IS_SIM:
+            # Best-effort: a failed recorder start must never fail the run or
+            # change what's returned here (see _start_sim_recording).
+            _start_sim_recording(run_dir)
     return f"{warn}recording run '{label}' -> {run_dir}"
 
 
@@ -1761,12 +1866,21 @@ def ios_assert_visible(text: str, timeout_s: float = 5.0) -> str:
     """
     deadline = time.monotonic() + max(0.0, timeout_s)
     attempts = 0
+    any_clean = False
+    last_timeout_err: MCPToolError | None = None
     while True:
         attempts += 1
-        if _find_element(text):
-            _record("note", f"assert visible '{text}' (after {attempts} check(s))", note="pass")
-            return f"PASS: '{text}' is visible"
+        eid, err = _find_element_or_timeout(text)
+        if err is not None:
+            last_timeout_err = err
+        else:
+            any_clean = True
+            if eid:
+                _record("note", f"assert visible '{text}' (after {attempts} check(s))", note="pass")
+                return f"PASS: '{text}' is visible"
         if time.monotonic() >= deadline:
+            if last_timeout_err is not None and not any_clean:
+                raise last_timeout_err  # WDA was wedged for every attempt — say so
             raise MCPToolError(f"ASSERT FAILED: '{text}' not visible within {timeout_s}s.",
                                 kind=ErrorKind.NOT_FOUND)
         time.sleep(0.5)
@@ -1783,12 +1897,21 @@ def ios_assert_not_visible(text: str, timeout_s: float = 3.0) -> str:
     """
     deadline = time.monotonic() + max(0.0, timeout_s)
     attempts = 0
+    any_clean = False
+    last_timeout_err: MCPToolError | None = None
     while True:
         attempts += 1
-        if not _find_element(text):
-            _record("note", f"assert not-visible '{text}' (after {attempts} check(s))", note="pass")
-            return f"PASS: '{text}' is not visible"
+        eid, err = _find_element_or_timeout(text)
+        if err is not None:
+            last_timeout_err = err
+        else:
+            any_clean = True
+            if not eid:
+                _record("note", f"assert not-visible '{text}' (after {attempts} check(s))", note="pass")
+                return f"PASS: '{text}' is not visible"
         if time.monotonic() >= deadline:
+            if last_timeout_err is not None and not any_clean:
+                raise last_timeout_err  # WDA was wedged for every attempt — say so
             raise MCPToolError(f"ASSERT FAILED: '{text}' still visible after {timeout_s}s.",
                                 kind=ErrorKind.NOT_FOUND)
         time.sleep(0.5)
