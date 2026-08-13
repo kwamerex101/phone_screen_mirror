@@ -438,3 +438,151 @@ final class CaptureLivenessTests: XCTestCase {
                        "regression: markActive() on recovery reset the counter and hid the dead source")
     }
 }
+
+// MARK: - Frame-content-aware capture liveness (I3)
+//
+// Advisory-only content signal: it may only select which waiting-overlay copy
+// is shown, and must never be able to change captureWatchdogDecision's
+// recover/idle/dead outcome. See CaptureLiveness.swift for the design rationale.
+final class FrameContentSamplingTests: XCTestCase {
+
+    func testIdenticalSamplesProduceTheSameFingerprint() {
+        let samples: [UInt8] = [10, 20, 30, 40, 200, 5, 60, 70]
+        let a = FrameContentSampling.fingerprint(samples: samples)
+        let b = FrameContentSampling.fingerprint(samples: samples)
+        XCTAssertEqual(a, b)
+    }
+
+    func testChangedSamplesProduceADifferentFingerprint() {
+        let a = FrameContentSampling.fingerprint(samples: [10, 20, 30, 40])
+        let b = FrameContentSampling.fingerprint(samples: [11, 20, 30, 40])
+        XCTAssertNotEqual(a.hash, b.hash)
+    }
+
+    func testAllDarkSamplesAreNearBlack() {
+        let fp = FrameContentSampling.fingerprint(samples: [UInt8](repeating: 2, count: 256))
+        XCTAssertTrue(fp.nearBlack)
+    }
+
+    func testBrightSamplesAreNotNearBlack() {
+        let fp = FrameContentSampling.fingerprint(samples: [UInt8](repeating: 200, count: 256))
+        XCTAssertFalse(fp.nearBlack)
+    }
+
+    func testMixedDarkAndBrightAveragesAboveThresholdIsNotNearBlack() {
+        // Half black, half bright -- the average sits well above the threshold, so
+        // this must not be misread as a black frame.
+        let samples = [UInt8](repeating: 0, count: 128) + [UInt8](repeating: 255, count: 128)
+        let fp = FrameContentSampling.fingerprint(samples: samples)
+        XCTAssertFalse(fp.nearBlack)
+    }
+}
+
+final class CaptureWaitingReasonTests: XCTestCase {
+
+    private func state(consecutiveStaticFrames: Int,
+                       nearBlack: Bool,
+                       interruptionActive: Bool) -> CaptureWatchdogState {
+        CaptureWatchdogState(visible: true,
+                             hasInput: true,
+                             sessionRunning: true,
+                             secondsSinceLastFrame: 1,
+                             secondsSinceRecoveryStarted: nil,
+                             consecutiveFailedRecoveries: 0,
+                             consecutiveStaticFrames: consecutiveStaticFrames,
+                             nearBlack: nearBlack,
+                             interruptionActive: interruptionActive)
+    }
+
+    /// Changing frames (no static run at all) never produce an advisory.
+    func testNoneWhenFramesAreChanging() {
+        let reason = captureWaitingReason(state(consecutiveStaticFrames: 0, nearBlack: false, interruptionActive: false))
+        XCTAssertEqual(reason, .none)
+    }
+
+    /// Outage-vs-blip: a single static/near-black tick must not trigger anything.
+    func testNoneOnASingleStaticTick() {
+        let reason = captureWaitingReason(state(consecutiveStaticFrames: 1, nearBlack: true, interruptionActive: false))
+        XCTAssertEqual(reason, .none)
+    }
+
+    /// Sustained static + near-black content corroborated by an active telephony
+    /// interruption reads as a call/occlusion, not a hard failure.
+    func testCallOrOcclusionWhenSustainedAndInterruptionActive() {
+        let reason = captureWaitingReason(state(consecutiveStaticFrames: CaptureLiveness.staticFrameGate,
+                                                nearBlack: true,
+                                                interruptionActive: true))
+        XCTAssertEqual(reason, .callOrOcclusion)
+    }
+
+    /// The same sustained static/near-black content with no corroborating
+    /// interruption reads as a generic stalled source instead.
+    func testStaticSourceWhenSustainedWithoutInterruption() {
+        let reason = captureWaitingReason(state(consecutiveStaticFrames: CaptureLiveness.staticFrameGate,
+                                                nearBlack: true,
+                                                interruptionActive: false))
+        XCTAssertEqual(reason, .staticSource)
+    }
+
+    /// Counter-reset behavior (I3 requirement 7): a fresh bind/markActive resets
+    /// consecutiveStaticFrames to 0, which must read back as no advisory even if
+    /// the tick happens to be near-black (e.g. a recovery landing on the same
+    /// still-dark screen it left).
+    func testResetCounterProducesNoAdvisoryEvenIfNearBlack() {
+        let reason = captureWaitingReason(state(consecutiveStaticFrames: 0, nearBlack: true, interruptionActive: true))
+        XCTAssertEqual(reason, .none)
+    }
+}
+
+final class CaptureContentSignalDoesNotAffectRecoveryTests: XCTestCase {
+
+    private func decisionsMatch(visible: Bool = true,
+                                hasInput: Bool = true,
+                                sessionRunning: Bool = true,
+                                secondsSinceLastFrame: TimeInterval,
+                                secondsSinceRecoveryStarted: TimeInterval?,
+                                consecutiveFailedRecoveries: Int = 0) {
+        let baseline = captureWatchdogDecision(CaptureWatchdogState(
+            visible: visible, hasInput: hasInput, sessionRunning: sessionRunning,
+            secondsSinceLastFrame: secondsSinceLastFrame,
+            secondsSinceRecoveryStarted: secondsSinceRecoveryStarted,
+            consecutiveFailedRecoveries: consecutiveFailedRecoveries))
+        let withContentSignal = captureWatchdogDecision(CaptureWatchdogState(
+            visible: visible, hasInput: hasInput, sessionRunning: sessionRunning,
+            secondsSinceLastFrame: secondsSinceLastFrame,
+            secondsSinceRecoveryStarted: secondsSinceRecoveryStarted,
+            consecutiveFailedRecoveries: consecutiveFailedRecoveries,
+            consecutiveStaticFrames: CaptureLiveness.staticFrameGate + 5,
+            nearBlack: true,
+            interruptionActive: true))
+        XCTAssertEqual(baseline, withContentSignal,
+                       "content signal must never change the recover/idle/dead decision")
+    }
+
+    /// Guard test: representative states across healthy, mid-recovery, past-grace
+    /// recover, and dead-source retry-cadence must all produce identical
+    /// decisions with and without the static/near-black/interruption signal set.
+    func testHealthyStreamIsUnaffected() {
+        decisionsMatch(secondsSinceLastFrame: 1, secondsSinceRecoveryStarted: nil)
+    }
+
+    func testInFlightRecoveryIsUnaffected() {
+        decisionsMatch(secondsSinceLastFrame: 15, secondsSinceRecoveryStarted: 15)
+    }
+
+    func testPastGraceRecoveryIsUnaffected() {
+        decisionsMatch(secondsSinceLastFrame: 30, secondsSinceRecoveryStarted: 30)
+    }
+
+    func testDeadSourceRetryCadenceIsUnaffected() {
+        decisionsMatch(secondsSinceLastFrame: 40, secondsSinceRecoveryStarted: 30, consecutiveFailedRecoveries: 5)
+    }
+
+    func testDeadSourceRetryAfterIntervalIsUnaffected() {
+        decisionsMatch(secondsSinceLastFrame: 40, secondsSinceRecoveryStarted: 65, consecutiveFailedRecoveries: 5)
+    }
+
+    func testHiddenWindowIsUnaffected() {
+        decisionsMatch(visible: false, secondsSinceLastFrame: 99, secondsSinceRecoveryStarted: nil, consecutiveFailedRecoveries: 9)
+    }
+}

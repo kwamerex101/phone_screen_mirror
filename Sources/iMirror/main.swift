@@ -243,6 +243,41 @@ final class FrameGrabber: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
     /// watchdog gives a fresh grace window instead of firing on the stale gap.
     func markActive() { lock.lock(); lastFrameAt = Date(); lock.unlock() }
 
+    /// Sample plane-0 luma on a `gridSize` x `gridSize` stride grid from the
+    /// latest buffer. Runs once per watchdog tick (~3s in checkCaptureLiveness),
+    /// never in captureOutput — a full-buffer luma pass there would run at
+    /// ~350-700MB/s on the frames queue. Handles both planar (YCbCr, plane 0 =
+    /// luma) and non-planar (e.g. BGRA) buffers: for non-planar formats it
+    /// samples the first byte of each pixel's byte group, which still moves when
+    /// content changes and still tracks darkness closely enough for this
+    /// heuristic. Returns an empty array if there is no frame yet.
+    func sampledLumaBytes(gridSize: Int = 16) -> [UInt8] {
+        guard let pixelBuffer = snapshot() else { return [] }
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        let planar = CVPixelBufferIsPlanar(pixelBuffer)
+        let width = planar ? CVPixelBufferGetWidthOfPlane(pixelBuffer, 0) : CVPixelBufferGetWidth(pixelBuffer)
+        let height = planar ? CVPixelBufferGetHeightOfPlane(pixelBuffer, 0) : CVPixelBufferGetHeight(pixelBuffer)
+        let stride = planar ? CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0) : CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let base = planar ? CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) : CVPixelBufferGetBaseAddress(pixelBuffer)
+        guard width > 0, height > 0, gridSize > 0, stride > 0, let base else { return [] }
+
+        let bytesPerElement = planar ? 1 : max(1, stride / max(width, 1))
+        let ptr = base.assumingMemoryBound(to: UInt8.self)
+        var samples: [UInt8] = []
+        samples.reserveCapacity(gridSize * gridSize)
+        for row in 0..<gridSize {
+            let y = min(height - 1, (row * height) / gridSize)
+            for col in 0..<gridSize {
+                let x = min(width - 1, (col * width) / gridSize)
+                let byteOffset = min(stride - bytesPerElement, x * bytesPerElement)
+                samples.append(ptr[y * stride + byteOffset])
+            }
+        }
+        return samples
+    }
+
     /// Seconds since the last delivered frame (or last markActive). The capture
     /// watchdog uses this to detect a silently stalled stream (green WDA, black
     /// mirror) that fires no runtime-error or disconnect notification.
@@ -342,6 +377,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     /// video" overlay. Driven solely by real frame delivery via the watchdog.
     private enum CaptureUIState { case mirroring, waiting }
     private var captureUIState: CaptureUIState = .mirroring
+
+    // Frame-content-aware liveness (I3, advisory only — see CaptureLiveness.swift).
+    // Computed once per watchdog tick from FrameGrabber.snapshot(), never per
+    // delivered frame. Never allowed to influence recovery/dead-marking, only
+    // which waiting-overlay message checkCaptureLiveness picks.
+    private var lastContentFingerprint: FrameFingerprint?
+    private var consecutiveStaticFrames = 0
+    private var lastShownWaitingReason: CaptureWaitingReason?
+    /// True while an AVCaptureSessionWasInterrupted is active for this session (no
+    /// matching InterruptionEnded yet). Corroborates the content signal so a
+    /// frozen call/occlusion screen reads as "call/occlusion" rather than a
+    /// generic stalled source.
+    ///
+    /// NOTE (deviation from the plan): the plan asked for this to be gated on
+    /// AVCaptureSessionInterruptionReasonKey and telephony-specific reasons
+    /// (videoDeviceNotAvailableWithMultipleForegroundApps, etc). Both that key and
+    /// AVCaptureSession.InterruptionReason are marked
+    /// `API_UNAVAILABLE(macos)` in the AVFoundation SDK — this is a macOS app, and
+    /// macOS's AVCaptureSessionWasInterrupted carries no reason in userInfo at
+    /// all. So the reason-based filter cannot be built as specified; any
+    /// interruption of this session is treated as corroborating, which is the
+    /// only signal this platform actually exposes.
+    private var interruptionActive = false
 
     // True while the window shows any pixels. When it's fully hidden (miniaturized
     // or occluded) we pause the screenshot frame-grabber and the capture watchdog
@@ -862,7 +920,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         // "Mirroring" over a black preview, reintroducing the bug this state machine
         // fixes. A source that was already waiting stays waiting until real frames
         // return.
-        if visible, captureUIState == .mirroring { frameGrabber.markActive() }
+        if visible, captureUIState == .mirroring {
+            frameGrabber.markActive()
+            resetContentLiveness()
+        }
     }
 
     @objc private func deviceChanged(_ note: Notification) {
@@ -889,10 +950,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     }
 
     @objc private func sessionInterrupted(_ note: Notification) {
+        // Corroborates the content-liveness advisory: an active interruption plus
+        // a sustained static/near-black frame reads as a call/occlusion rather
+        // than a generic stalled source. See checkCaptureLiveness. (macOS exposes
+        // no interruption-reason userInfo — see the `interruptionActive` doc
+        // comment for why this can't be filtered to telephony-specific reasons.)
+        interruptionActive = true
         DispatchQueue.main.async { [weak self] in self?.setStatus("Mirror paused — capture interrupted.") }
     }
 
     @objc private func sessionInterruptionEnded(_ note: Notification) {
+        interruptionActive = false
         DispatchQueue.main.async { [weak self] in self?.recoverCapture("interruption ended") }
     }
 
@@ -910,14 +978,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     /// can't deliver (e.g. truly unplugged) isn't bounced every tick.
     private func checkCaptureLiveness() {
         let now = Date()
-        let decision = captureWatchdogDecision(
-            CaptureWatchdogState(
-                visible: appVisible,
-                hasInput: currentInput != nil,
-                sessionRunning: session.isRunning,
-                secondsSinceLastFrame: frameGrabber.secondsSinceLastFrame,
-                secondsSinceRecoveryStarted: lastCaptureRecovery.map { now.timeIntervalSince($0) },
-                consecutiveFailedRecoveries: consecutiveCaptureRecoveries))
+        // Content-liveness sample: once per tick, on this (watchdog/main) thread,
+        // never in captureOutput. Advisory only — feeds captureWaitingReason below,
+        // never captureWatchdogDecision.
+        let samples = frameGrabber.sampledLumaBytes()
+        if !samples.isEmpty {
+            let fingerprint = FrameContentSampling.fingerprint(samples: samples)
+            if let last = lastContentFingerprint, last.hash == fingerprint.hash {
+                consecutiveStaticFrames += 1
+            } else {
+                consecutiveStaticFrames = 0
+            }
+            lastContentFingerprint = fingerprint
+        }
+        let state = CaptureWatchdogState(
+            visible: appVisible,
+            hasInput: currentInput != nil,
+            sessionRunning: session.isRunning,
+            secondsSinceLastFrame: frameGrabber.secondsSinceLastFrame,
+            secondsSinceRecoveryStarted: lastCaptureRecovery.map { now.timeIntervalSince($0) },
+            consecutiveFailedRecoveries: consecutiveCaptureRecoveries,
+            consecutiveStaticFrames: consecutiveStaticFrames,
+            nearBlack: lastContentFingerprint?.nearBlack ?? false,
+            interruptionActive: interruptionActive)
+        let decision = captureWatchdogDecision(state)
         if decision.sourceHealthy {
             // Real frames are flowing (only real delivery can set this now that a
             // recovery rebind no longer fakes the liveness clock). Restore mirroring
@@ -931,10 +1015,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         }
         // Not healthy. Only surface the waiting overlay when a phone is actually
         // bound and the window is visible — a hidden window or a no-device state has
-        // its own UI and must not be overwritten.
-        if appVisible, currentInput != nil, captureUIState != .waiting {
+        // its own UI and must not be overwritten. Re-show it if the advisory reason
+        // has changed since it was last displayed (e.g. a call starts partway
+        // through an existing stall) even though the UI state is already .waiting.
+        let waitingReason = captureWaitingReason(state)
+        if appVisible, currentInput != nil,
+           captureUIState != .waiting || waitingReason != lastShownWaitingReason {
             captureUIState = .waiting
-            showWaitingUI()
+            lastShownWaitingReason = waitingReason
+            showWaitingUI(reason: waitingReason)
         }
         if case .recover(let reason) = decision.action {
             consecutiveCaptureRecoveries += 1
@@ -969,11 +1058,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     /// telephony pause (frames resume when the call ends) from a wedged capture
     /// endpoint (needs a replug), so the message covers both honestly instead of
     /// claiming to mirror over a black rectangle.
-    private func showWaitingUI() {
-        mirrorLog.notice("no frames from bound device — showing waiting-for-video guidance")
+    private func showWaitingUI(reason: CaptureWaitingReason) {
+        mirrorLog.notice("no frames from bound device — showing waiting-for-video guidance (\(String(describing: reason), privacy: .public))")
         setStatus("Waiting for video from iPhone…")
-        setEmptyStateReason(title: "Waiting for video",
-                            hint: "If you’re on a phone call, the screen resumes when the call ends. If it stays blank, unplug and replug the USB cable.")
+        switch reason {
+        case .callOrOcclusion:
+            // Corroborated by an active telephony-relevant interruption — confident
+            // enough to name the likely cause outright.
+            setEmptyStateReason(title: "Waiting for video",
+                                hint: "Looks like you’re on a phone call — the screen resumes when it ends. If it stays blank, unplug and replug the USB cable.")
+        case .staticSource, .none:
+            // Uncorroborated (or no sustained stall detected yet): stay honest that
+            // this could be a call OR a wedged endpoint, per the existing design —
+            // the content signal never gets to claim more certainty than that.
+            setEmptyStateReason(title: "Waiting for video",
+                                hint: "If you’re on a phone call, the screen resumes when the call ends. If it stays blank, unplug and replug the USB cable.")
+        }
         cameraActionButton.isHidden = true
         setEmptyState(hidden: false)
     }
@@ -987,6 +1087,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         setEmptyState(hidden: true)
         setEmptyStateReason(title: "No iPhone connected",
                             hint: "Plug in via USB, unlock, and tap “Trust.”")
+        lastShownWaitingReason = nil
+    }
+
+    /// Reset the content-liveness counters — call alongside every
+    /// `frameGrabber.markActive()` (fresh bind or a visibility reveal). Otherwise
+    /// a recovery that resumes on the same static screen it left would find its
+    /// old fingerprint still matching and instantly re-trip the static-frame gate.
+    private func resetContentLiveness() {
+        lastContentFingerprint = nil
+        consecutiveStaticFrames = 0
     }
 
     private func refreshDevices() {
@@ -1042,6 +1152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
                     currentInput = input
                     if !isRecovery {
                         frameGrabber.markActive()   // fresh bind: start the watchdog's grace window
+                        resetContentLiveness()
                         setStatus("Mirroring \(device.localizedName) — phone stays usable.")
                     }
                     recordItem?.isEnabled = true

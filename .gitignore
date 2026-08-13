@@ -14,3 +14,7 @@ __pycache__/
 
 # macOS finder metadata
 .DS_Store
+
+# internal planning/design/spec docs (kept out of the repo; docs/images assets stay tracked)
+docs/*.md
+docs/**/*.md

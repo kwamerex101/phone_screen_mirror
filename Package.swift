@@ -23,5 +23,10 @@ let package = Package(
             dependencies: ["iMirrorCore"],
             path: "Tests/iMirrorCoreTests"
         ),
+        .testTarget(
+            name: "iMirrorTests",
+            dependencies: ["iMirror", "iMirrorCore"],
+            path: "Tests/iMirrorTests"
+        ),
     ]
 )

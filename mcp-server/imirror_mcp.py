@@ -18,9 +18,11 @@ Override target:  IMIRROR_WDA=http://127.0.0.1:8100
 """
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
+import atexit
 import base64
+import functools
 import html
 import http.client
 import ipaddress
@@ -29,6 +31,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -36,10 +39,60 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from typing import Any
 from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import FastMCP, Image
+
+
+class ErrorKind:
+    """Closed set of machine-readable failure classifications for
+    MCPToolError. Plain string constants (not a real Enum) so `error_kind`
+    stays a bare string — both an attribute value and the thing embedded in
+    the wire-visible message tail (see MCPToolError.__str__)."""
+    VALIDATION = "validation"
+    NOT_FOUND = "not_found"
+    WDA_HTTP = "wda_http"
+    UNREACHABLE = "unreachable"
+    WEDGED = "wedged"
+    TIMEOUT = "timeout"
+    UNSUPPORTED = "unsupported"
+
+
+_ERROR_KINDS = {ErrorKind.VALIDATION, ErrorKind.NOT_FOUND, ErrorKind.WDA_HTTP,
+                ErrorKind.UNREACHABLE, ErrorKind.WEDGED, ErrorKind.TIMEOUT,
+                ErrorKind.UNSUPPORTED}
+
+
+class MCPToolError(RuntimeError):
+    """A RuntimeError that also carries a machine-readable classification.
+
+    FastMCP hands a raised exception back to the agent as `str(e)` — bare
+    attributes such as `.error_kind` never reach the agent over the wire.
+    So the classification is ALSO encoded into the message itself, as a
+    trailing `[kind=<kind>]` (or `[kind=<kind> code=<code>]`) tag appended
+    by `__str__` after the human-readable message. `.error_kind`/
+    `.error_code` stay available as plain attributes too, for in-process
+    use (e.g. the run report).
+
+    Subclassing RuntimeError keeps every existing
+    `pytest.raises(RuntimeError, match=...)` test passing unchanged — this
+    is additive, not a breaking change to the exception contract.
+    """
+
+    def __init__(self, message: str, *, kind: str, code: str | None = None):
+        if kind not in _ERROR_KINDS:
+            raise ValueError(f"unknown MCPToolError kind: {kind!r}")
+        super().__init__(message)
+        self.human_message = message
+        self.error_kind = kind
+        self.error_code = code
+
+    def __str__(self) -> str:
+        tail = (f"[kind={self.error_kind}]" if self.error_code is None
+                else f"[kind={self.error_kind} code={self.error_code}]")
+        return f"{self.human_message} {tail}"
 
 
 def _is_loopback_url(url: str) -> bool:
@@ -96,6 +149,23 @@ def _wedged_hint() -> str:
             else "check the iMirror health dot")
 
 
+# Named timeout tiers, in place of scattered per-call literals.
+#   PROBE    — cheap existence/point checks (/status, element lookups in poll
+#              loops, best-effort settings POSTs). Deliberately short: a poll
+#              loop calls this many times, and a wedged WDA should surface fast.
+#   INTERACT — gestures and other session operations. Same value as the old
+#              flat _req default (15s) — this is a relabel, not a behavior change.
+#   TREE     — full /source reads. A legitimately heavy accessibility tree has
+#              been observed taking >15s (~160KB on a real device), so this
+#              stays generous. What actually protects against a stalled WDA
+#              queue is the probe-gated retry in _req_tree, not a short timeout
+#              here — WDA serializes on one XCUITest queue, so a short timeout
+#              plus a blind retry would just queue a second full-tree
+#              serialization behind whatever is already stalling it.
+_TIMEOUT_PROBE = 5
+_TIMEOUT_INTERACT = 15
+_TIMEOUT_TREE = 60
+
 mcp = FastMCP("imirror")
 
 _session: dict[str, str | None] = {"id": None}
@@ -105,23 +175,32 @@ _session: dict[str, str | None] = {"id": None}
 _run: dict[str, Any] = {
     "active": False, "dir": None, "label": None, "started": None,
     "device": None, "ios": None, "steps": [],
+    "recorder": None, "recording": None,
 }
 
 
 def _record(action: str, detail: str = "", screenshot: str | None = None,
-            note: str = "") -> None:
+            note: str = "", verdict: dict[str, Any] | None = None) -> None:
     """Append a step to the active run. No-op when no run is recording.
 
     Each step is also appended to steps.jsonl in the run dir so a crash between
     ios_start_run and ios_finish_run leaves a replayable log next to the
     screenshots already on disk (the in-memory timeline would otherwise be lost).
     The disk append is best-effort — a write failure must never break recording.
+
+    `verdict` (I8 schema addition) is an optional structured outcome, e.g.
+    `{"kind": "fail", "reason": <str>, "error_kind": ..., "error_code": ...}`
+    for an auto-recorded tool failure (see `_recorded`), or
+    `{"kind": "idle", "reason": <settled|still-moving|empty|too-few-reads>}`
+    for an `ios_await_idle` read. It is additive: the legacy `note` field
+    keeps working unchanged for callers that don't pass a verdict.
     """
     if not _run["active"]:
         return
     step = {
         "i": len(_run["steps"]) + 1, "t": time.time(),
         "action": action, "detail": detail, "screenshot": screenshot, "note": note,
+        "verdict": verdict,
     }
     _run["steps"].append(step)
     run_dir = _run.get("dir")
@@ -131,6 +210,60 @@ def _record(action: str, detail: str = "", screenshot: str | None = None,
                 f.write(json.dumps(step) + "\n")
         except OSError:
             pass
+
+
+def _step_is_fail(s: dict[str, Any]) -> bool:
+    """True if a recorded step counts as a failure in the report rollup.
+
+    Two paths count: the legacy manual `note="fail"` marker (still used by a
+    couple of call sites for a PASS-only signal), and a structured `verdict`
+    with `kind == "fail"` recorded automatically by `_recorded` when a
+    decorated tool raises. This is an intentional semantics change (I8): a
+    raised failure that previously went unrecorded — because no tool
+    manually logged a fail note before raising — now flips a report from
+    PASS to FAIL. An `idle` verdict (or any other non-"fail" kind) never
+    counts here.
+    """
+    if s["action"] == "note" and s["note"] == "fail":
+        return True
+    v = s.get("verdict")
+    return bool(v and v.get("kind") == "fail")
+
+
+def _recorded(fn):
+    """Decorator: auto-record ONE `fail` step (with a structured verdict) when
+    the wrapped tool raises during an active run, then re-raise unchanged.
+
+    Centralizes fail-recording at the raise boundary so individual tools
+    don't each need to remember to log a fail note before raising — this
+    replaces the old manual `_record(..., note="fail")` calls in
+    `ios_scroll_to`/`ios_assert_visible`/`ios_assert_not_visible`, which are
+    removed in favor of this single source of truth (avoids double-recording
+    the same failure).
+
+    No-op when no run is active: it still re-raises, but records nothing —
+    behavior is identical to calling the undecorated function.
+
+    Apply this UNDER `@mcp.tool()` (i.e. `@mcp.tool()` on top, `@_recorded`
+    directly above `def`) so FastMCP registers/introspects the real function.
+    `functools.wraps` preserves `__name__`/`__doc__`/signature for that.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if _run["active"]:
+                verdict: dict[str, Any] = {
+                    "kind": "fail",
+                    "reason": e.human_message if isinstance(e, MCPToolError) else str(e),
+                }
+                if isinstance(e, MCPToolError):
+                    verdict["error_kind"] = e.error_kind
+                    verdict["error_code"] = e.error_code
+                _record(fn.__name__, detail=verdict["reason"], verdict=verdict)
+            raise
+    return wrapper
 
 
 # ---- HTTP helpers (keep-alive connection, reconnect on drop) -------------------
@@ -178,7 +311,7 @@ def _http(method: str, path: str, data: bytes | None,
 
 
 def _req(method: str, path: str, body: dict | None = None,
-         timeout: float = 15) -> tuple[int, dict[str, Any]]:
+         timeout: float = _TIMEOUT_INTERACT) -> tuple[int, dict[str, Any]]:
     data = json.dumps(body).encode() if body is not None else None
     # WDA's CocoaHTTPServer occasionally drops a connection mid-exchange
     # (RemoteDisconnected / reset), and keep-alive means we may hand back a
@@ -199,12 +332,13 @@ def _req(method: str, path: str, body: dict | None = None,
                 time.sleep(0.3 * attempt)
             continue
         except (socket.timeout, TimeoutError) as e:
-            raise RuntimeError(
+            raise MCPToolError(
                 f"WDA timed out after {timeout}s on {path}. It may be busy or "
-                f"wedged — {_wedged_hint()}.") from e
+                f"wedged — {_wedged_hint()}.", kind=ErrorKind.WEDGED) from e
         except OSError as e:
-            raise RuntimeError(
-                f"Cannot reach WDA at {WDA} ({e}). {_unreachable_hint()}") from e
+            raise MCPToolError(
+                f"Cannot reach WDA at {WDA} ({e}). {_unreachable_hint()}",
+                kind=ErrorKind.UNREACHABLE) from e
         # HTTP errors (4xx/5xx) come back as a normal response with http.client,
         # not an exception — callers (e.g. _session_post) rely on seeing the code
         # and any JSON error body, so return them rather than raising.
@@ -214,9 +348,38 @@ def _req(method: str, path: str, body: dict | None = None,
             if status >= 400:
                 return status, {"error": raw.decode("utf-8", "replace")[:300]}
             raise
-    raise RuntimeError(
+    raise MCPToolError(
         f"WDA dropped the connection repeatedly on {path} ({last_exc}). "
-        f"It may be busy or wedged — {_wedged_hint()}.")
+        f"It may be busy or wedged — {_wedged_hint()}.", kind=ErrorKind.WEDGED)
+
+
+def _req_tree(path: str) -> tuple[int, dict[str, Any]]:
+    """GET a read-only /source route at the TREE tier, riding out one stall
+    instead of failing the step outright.
+
+    On a timeout, a blind retry is dangerous: WDA serializes on a single
+    XCUITest queue, so retrying immediately just queues a second full-tree
+    serialization behind whatever is already stalling the first one. Instead,
+    probe cheaply first (GET /status at the PROBE tier):
+      - probe answers  -> the queue cleared, so retry the tree read once more
+        (a second timeout there propagates as the usual wedged error).
+      - probe also times out -> WDA is still stalled; re-raise the original
+        error immediately rather than piling on more work.
+
+    Read-only routes ONLY. Never wrap a gesture or other state-changing POST
+    in this: a timed-out call may have already applied server-side, and a
+    retry could double-apply it.
+    """
+    try:
+        return _req("GET", path, timeout=_TIMEOUT_TREE)
+    except RuntimeError as first_exc:
+        if not isinstance(first_exc.__cause__, (socket.timeout, TimeoutError)):
+            raise  # not a timeout (e.g. repeated connection drops) — nothing to ride out
+        try:
+            _req("GET", "/status", timeout=_TIMEOUT_PROBE)
+        except Exception:
+            raise first_exc from None  # still stalled — don't pile another read on the queue
+        return _req("GET", path, timeout=_TIMEOUT_TREE)  # queue cleared — ride it out once
 
 
 def _screenshot_quality() -> int:
@@ -257,7 +420,7 @@ def _ensure_session() -> str:
     # per-session settings route is honored.
     try:
         _req("POST", f"/session/{sid}/appium/settings",
-             {"settings": {"waitForIdleTimeout": 0, "animationCoolOffTimeout": 0}}, timeout=5)
+             {"settings": {"waitForIdleTimeout": 0, "animationCoolOffTimeout": 0}}, timeout=_TIMEOUT_PROBE)
     except Exception:
         pass
     # Ask WDA to JPEG-encode screenshots device-side (screenshotQuality 1/2) —
@@ -265,7 +428,7 @@ def _ensure_session() -> str:
     # a build that rejects the key can't also drop the idle-wait settings above.
     try:
         _req("POST", f"/session/{sid}/appium/settings",
-             {"settings": {"screenshotQuality": _screenshot_quality()}}, timeout=5)
+             {"settings": {"screenshotQuality": _screenshot_quality()}}, timeout=_TIMEOUT_PROBE)
     except Exception:
         pass
     return sid
@@ -279,7 +442,8 @@ def _session_post(subpath: str, body: dict, _retry: bool = True) -> dict[str, An
         _session["id"] = None
         return _session_post(subpath, body, _retry=False)
     if code >= 400:
-        raise RuntimeError(f"WDA error (HTTP {code}) on {subpath}: {j}")
+        raise MCPToolError(f"WDA error (HTTP {code}) on {subpath}: {j}",
+                            kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
     return j
 
 
@@ -291,7 +455,8 @@ def _session_get(subpath: str, _retry: bool = True) -> dict[str, Any]:
         _session["id"] = None
         return _session_get(subpath, _retry=False)
     if code >= 400:
-        raise RuntimeError(f"WDA error (HTTP {code}) on {subpath}: {j}")
+        raise MCPToolError(f"WDA error (HTTP {code}) on {subpath}: {j}",
+                            kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
     return j
 
 
@@ -304,6 +469,13 @@ def _pointer(steps: list[dict]) -> dict:
 # queue; two overlapping gestures stall it and can wedge the wire. With several
 # agents (or test threads) sharing one MCP server, the lock prevents that.
 _gesture_lock = threading.Lock()
+
+# Serialise the simulator recorder handoff (start/stop) across threads. Two
+# racing ios_start_run calls could otherwise interleave their _run["recorder"]
+# mutations and orphan a recordVideo child with no reference left to kill it.
+# RLock so a thread already holding it (ios_start_run) can call into
+# _start_sim_recording/_stop_sim_recording, which also take the lock.
+_recorder_lock = threading.RLock()
 
 
 def _gesture(steps: list[dict]) -> None:
@@ -346,7 +518,8 @@ def _scroll_geom(direction: str, distance_pct: float,
     elif d == "left":  fx, fy, tx, ty = cx + sh / 2, cy, cx - sh / 2, cy
     elif d == "right": fx, fy, tx, ty = cx - sh / 2, cy, cx + sh / 2, cy
     else:
-        raise RuntimeError("direction must be one of up / down / left / right")
+        raise MCPToolError("direction must be one of up / down / left / right",
+                            kind=ErrorKind.VALIDATION)
     clamp = lambda v, m: min(max(v, 1.0), m - 1.0)
     fx, tx = clamp(fx, w), clamp(tx, w)
     fy, ty = clamp(fy, h), clamp(ty, h)
@@ -365,23 +538,254 @@ def _scroll_once(direction: str, distance_pct: float, x_pct: float,
     return fx, fy, tx, ty, dist
 
 
-def _find_element(text: str, _retry: bool = True) -> str | None:
+def _find_element(text: str, visible_only: bool = False, _retry: bool = True) -> str | None:
     """Return the element id of the first element whose label/name/value matches
     `text`, or None if no such element is on screen. Recreates the session once
     on a stale 404.
+
+    `visible_only` ANDs `visible == 1` into the predicate so only an on-screen
+    match counts — WDA returns the first predicate match, which is reading
+    order, so this is how a caller waits for the first VISIBLE match rather
+    than any matching element regardless of visibility. Extending the same
+    predicate string (rather than switching to `/elements` + per-element rect
+    lookups) keeps this a single round trip; the latter would be N round trips
+    per poll, a real-device perf regression. Default False keeps today's
+    behavior for ios_find_and_tap / ios_scroll_to / the asserts.
     """
     sid = _ensure_session()
     # Escape backslashes BEFORE quotes: input ending in \' would otherwise become
     # \\' (escaped backslash + live quote) and break out of the predicate literal.
     safe = text.replace("\\", "\\\\").replace("'", "\\'")
     predicate = f"label == '{safe}' OR name == '{safe}' OR value == '{safe}'"
+    if visible_only:
+        predicate = f"({predicate}) AND visible == 1"
+    # PROBE tier: poll loops (ios_wait_for, ios_find_and_tap, ios_scroll_to, the
+    # asserts) call this many times per second, so a wedged WDA should surface
+    # fast rather than each lookup eating the INTERACT tier.
     code, j = _req("POST", f"/session/{sid}/element",
-                   {"using": "predicate string", "value": predicate})
+                   {"using": "predicate string", "value": predicate},
+                   timeout=_TIMEOUT_PROBE)
     if code == 404 and _retry:
         _session["id"] = None
-        return _find_element(text, _retry=False)
+        return _find_element(text, visible_only=visible_only, _retry=False)
     return (j.get("value") or {}).get("ELEMENT") or \
            (j.get("value") or {}).get("element-6066-11e4-a52e-4f735466cecf")
+
+
+def _find_element_or_timeout(text: str, visible_only: bool = False) -> tuple[str | None, MCPToolError | None]:
+    """Call `_find_element`, catching a timeout-class failure so poll loops can
+    treat a slow-but-not-wedged lookup as a transient miss instead of
+    aborting their whole retry/timeout budget after one attempt.
+
+    `_find_element` posts at the PROBE tier (5s) so poll loops can surface a
+    wedged WDA fast — but that same short tier means a legitimately slow
+    (>5s, not wedged) lookup also raises. Swallowing only WEDGED/TIMEOUT here
+    lets the caller keep polling toward its own deadline; anything else
+    (unreachable, wda_http, ...) still propagates immediately so callers fail
+    fast when WDA is genuinely down rather than confused with WDA slow.
+
+    Returns `(element_id_or_None, error_or_None)`. `error` is set only when
+    this attempt was a caught timeout — callers use it to decide, once their
+    budget is exhausted, whether to report a plain "not found" (at least one
+    attempt read cleanly) or re-raise the timeout (every attempt timed out,
+    meaning WDA was wedged the whole time).
+    """
+    try:
+        return _find_element(text, visible_only=visible_only), None
+    except MCPToolError as e:
+        if e.error_kind in (ErrorKind.WEDGED, ErrorKind.TIMEOUT):
+            return None, e
+        raise
+
+
+# ---- Compact accessibility tree (ios_source text mode) --------------------------
+#
+# WDA's /source can return either an XCUITest XML dump or (on some WDA builds,
+# via ?format=json) a JSON tree. We do not assume JSON support — probe once and
+# fall back to XML — and normalize either shape into one internal node dict
+# before rendering, so the renderer only has to know one shape:
+#   {type, label, name, value, identifier, enabled, visible, hittable, rect, children}
+# `rect` is (x, y, width, height) in points or None when unusable/missing.
+
+# Cap the rendered tree by ELEMENT COUNT, not bytes — a screen can carry a huge
+# but info-dense tree, and a byte cap would truncate mid-element. The full
+# payload is always parsed first; only the rendered output is capped.
+_SOURCE_MAX_ELEMENTS = 400
+
+# "Content" roles are always rendered, even with an empty label, because they're
+# the elements an agent actually taps/reads. Pure containers (Other, Window,
+# Group, ...) are rendered only when they carry their own label/value/identifier
+# or are themselves interactive — otherwise they're collapsed and we recurse
+# straight into their children.
+_SOURCE_CONTENT_ROLES = {
+    "Button", "StaticText", "TextField", "SecureTextField", "TextView",
+    "Image", "Cell", "SearchField", "Switch", "Link", "Icon", "Key",
+}
+
+
+def _source_short_type(raw_type: str | None) -> str:
+    """Strip the "XCUIElementType" prefix XML tags/JSON `type` values carry."""
+    t = raw_type or "Other"
+    prefix = "XCUIElementType"
+    return t[len(prefix):] if t.startswith(prefix) else t
+
+
+def _source_bool(v: Any) -> bool | None:
+    """Normalize a WDA truthy field (XML string "true"/"false" or JSON bool) to
+    a real bool, or None when the field is absent/unrecognized."""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return None
+    if isinstance(v, str):
+        low = v.strip().lower()
+        if low in ("true", "1"):
+            return True
+        if low in ("false", "0"):
+            return False
+        return None
+    return bool(v)
+
+
+def _source_rect(x: Any, y: Any, w: Any, h: Any) -> tuple[float, float, float, float] | None:
+    try:
+        return (float(x), float(y), float(w), float(h))
+    except (TypeError, ValueError):
+        return None
+
+
+def _norm_source_xml(el: ET.Element) -> dict[str, Any]:
+    """Normalize one WDA XML element (and its subtree) into the internal node shape."""
+    a = el.attrib
+    return {
+        "type": a.get("type") or el.tag,
+        "label": a.get("label") or None,
+        "name": a.get("name") or None,
+        "value": a.get("value") or None,
+        "identifier": a.get("identifier") or None,
+        "enabled": _source_bool(a.get("enabled")),
+        "visible": _source_bool(a.get("visible")),
+        "hittable": _source_bool(a.get("hittable")),
+        "rect": _source_rect(a.get("x"), a.get("y"), a.get("width"), a.get("height")),
+        "children": [_norm_source_xml(c) for c in el],
+    }
+
+
+def _norm_source_json(d: dict) -> dict[str, Any] | None:
+    """Normalize one WDA JSON tree node (and its subtree) into the internal node
+    shape. Returns None for a malformed (non-dict) node so callers can skip it."""
+    if not isinstance(d, dict):
+        return None
+    rect_field = d.get("rect")
+    if isinstance(rect_field, dict):
+        rect = _source_rect(rect_field.get("x"), rect_field.get("y"),
+                            rect_field.get("width"), rect_field.get("height"))
+    else:
+        rect = _source_rect(d.get("x"), d.get("y"), d.get("width"), d.get("height"))
+    children = [n for n in (_norm_source_json(c) for c in d.get("children") or []) if n]
+    return {
+        "type": d.get("type") or "Other",
+        "label": d.get("label") or None,
+        "name": d.get("name") or None,
+        "value": d.get("value") or None,
+        "identifier": d.get("identifier") or None,
+        "enabled": _source_bool(d.get("isEnabled", d.get("enabled"))),
+        "visible": _source_bool(d.get("isVisible", d.get("visible"))),
+        "hittable": _source_bool(d.get("isHittable", d.get("hittable"))),
+        "rect": rect,
+        "children": children,
+    }
+
+
+def _fetch_source_json_tree() -> dict[str, Any] | None:
+    """Probe WDA's JSON source once. Returns a normalized root node, or None if
+    this WDA build doesn't support it (non-2xx, missing/non-dict `value`, or the
+    request itself blows up) so the caller falls back to XML. Never raises."""
+    try:
+        code, j = _req_tree("/source?format=json")
+    except Exception:
+        return None
+    if code >= 400:
+        return None
+    value = j.get("value")
+    if not isinstance(value, dict):
+        return None
+    return _norm_source_json(value)
+
+
+def _fetch_source_xml_tree() -> dict[str, Any]:
+    """Fetch and parse WDA's XML /source (the universally-supported form)."""
+    code, j = _req_tree("/source")
+    if code >= 400:
+        raise MCPToolError(f"WDA error (HTTP {code}) on /source: {j}",
+                            kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
+    src = j.get("value", "")
+    if not isinstance(src, str):
+        raise RuntimeError(f"WDA returned an unexpected /source payload: {j}")
+    return _norm_source_xml(ET.fromstring(src))
+
+
+def _fetch_source_tree() -> dict[str, Any]:
+    """Probe-and-fallback source acquisition (never assume WDA supports JSON)."""
+    return _fetch_source_json_tree() or _fetch_source_xml_tree()
+
+
+def _collect_source_elements(node: dict[str, Any], depth: int,
+                              out: list[tuple[int, dict[str, Any]]]) -> None:
+    """Walk the full normalized tree collecting the elements worth rendering
+    (content roles always; containers only when they carry info or are
+    interactive), in document order. Always recurses into children regardless
+    of whether `node` itself qualifies, so a collapsed container's meaningful
+    descendants are never lost."""
+    short = _source_short_type(node.get("type"))
+    has_info = any(node.get(f) for f in ("label", "name", "value", "identifier"))
+    interactive = node.get("enabled") is True or node.get("hittable") is True
+    if short in _SOURCE_CONTENT_ROLES or has_info or interactive:
+        out.append((depth, node))
+    for child in node.get("children") or []:
+        _collect_source_elements(child, depth + 1, out)
+
+
+def _render_source_line(depth: int, node: dict[str, Any],
+                        win_w: float, win_h: float) -> str:
+    short = _source_short_type(node.get("type"))
+    parts = [("  " * depth) + short]
+    for field, tag in (("label", "label"), ("name", "name"),
+                       ("value", "value"), ("identifier", "id")):
+        v = node.get(field)
+        if v:
+            parts.append(f'{tag}="{v}"')
+    flags = [name for name, v in (("enabled", node.get("enabled")),
+                                  ("visible", node.get("visible")),
+                                  ("hittable", node.get("hittable"))) if v is True]
+    if flags:
+        parts.append("[" + ",".join(flags) + "]")
+    rect = node.get("rect")
+    if rect and win_w and win_h:
+        x, y, w, h = rect
+        nx, ny, nw, nh = x / win_w, y / win_h, w / win_w, h / win_h
+        parts.append(f"norm=({nx:.3f},{ny:.3f},{nw:.3f},{nh:.3f})")
+    return " ".join(parts)
+
+
+def _render_source_text(root: dict[str, Any]) -> str:
+    """Render the normalized tree as one line per meaningful element: type,
+    whichever of label/name/value/identifier is present, interactivity flags,
+    and a normalized [0,1] frame (from `_win_size()`, so a stale 30s-cached
+    size or a mid-rotation call can skew the frame briefly — same caveat as
+    every other tool that reads it)."""
+    elements: list[tuple[int, dict[str, Any]]] = []
+    _collect_source_elements(root, 0, elements)
+    win_w, win_h = _win_size()
+    lines = ["# tap point = (x + w/2, y + h/2) in normalized [0,1] coords, "
+             "multiply by window size"]
+    total = len(elements)
+    for depth, node in elements[:_SOURCE_MAX_ELEMENTS]:
+        lines.append(_render_source_line(depth, node, win_w, win_h))
+    dropped = total - _SOURCE_MAX_ELEMENTS
+    if dropped > 0:
+        lines.append(f"… ({dropped} elements dropped; refine with a more specific screen)")
+    return "\n".join(lines)
 
 
 # ---- Read-only tools -----------------------------------------------------------
@@ -422,24 +826,36 @@ def _img_kind(data: bytes) -> tuple[str, str]:
     """Sniff image bytes -> (fastmcp_format, file_extension).
 
     WDA returns PNG by default and JPEG when a lower screenshot quality is
-    configured. Default to PNG on anything unrecognized so a screenshot that
-    came back always returns rather than erroring on an odd header.
+    configured. This is now STRICT: only a real JPEG SOI+marker prefix
+    (`\\xff\\xd8\\xff`) or the full 8-byte PNG magic
+    (`\\x89PNG\\r\\n\\x1a\\n`) is accepted. Anything else raises
+    MCPToolError instead of guessing.
+
+    This reverses the previous lenient design, which defaulted to
+    `("png", ".png")` for any unrecognized header on the theory that a
+    screenshot which came back should always return rather than erroring on
+    an odd header. In practice that swallowed real failures: an HTML error
+    page, an empty body, or a truncated payload from WDA would silently be
+    reported to the caller as a valid PNG. Failing loudly here surfaces
+    those cases instead of shipping garbage bytes labeled as an image.
     """
-    if data[:2] == b"\xff\xd8":
+    if data[:3] == b"\xff\xd8\xff":
         return "jpeg", ".jpg"
-    return "png", ".png"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png", ".png"
+    preview = data[:16].hex()
+    raise MCPToolError(
+        f"WDA's /screenshot response was not a recognizable image "
+        f"(likely an error page, empty body, or truncated payload from WDA). "
+        f"Got {len(data)} byte(s); first bytes: {preview}",
+        kind=ErrorKind.WDA_HTTP,
+        code="SCREENSHOT_NOT_IMAGE",
+    )
 
 
-@mcp.tool()
-def ios_screenshot() -> Image:
-    """Capture the iPhone's current screen. Returns a PNG by default. On a
-    physical device, IMIRROR_SCREENSHOT_QUALITY=1/2 makes WDA return smaller,
-    faster JPEG frames; the simulator always returns PNG.
-
-    Returns a full-resolution device screenshot. Needs no macOS Screen Recording
-    permission (the frame comes from WebDriverAgent, not a Mac screen capture).
-    Use it to see the device state before/after an action.
-    """
+def _screenshot_bytes_wda() -> bytes:
+    """Capture a screenshot over WDA. Used directly on a device, and as the
+    simulator's fallback when the simctl fast path fails."""
     # Ensure a session exists first so the screenshotQuality settings POST (in
     # _ensure_session) has run even when a screenshot is the very first tool call
     # of a session — otherwise the sessionless /screenshot route below returns a
@@ -450,7 +866,53 @@ def ios_screenshot() -> Image:
     b64 = j.get("value")
     if not b64:
         raise RuntimeError(f"No screenshot returned: {j}")
-    data = base64.b64decode(b64)
+    return base64.b64decode(b64)
+
+
+def _screenshot_bytes_simctl() -> bytes:
+    """Capture a screenshot via `simctl io booted screenshot`. Simulator-only,
+    session-free, and faster than the WDA round-trip. Raises RuntimeError (via
+    `_simctl`) or OSError on failure; callers should fall back to WDA."""
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        _simctl("io", "booted", "screenshot", path)
+        with open(path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+@mcp.tool()
+def ios_screenshot() -> Image:
+    """Capture the iPhone's current screen. Returns a PNG by default. On a
+    physical device, IMIRROR_SCREENSHOT_QUALITY=1/2 makes WDA return smaller,
+    faster JPEG frames; the simulator always returns PNG.
+
+    On the simulator, the screenshot is captured via `simctl io booted
+    screenshot` (session-free, faster than the WDA round-trip), falling back
+    to WDA if simctl is unavailable or fails. The device path is unchanged.
+
+    Returns a full-resolution device screenshot. Needs no macOS Screen Recording
+    permission (the frame comes from WebDriverAgent, not a Mac screen capture).
+    Use it to see the device state before/after an action.
+    """
+    if _IS_SIM:
+        try:
+            data = _screenshot_bytes_simctl()
+        except (RuntimeError, OSError):
+            # Deliberate graceful degradation: simctl is a fast path that can be
+            # unavailable (no xcrun, no booted sim, a transient simctl hiccup).
+            # WDA is already up on the simulator for gestures/AX, so fall back to
+            # it rather than failing the call outright. This is not swallowing a
+            # real error — the sim path never regresses below "as reliable as
+            # before this fast path existed."
+            data = _screenshot_bytes_wda()
+    else:
+        data = _screenshot_bytes_wda()
     fmt, ext = _img_kind(data)
     if _run["active"]:
         # Cap saved screenshots per run so a looping agent can't fill the disk
@@ -471,34 +933,191 @@ def ios_screenshot() -> Image:
 
 
 @mcp.tool()
-def ios_source() -> str:
-    """Get the accessibility hierarchy (XML) of the current screen.
+def ios_source(format: str = "text") -> str:
+    """Get the accessibility hierarchy of the current screen.
 
-    Useful for finding element labels/identifiers to drive ios_find_and_tap, or
-    for asserting that expected UI is present. The output can be large; prefer a
-    screenshot for a quick look and use this when you need exact element text.
+    Default (`format="text"`, NEW as of 1.1.0): a compact tree, one line per
+    meaningful element — type, whichever of label/name/value/identifier is
+    present, interactivity flags (enabled/visible/hittable, when known), and a
+    normalized [0,1] frame. The first line spells out the tap formula:
+    `tap point = (x + w/2, y + h/2) in normalized [0,1] coords, multiply by
+    window size` — multiply that point by ios_window_size() to get real tap
+    coordinates. Frames are computed against the cached window size (30s TTL,
+    invalidated by ios_orientation), so a size read right after a rotation can
+    be briefly stale. Pure containers (Other/Window/Group/...) are collapsed
+    unless they carry their own label/value/identifier or are interactive;
+    content elements (buttons, text, fields, images, cells, ...) always
+    appear, even with an empty label. Output is capped at 400 elements (by
+    count, not bytes — the full tree is always parsed first); a trailing line
+    reports how many were dropped, if any. This is far cheaper for an agent to
+    read than the raw XML — prefer it unless you need the exact raw markup.
+
+    `format="xml"` returns the raw WDA source string unchanged (today's
+    original behavior): hard-truncated at 20,000 characters with a
+    "… (truncated)" suffix, no element cap, no normalization.
+
+    Either mode is useful for finding element labels/identifiers to drive
+    ios_find_and_tap, or for asserting that expected UI is present.
     """
-    # /source is a sessionless WDA route. On a complex screen WDA can take far
-    # longer than a tap to serialise the whole tree (seen >15s, ~160 KB on a
-    # real device), so give it a generous timeout.
-    code, j = _req("GET", "/source", timeout=60)
-    if code >= 400:
-        raise RuntimeError(f"WDA error (HTTP {code}) on /source: {j}")
-    src = j.get("value", "")
-    if not isinstance(src, str):
-        src = json.dumps(src)
-    if len(src) > 20000:
-        src = src[:20000] + "\n… (truncated)"
-    return src
+    if format == "xml":
+        # /source is a sessionless WDA route. On a complex screen WDA can take
+        # far longer than a tap to serialise the whole tree (seen >15s, ~160 KB
+        # on a real device), so give it the TREE tier — and ride out one stall
+        # via _req_tree rather than fail the step outright.
+        code, j = _req_tree("/source")
+        if code >= 400:
+            raise MCPToolError(f"WDA error (HTTP {code}) on /source: {j}",
+                                kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
+        src = j.get("value", "")
+        if not isinstance(src, str):
+            src = json.dumps(src)
+        if len(src) > 20000:
+            src = src[:20000] + "\n… (truncated)"
+        return src
+    if format != "text":
+        raise MCPToolError(f"format must be 'text' or 'xml', got {format!r}",
+                            kind=ErrorKind.VALIDATION)
+    root = _fetch_source_tree()
+    return _render_source_text(root)
+
+
+# ---- ios_await_idle (screen-settle detection) -----------------------------------
+
+# Poll cadence for ios_await_idle. Deliberately not tied to _TIMEOUT_* — this is
+# the pause BETWEEN reads, not a request timeout.
+_IDLE_POLL_S = 0.4
+
+
+def _idle_fingerprint(root: dict[str, Any]) -> tuple:
+    """Cheap per-element signature for settle detection: short type + whichever
+    of label/value/identifier is present + frame rounded to ~1% of the screen
+    (2 decimal places of the normalized [0,1] coordinate). Reuses I1's element
+    walk (_collect_source_elements) so containers that don't carry their own
+    info are collapsed the same way ios_source collapses them. Two reads with
+    an identical fingerprint mean the visible structure hasn't changed."""
+    elements: list[tuple[int, dict[str, Any]]] = []
+    _collect_source_elements(root, 0, elements)
+    win_w, win_h = _win_size()
+    fp = []
+    for _, node in elements:
+        short = _source_short_type(node.get("type"))
+        label = node.get("label") or node.get("value") or node.get("identifier") or ""
+        rect = node.get("rect")
+        if rect and win_w and win_h:
+            x, y, w, h = rect
+            cell = (round(x / win_w, 2), round(y / win_h, 2),
+                    round(w / win_w, 2), round(h / win_h, 2))
+        else:
+            cell = None
+        fp.append((short, label, cell))
+    return tuple(fp)
+
+
+@mcp.tool()
+def ios_await_idle(timeout_s: float = 5.0, min_stable_ms: int = 600) -> str:
+    """Block until the screen's accessibility structure stops changing.
+
+    Polls a cheap fingerprint of the compact tree (element type + label/value/
+    identifier + frame, rounded to ~1% of the screen) roughly every 400ms.
+    "Settled" means the fingerprint held across two-or-more consecutive reads
+    spanning at least `min_stable_ms`. Use it after an action that starts a
+    transition (navigation, a network load, an animation) instead of a blind
+    sleep.
+
+    NEVER raises for a non-settle outcome — it always returns a JSON verdict
+    `{"verdict", "elapsed_s", "reads", "stable_ms"}`, where verdict is one of:
+      "settled"       — the fingerprint was stable across the whole observed
+                        window: either it held for min_stable_ms before
+                        timeout_s elapsed, or it simply never changed across
+                        every read taken (even if that span fell short of
+                        min_stable_ms — a screen that never moved is settled,
+                        not "still moving").
+      "still-moving"  — the fingerprint actually changed at least once and
+                        never re-stabilized before timeout_s elapsed.
+      "empty"         — the tree had no elements for the whole window (a blank
+                        screen, or a read that isn't returning content).
+      "too-few-reads" — timed out before enough reads landed to judge either
+                        way (e.g. reads are slow relative to timeout_s).
+    A genuine transport failure (WDA unreachable/wedged) still raises out of
+    this call — only "didn't settle in time" is swallowed into a verdict.
+
+    Read-only: does not take the gesture lock, so it's safe to call alongside
+    other read tools. Each poll is a full compact-tree read (the same heavy
+    /source call ios_source makes), so a long timeout_s here means real
+    device round-trips — call it deliberately, not in a tight loop.
+    """
+    start = time.monotonic()
+    deadline = start + max(0.0, timeout_s)
+    reads = 0
+    any_elements_seen = False
+    ever_changed = False
+    candidate_fp: tuple | None = None
+    candidate_ts: float | None = None
+    last_ts = start
+    while True:
+        ts = time.monotonic()
+        last_ts = ts
+        fp = _idle_fingerprint(_fetch_source_tree())
+        reads += 1
+        if fp:
+            any_elements_seen = True
+            if fp != candidate_fp:
+                if candidate_fp is not None:
+                    # A real change from one non-empty fingerprint to another
+                    # (not just the first read establishing a candidate).
+                    ever_changed = True
+                candidate_fp, candidate_ts = fp, ts
+            else:
+                stable_ms = (ts - candidate_ts) * 1000.0  # type: ignore[operator]
+                if stable_ms >= min_stable_ms:
+                    _record("await_idle", f"settled after {reads} read(s)", note="info",
+                            verdict={"kind": "idle", "reason": "settled"})
+                    return json.dumps({
+                        "verdict": "settled", "elapsed_s": round(ts - start, 3),
+                        "reads": reads, "stable_ms": round(stable_ms, 1),
+                    })
+        else:
+            candidate_fp, candidate_ts = None, None
+        if ts >= deadline:
+            break
+        time.sleep(_IDLE_POLL_S)
+    stable_ms = (last_ts - candidate_ts) * 1000.0 if candidate_ts is not None else 0.0
+    if reads < 2:
+        verdict = "too-few-reads"
+    elif not any_elements_seen:
+        verdict = "empty"
+    elif not ever_changed:
+        # The fingerprint held for the entire observation window — even
+        # though the span never reached min_stable_ms, it's still static,
+        # not animating. Report the real (shorter) observed stable span.
+        verdict = "settled"
+    else:
+        verdict = "still-moving"
+    # Idle verdicts always annotate the run, never fail it (see I8): recorded
+    # as an "info" note with the verdict kind fixed at "idle" so the report
+    # rollup (which only counts kind=="fail") never trips on a non-settle
+    # outcome.
+    _record("await_idle", f"{verdict} after {reads} read(s)", note="info",
+            verdict={"kind": "idle", "reason": verdict})
+    return json.dumps({
+        "verdict": verdict, "elapsed_s": round(last_ts - start, 3),
+        "reads": reads, "stable_ms": round(stable_ms, 1),
+    })
 
 
 # ---- Control tools -------------------------------------------------------------
 
 @mcp.tool()
-def ios_tap(x: float, y: float) -> str:
+@_recorded
+def ios_tap(x: float, y: float, settle_ms: int = 0) -> str:
     """Tap the screen at a point, in logical points (see ios_window_size).
 
     Origin is top-left. Example: center of a 430×932 portrait screen is (215, 466).
+
+    `settle_ms` is an optional fixed pause after the tap, for when a following
+    ios_screenshot / ios_source needs a stable frame (e.g. a tap that triggers a
+    quick transition animation). It is a blind sleep, not a real settle check —
+    to wait until the screen actually stops changing, use ios_await_idle instead.
     """
     _gesture([
         {"type": "pointerMove", "duration": 0, "x": x, "y": y},
@@ -506,11 +1125,14 @@ def ios_tap(x: float, y: float) -> str:
         {"type": "pause", "duration": 40},
         {"type": "pointerUp", "button": 0},
     ])
+    if settle_ms > 0:
+        time.sleep(settle_ms / 1000.0)
     _record("tap", f"({x}, {y})")
     return f"tapped ({x}, {y})"
 
 
 @mcp.tool()
+@_recorded
 def ios_swipe(from_x: float, from_y: float, to_x: float, to_y: float,
               duration_ms: int = 250, settle_ms: int = 0) -> str:
     """Swipe/drag from one point to another (logical points). Use for scrolling,
@@ -535,6 +1157,7 @@ def ios_swipe(from_x: float, from_y: float, to_x: float, to_y: float,
 
 
 @mcp.tool()
+@_recorded
 def ios_scroll(direction: str, distance_pct: float = 40, x_pct: float = 50,
                y_pct: float = 50, duration_ms: int = 300, settle_ms: int = 300) -> str:
     """Scroll the screen in a direction by a fraction of the screen.
@@ -558,6 +1181,7 @@ def ios_scroll(direction: str, distance_pct: float = 40, x_pct: float = 50,
 
 
 @mcp.tool()
+@_recorded
 def ios_scroll_to(text: str, direction: str = "down", max_swipes: int = 10,
                   distance_pct: float = 35, settle_ms: int = 350) -> str:
     """Scroll until an element with the given visible label/name/value is on screen.
@@ -571,21 +1195,32 @@ def ios_scroll_to(text: str, direction: str = "down", max_swipes: int = 10,
     cap = min(max_swipes, 20)
     if max_swipes > 20:
         _record("scroll_to", f"max_swipes {max_swipes} capped at 20")
+    any_clean = False
+    last_timeout_err: MCPToolError | None = None
     for n in range(cap + 1):
-        if _find_element(text):
-            _record("scroll_to", f"'{text}' {direction}: found after {n} swipe(s)")
-            return json.dumps({"found": True, "swipes": n})
+        eid, err = _find_element_or_timeout(text)
+        if err is not None:
+            last_timeout_err = err
+        else:
+            any_clean = True
+            if eid:
+                _record("scroll_to", f"'{text}' {direction}: found after {n} swipe(s)")
+                return json.dumps({"found": True, "swipes": n})
         if n == cap:
             break
         _scroll_once(direction, distance_pct, 50, 50, 300)
         time.sleep(settle_ms / 1000.0)
-    # Recorded as a "note" so the failure counts in the report's pass/fail rollup.
-    _record("note", f"scroll_to '{text}' {direction}: NOT found after {cap} swipes",
-            note="fail")
-    raise RuntimeError(f"Element '{text}' not found after {cap} swipes ({direction}).")
+    if last_timeout_err is not None and not any_clean:
+        raise last_timeout_err  # WDA was wedged for the whole search — say so
+    # The @_recorded decorator logs the fail step (with a structured verdict)
+    # when this raises, so the report's pass/fail rollup sees it without a
+    # manual note here.
+    raise MCPToolError(f"Element '{text}' not found after {cap} swipes ({direction}).",
+                        kind=ErrorKind.NOT_FOUND)
 
 
 @mcp.tool()
+@_recorded
 def ios_type(text: str) -> str:
     """Type text into the currently focused field. Tap a text field first.
 
@@ -597,6 +1232,7 @@ def ios_type(text: str) -> str:
 
 
 @mcp.tool()
+@_recorded
 def ios_press_button(name: str = "home") -> str:
     """Press a hardware button. name ∈ {home, volumeUp, volumeDown}.
 
@@ -615,7 +1251,8 @@ def ios_press_button(name: str = "home") -> str:
     if name == "home":
         code, j = _req("POST", "/wda/homescreen", {})
         if code >= 400:
-            raise RuntimeError(f"WDA error (HTTP {code}) pressing home: {j}")
+            raise MCPToolError(f"WDA error (HTTP {code}) pressing home: {j}",
+                                kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
     else:
         _session_post("/wda/pressButton", {"name": name})
     _record("press_button", name)
@@ -623,6 +1260,7 @@ def ios_press_button(name: str = "home") -> str:
 
 
 @mcp.tool()
+@_recorded
 def ios_find_and_tap(text: str, retries: int = 0, retry_delay_s: float = 0.5) -> str:
     """Find an on-screen element by its visible label/name and tap it.
 
@@ -633,39 +1271,77 @@ def ios_find_and_tap(text: str, retries: int = 0, retry_delay_s: float = 0.5) ->
     back to ios_source to inspect, or ios_tap with coordinates.
     """
     attempt = 0
+    any_clean = False
+    last_timeout_err: MCPToolError | None = None
     while True:
-        eid = _find_element(text)
-        if eid:
-            # The click leg goes through _session_post so a stale-session 404 retries
-            # and a WDA error raises — returning "tapped" on a failed click would mislead.
-            _session_post(f"/element/{eid}/click", {})
-            _record("find_and_tap", text)
-            return f"tapped element '{text}'"
+        eid, err = _find_element_or_timeout(text)
+        if err is not None:
+            last_timeout_err = err
+        else:
+            any_clean = True
+            if eid:
+                # The click leg goes through _session_post so a stale-session 404 retries
+                # and a WDA error raises — returning "tapped" on a failed click would mislead.
+                _session_post(f"/element/{eid}/click", {})
+                _record("find_and_tap", text)
+                return f"tapped element '{text}'"
         if attempt >= retries:
+            if last_timeout_err is not None and not any_clean:
+                raise last_timeout_err  # WDA was wedged for every attempt — say so
             raise RuntimeError(f"No element matching '{text}'. Use ios_source to inspect.")
         attempt += 1
         time.sleep(retry_delay_s)
 
 
 @mcp.tool()
+@_recorded
 def ios_wait_for(text: str, timeout_s: float = 10.0) -> str:
     """Wait until an element with the given visible label/name/value appears.
 
-    Polls the screen until a matching element is present or `timeout_s` elapses.
-    Use after an action that triggers a transition (navigation, a network load) so
-    later taps don't race the UI. Raises if the element never appears in time.
+    Polls the screen until a matching element is VISIBLE (not just present in
+    the tree) or `timeout_s` elapses, matching the first hit in reading order.
+    Use after an action that triggers a transition (navigation, a network load)
+    so later taps don't race the UI. Raises if the element never appears in
+    time — the error message appends a compact-tree snapshot of what was
+    actually on screen (first ~10 lines) so a loose selector is debuggable
+    without a follow-up ios_source call.
     """
     deadline = time.monotonic() + max(0.0, timeout_s)
     attempts = 0
+    any_clean = False
+    last_timeout_err: MCPToolError | None = None
     while True:
         attempts += 1
-        if _find_element(text):
-            _record("wait_for", f"'{text}' (found after {attempts} check(s))")
-            return f"found '{text}' after {attempts} check(s)"
+        eid, err = _find_element_or_timeout(text, visible_only=True)
+        if err is not None:
+            last_timeout_err = err
+        else:
+            any_clean = True
+            if eid:
+                _record("wait_for", f"'{text}' (found after {attempts} check(s))")
+                return f"found '{text}' after {attempts} check(s)"
         if time.monotonic() >= deadline:
-            raise RuntimeError(
-                f"'{text}' did not appear within {timeout_s}s. Use ios_source to inspect.")
+            if last_timeout_err is not None and not any_clean:
+                raise last_timeout_err  # WDA was wedged for every attempt — say so
+            raise MCPToolError(
+                f"'{text}' did not appear within {timeout_s}s.\n"
+                f"{_wait_for_timeout_snapshot()}", kind=ErrorKind.NOT_FOUND)
         time.sleep(0.5)
+
+
+def _wait_for_timeout_snapshot() -> str:
+    """Best-effort compact-tree snapshot for a timed-out ios_wait_for, so the
+    failure message quotes what was actually on screen instead of just "not
+    found". One extra heavy /source read, only ever taken on this failure
+    path — never on the polling hot path. If even this read fails (the same
+    wedged WDA that likely caused the timeout), fall back to the old plain
+    message rather than raising a different error."""
+    try:
+        root = _fetch_source_tree()
+        lines = _render_source_text(root).splitlines()[:10]
+        return "Current screen (first 10 lines):\n" + "\n".join(lines)
+    except Exception as e:
+        return f"(could not read current screen: {e})"
 
 
 @mcp.tool()
@@ -736,14 +1412,44 @@ def ios_open_url(url: str) -> str:
     return f"opened {url}"
 
 
+def _simctl_pbcopy(text: str) -> None:
+    """Set the simulator's clipboard via `simctl pbcopy booted`. Simulator-only,
+    session-free, and free of WDA's foreground caveat. Raises RuntimeError when
+    the current target isn't a simulator, when `xcrun` is missing, or when
+    simctl exits non-zero (surfacing its stderr); callers should fall back
+    to WDA."""
+    if not _IS_SIM:
+        raise RuntimeError("simctl tools require IMIRROR_TARGET=simulator.")
+    try:
+        r = subprocess.run(["xcrun", "simctl", "pbcopy", "booted"],
+                           input=text.encode(), capture_output=True, text=False)
+    except FileNotFoundError as e:
+        raise RuntimeError("`xcrun` not found — install the Xcode command-line tools.") from e
+    if r.returncode != 0:
+        stderr = (r.stderr or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError(f"simctl pbcopy failed: {stderr or r.returncode}")
+
+
 @mcp.tool()
 def ios_clipboard_set(text: str) -> str:
     """Set the device clipboard to `text`.
 
-    NOTE: iOS grants pasteboard access only while WebDriverAgent is foreground;
-    with another app in front this may be ignored — call after a WDA-owned screen
-    or expect a no-op.
+    On the simulator, the clipboard is set via `simctl pbcopy` (session-free,
+    no WDA-foreground caveat), falling back to WDA if simctl is unavailable or
+    fails. On a physical device, iOS grants pasteboard access only while
+    WebDriverAgent is foreground; with another app in front this may be
+    ignored — call after a WDA-owned screen or expect a no-op.
     """
+    if _IS_SIM:
+        try:
+            _simctl_pbcopy(text)
+            _record("clipboard_set", repr(text))
+            return f"set clipboard ({len(text)} chars)"
+        except (RuntimeError, OSError):
+            # Deliberate graceful degradation to WDA, not swallowing a real
+            # error — the sim path never regresses below "as reliable as
+            # before this fast path existed."
+            pass
     b64 = base64.b64encode(text.encode()).decode()
     _session_post("/wda/setPasteboard", {"content": b64, "contentType": "plaintext"})
     _record("clipboard_set", repr(text))
@@ -752,8 +1458,25 @@ def ios_clipboard_set(text: str) -> str:
 
 @mcp.tool()
 def ios_clipboard_get() -> str:
-    """Read the device clipboard (plaintext). Same foreground caveat as
-    ios_clipboard_set applies."""
+    """Read the device clipboard (plaintext).
+
+    On the simulator, the clipboard is read via `simctl pbpaste` (session-free,
+    no WDA-foreground caveat), falling back to WDA if simctl is unavailable or
+    fails. On a physical device, the same foreground caveat as
+    ios_clipboard_set applies.
+    """
+    if _IS_SIM:
+        try:
+            # strip=False: pbpaste's stdout IS the clipboard content verbatim —
+            # trailing newlines, indentation, and other meaningful whitespace
+            # must round-trip unchanged (unlike UDID/device-list callers, where
+            # _simctl's default strip=True is correct).
+            text = _simctl("pbpaste", "booted", strip=False)
+            _record("clipboard_get", f"{len(text)} chars")
+            return text
+        except (RuntimeError, OSError):
+            # Deliberate graceful degradation to WDA — see ios_clipboard_set.
+            pass
     j = _session_post("/wda/getPasteboard", {"contentType": "plaintext"})
     raw = j.get("value") or ""
     try:
@@ -833,11 +1556,16 @@ def _install_on_simulator(path: str) -> None:
 # dialog, and freeze the status bar for clean screenshots. simctl only ever talks
 # to simulators, so they require IMIRROR_TARGET=simulator and target `booted`.
 
-def _simctl(*args: str) -> str:
+def _simctl(*args: str, strip: bool = True) -> str:
     """Run `xcrun simctl <args>` and return stdout. Simulator-only.
 
     Raises a clear error when the current target isn't a simulator, when `xcrun`
     is missing, or when simctl exits non-zero (surfacing its stderr).
+
+    `strip` defaults to True (matching every existing caller — UDIDs, device
+    lists, and other structured output where surrounding whitespace is noise).
+    Pass `strip=False` for output where whitespace is meaningful, e.g.
+    clipboard content read via `pbpaste`.
     """
     if not _IS_SIM:
         raise RuntimeError("simctl tools require IMIRROR_TARGET=simulator.")
@@ -849,7 +1577,81 @@ def _simctl(*args: str) -> str:
     except subprocess.CalledProcessError as e:
         raise RuntimeError(
             f"simctl {args[0]} failed: {(e.stderr or '').strip() or e}") from e
-    return (r.stdout or "").strip()
+    out = r.stdout or ""
+    return out.strip() if strip else out
+
+
+def _start_sim_recording(run_dir: str) -> None:
+    """Best-effort: start `xcrun simctl io booted recordVideo` for this run.
+
+    Records into recording.mp4 inside `run_dir` until _stop_sim_recording sends
+    SIGINT. Simulator-only, and never allowed to fail the run: xcrun missing,
+    a simulator that rejects the command, or any other error just leaves the
+    run without a recording (ios_finish_run then falls back to the ffmpeg
+    timelapse) rather than raising.
+    """
+    path = os.path.join(run_dir, "recording.mp4")
+    with _recorder_lock:
+        try:
+            proc = subprocess.Popen(
+                ["xcrun", "simctl", "io", "booted", "recordVideo",
+                 "--codec=h264", "--force", path],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                # DEVNULL, not PIPE: nothing ever reads this pipe, and a long
+                # run can fill the ~64KB stderr buffer and block the child,
+                # stalling the recording.
+                stderr=subprocess.DEVNULL)
+        except Exception:
+            _run["recorder"] = None
+            _run["recording"] = None
+            return
+        _run["recorder"] = proc
+        _run["recording"] = path
+
+
+def _stop_sim_recording() -> tuple[str | None, str]:
+    """Stop any in-flight simulator recording started by _start_sim_recording.
+
+    `recordVideo` only finalizes its mp4 on SIGINT (a kill leaves a broken
+    file), so this signals it and waits up to ~10s; a process that won't die
+    in time is killed and the clip is flagged as possibly incomplete.
+
+    Returns (basename, note) — a bare filename like _make_timelapse's clip
+    return, since ios_finish_run treats the two interchangeably and
+    _render_report embeds the clip as a path relative to report.html in the
+    same run directory. (None, "") when no recorder was running; (None,
+    reason) when one ran but produced no usable file.
+    """
+    with _recorder_lock:
+        proc = _run.get("recorder")
+        path = _run.get("recording")
+        if proc is None:
+            _run["recorder"] = None
+            _run["recording"] = None
+            return None, ""
+        note = ""
+        try:
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            note = "recording stop timed out; clip may be incomplete"
+        except Exception:
+            pass
+        _run["recorder"] = None
+        _run["recording"] = None
+    if path and os.path.exists(path) and os.path.getsize(path) > 0:
+        return os.path.basename(path), note
+    return None, note or "recording skipped: no output produced"
+
+
+# Best-effort cleanup so a server exit (normal exit, sys.exit, an unhandled
+# exception, or a client disconnect) between ios_start_run and ios_finish_run
+# doesn't leave the recordVideo child running and writing forever. This can
+# only catch orderly interpreter shutdown — a hard SIGKILL of the server
+# process still leaves the recorder orphaned, same as any other atexit hook.
+atexit.register(_stop_sim_recording)
 
 
 @mcp.tool()
@@ -952,8 +1754,21 @@ def ios_start_run(label: str = "test") -> str:
         device, ios_ver = v.get("device"), v.get("os", {}).get("version")
     except Exception:
         pass
-    _run.update(active=True, dir=run_dir, label=label, started=time.time(),
-                device=device, ios=ios_ver, steps=[], cap_noted=False)
+    # Hold the recorder lock across the whole stop -> reset -> start handoff so
+    # a concurrent ios_start_run can't interleave and orphan a recorder handle
+    # (one thread's reset overwriting another's just-set recorder with no
+    # reference left to kill it). A replaced run must not leak the previous
+    # run's recorder process, so stop it (discarding the clip) before
+    # resetting state for the new run.
+    with _recorder_lock:
+        _stop_sim_recording()
+        _run.update(active=True, dir=run_dir, label=label, started=time.time(),
+                    device=device, ios=ios_ver, steps=[], cap_noted=False,
+                    recorder=None, recording=None)
+        if _IS_SIM:
+            # Best-effort: a failed recorder start must never fail the run or
+            # change what's returned here (see _start_sim_recording).
+            _start_sim_recording(run_dir)
     return f"{warn}recording run '{label}' -> {run_dir}"
 
 
@@ -969,7 +1784,8 @@ def ios_run_note(text: str, status: str = "info") -> str:
         raise RuntimeError("No active run. Call ios_start_run first.")
     status = status.lower()
     if status not in {"info", "pass", "fail"}:
-        raise RuntimeError("status must be one of info / pass / fail")
+        raise MCPToolError("status must be one of info / pass / fail",
+                            kind=ErrorKind.VALIDATION)
     _record("note", detail=text, note=status)
     return f"noted ({status}): {text}"
 
@@ -999,12 +1815,16 @@ def ios_finish_run(video: str = "gif") -> str:
     report.html in the run directory and returns its path. Stops recording. Raises
     if no run is active.
 
-    `video` stitches the run's screenshots into a looping timelapse shown at the
-    top of the report: "gif" (default), "mp4", or "none". Needs ffmpeg on PATH and
-    at least two screenshots; if either is missing the report is still written, with
-    a note that the timelapse was skipped. The clip is saved beside report.html
-    (so a video-bearing report is a folder, not a single file); screenshots stay
-    embedded in the HTML regardless.
+    `video` controls the clip shown at the top of the report: "gif" (default),
+    "mp4", or "none". On the simulator this is a real continuous screen
+    recording captured via `xcrun simctl io recordVideo` while the run was
+    active; if that recording is missing (e.g. xcrun unavailable), it falls
+    back to stitching the run's screenshots into a timelapse with ffmpeg, same
+    as on a physical device. The timelapse fallback needs ffmpeg on PATH and
+    at least two screenshots; if either is missing the report is still
+    written, with a note that the clip was skipped. The clip is saved beside
+    report.html (so a video-bearing report is a folder, not a single file);
+    screenshots stay embedded in the HTML regardless.
     """
     if not _run["active"]:
         raise RuntimeError("No active run. Call ios_start_run first.")
@@ -1015,7 +1835,18 @@ def ios_finish_run(video: str = "gif") -> str:
     # appending to a run the caller believes is finished. Steps stay in memory, so a
     # failed write can still be retried out-of-band.
     try:
-        clip, clip_note = _make_timelapse(video)
+        if _IS_SIM:
+            # Always stop the recorder (even for video="none") so it doesn't
+            # keep running past the end of the run.
+            rec_clip, rec_note = _stop_sim_recording()
+            if video == "none":
+                clip, clip_note = None, ""
+            elif rec_clip is not None:
+                clip, clip_note = rec_clip, (rec_note or "screen recording (simulator)")
+            else:
+                clip, clip_note = _make_timelapse(video)
+        else:
+            clip, clip_note = _make_timelapse(video)
         path = os.path.join(_run["dir"], "report.html")
         with open(path, "w", encoding="utf-8") as f:
             f.write(_render_report(ended=time.time(), clip=clip, clip_note=clip_note))
@@ -1025,43 +1856,221 @@ def ios_finish_run(video: str = "gif") -> str:
 
 
 @mcp.tool()
+@_recorded
 def ios_assert_visible(text: str, timeout_s: float = 5.0) -> str:
     """Assert an element with the given visible label/name/value is present.
 
-    Polls up to `timeout_s`. Records a PASS note on success or a FAIL note on
-    timeout (so it lands in the report's pass/fail rollup), then raises on failure.
+    Polls up to `timeout_s`. Records a PASS note on success; on timeout the
+    @_recorded decorator logs the fail step (with a structured verdict) when
+    this raises. Raises on failure.
     """
     deadline = time.monotonic() + max(0.0, timeout_s)
     attempts = 0
+    any_clean = False
+    last_timeout_err: MCPToolError | None = None
     while True:
         attempts += 1
-        if _find_element(text):
-            _record("note", f"assert visible '{text}' (after {attempts} check(s))", note="pass")
-            return f"PASS: '{text}' is visible"
+        eid, err = _find_element_or_timeout(text)
+        if err is not None:
+            last_timeout_err = err
+        else:
+            any_clean = True
+            if eid:
+                _record("note", f"assert visible '{text}' (after {attempts} check(s))", note="pass")
+                return f"PASS: '{text}' is visible"
         if time.monotonic() >= deadline:
-            _record("note", f"assert visible '{text}' — NOT found within {timeout_s}s", note="fail")
-            raise RuntimeError(f"ASSERT FAILED: '{text}' not visible within {timeout_s}s.")
+            if last_timeout_err is not None and not any_clean:
+                raise last_timeout_err  # WDA was wedged for every attempt — say so
+            raise MCPToolError(f"ASSERT FAILED: '{text}' not visible within {timeout_s}s.",
+                                kind=ErrorKind.NOT_FOUND)
         time.sleep(0.5)
 
 
 @mcp.tool()
+@_recorded
 def ios_assert_not_visible(text: str, timeout_s: float = 3.0) -> str:
     """Assert an element with the given text is ABSENT (waits until it's gone).
 
-    Polls up to `timeout_s` for the element to disappear. Records PASS/FAIL note
-    like ios_assert_visible, then raises on failure.
+    Polls up to `timeout_s` for the element to disappear. Records a PASS note
+    on success; on timeout the @_recorded decorator logs the fail step (with
+    a structured verdict) when this raises. Raises on failure.
     """
     deadline = time.monotonic() + max(0.0, timeout_s)
     attempts = 0
+    any_clean = False
+    last_timeout_err: MCPToolError | None = None
     while True:
         attempts += 1
-        if not _find_element(text):
-            _record("note", f"assert not-visible '{text}' (after {attempts} check(s))", note="pass")
-            return f"PASS: '{text}' is not visible"
+        eid, err = _find_element_or_timeout(text)
+        if err is not None:
+            last_timeout_err = err
+        else:
+            any_clean = True
+            if not eid:
+                _record("note", f"assert not-visible '{text}' (after {attempts} check(s))", note="pass")
+                return f"PASS: '{text}' is not visible"
         if time.monotonic() >= deadline:
-            _record("note", f"assert not-visible '{text}' — still present after {timeout_s}s", note="fail")
-            raise RuntimeError(f"ASSERT FAILED: '{text}' still visible after {timeout_s}s.")
+            if last_timeout_err is not None and not any_clean:
+                raise last_timeout_err  # WDA was wedged for every attempt — say so
+            raise MCPToolError(f"ASSERT FAILED: '{text}' still visible after {timeout_s}s.",
+                                kind=ErrorKind.NOT_FOUND)
         time.sleep(0.5)
+
+
+# ---- ios_run_sequence -----------------------------------------------------------
+
+# Allowlisted step actions for ios_run_sequence. Each entry names the existing
+# tool it dispatches to, plus the required/optional params it accepts (as
+# type tuples for a basic isinstance check). The callable is a lambda that
+# looks `ios_*` up by name at call time (not a direct function reference) so
+# monkeypatching the tool function (as tests already do for the single-step
+# tools) also takes effect when it runs inside a sequence.
+_SEQ_ACTIONS: dict[str, dict[str, Any]] = {
+    "tap": {
+        "fn": lambda **kw: ios_tap(**kw),
+        "required": {"x": (int, float), "y": (int, float)},
+        "optional": {"settle_ms": (int,)},
+    },
+    "swipe": {
+        "fn": lambda **kw: ios_swipe(**kw),
+        "required": {"from_x": (int, float), "from_y": (int, float),
+                     "to_x": (int, float), "to_y": (int, float)},
+        "optional": {"duration_ms": (int,), "settle_ms": (int,)},
+    },
+    "scroll": {
+        "fn": lambda **kw: ios_scroll(**kw),
+        "required": {"direction": (str,)},
+        "optional": {"distance_pct": (int, float), "x_pct": (int, float),
+                     "y_pct": (int, float), "settle_ms": (int,)},
+    },
+    "scroll_to": {
+        "fn": lambda **kw: ios_scroll_to(**kw),
+        "required": {"text": (str,)},
+        "optional": {"direction": (str,), "max_swipes": (int,),
+                     "distance_pct": (int, float), "settle_ms": (int,)},
+    },
+    "type": {
+        "fn": lambda **kw: ios_type(**kw),
+        "required": {"text": (str,)},
+        "optional": {},
+    },
+    "press_button": {
+        "fn": lambda **kw: ios_press_button(**kw),
+        "required": {},
+        "optional": {"name": (str,)},
+    },
+    "find_and_tap": {
+        "fn": lambda **kw: ios_find_and_tap(**kw),
+        "required": {"text": (str,)},
+        "optional": {"retries": (int,), "retry_delay_s": (int, float)},
+    },
+    "wait_for": {
+        "fn": lambda **kw: ios_wait_for(**kw),
+        "required": {"text": (str,)},
+        "optional": {"timeout_s": (int, float)},
+    },
+    "assert_visible": {
+        "fn": lambda **kw: ios_assert_visible(**kw),
+        "required": {"text": (str,)},
+        "optional": {"timeout_s": (int, float)},
+    },
+    "assert_not_visible": {
+        "fn": lambda **kw: ios_assert_not_visible(**kw),
+        "required": {"text": (str,)},
+        "optional": {"timeout_s": (int, float)},
+    },
+}
+
+
+def _validate_seq_step(i: int, step: Any) -> None:
+    """Raise RuntimeError naming step `i` (1-based) if it isn't a well-formed
+    sequence step. Checks: step is an object, action is allowlisted, every
+    required param is present with a plausible type, every optional param
+    present has a plausible type, and no unexpected params are carried."""
+    if not isinstance(step, dict):
+        raise MCPToolError(f"step {i}: expected an object, got {type(step).__name__}",
+                            kind=ErrorKind.VALIDATION)
+    action = step.get("action")
+    if action not in _SEQ_ACTIONS:
+        raise MCPToolError(
+            f"step {i}: unknown action {action!r} (allowed: {sorted(_SEQ_ACTIONS)})",
+            kind=ErrorKind.VALIDATION)
+    spec = _SEQ_ACTIONS[action]
+    for name, types in spec["required"].items():
+        if name not in step:
+            raise MCPToolError(f"step {i} ({action}): missing required param '{name}'",
+                                kind=ErrorKind.VALIDATION)
+        if not isinstance(step[name], types):
+            raise MCPToolError(
+                f"step {i} ({action}): param '{name}' must be {types}, "
+                f"got {type(step[name]).__name__}", kind=ErrorKind.VALIDATION)
+    for name, types in spec["optional"].items():
+        if name in step and not isinstance(step[name], types):
+            raise MCPToolError(
+                f"step {i} ({action}): param '{name}' must be {types}, "
+                f"got {type(step[name]).__name__}", kind=ErrorKind.VALIDATION)
+    allowed_params = set(spec["required"]) | set(spec["optional"])
+    extra = set(step) - allowed_params - {"action"}
+    if extra:
+        raise MCPToolError(f"step {i} ({action}): unexpected param(s) {sorted(extra)}",
+                            kind=ErrorKind.VALIDATION)
+
+
+@mcp.tool()
+@_recorded
+def ios_run_sequence(steps: list[dict]) -> str:
+    """Run a batch of interaction steps in one call, stopping at the first failure.
+
+    Each step is an object `{"action": <name>, ...params}`. Allowed actions:
+    tap (x, y); swipe (from_x, from_y, to_x, to_y, optional duration_ms/
+    settle_ms); scroll (direction, optional distance_pct/x_pct/y_pct/
+    settle_ms); scroll_to (text, optional direction/max_swipes/distance_pct/
+    settle_ms); type (text); press_button (optional name); find_and_tap (text,
+    optional retries/retry_delay_s); wait_for (text, optional timeout_s);
+    assert_visible (text, optional timeout_s); assert_not_visible (text,
+    optional timeout_s). Each action dispatches straight to the matching
+    ios_* tool, so a step behaves exactly like calling that tool on its own —
+    including its own recording when a run is active. This tool never records
+    or screenshots on top of that; it only reports the per-step outcome.
+
+    ALL steps are validated (unknown action, missing or mistyped params,
+    unexpected params) before step 1 runs. If any step is invalid, this
+    raises naming the offending step (1-based) and no step is executed — a
+    typo in step 5 must not leave the device mid-flow. Once running, a step
+    that raises (a failed wait_for/assert_*, or any tool error) stops the
+    sequence; later steps are not run.
+
+    Returns a JSON string: {"ok", "ran", "total", "steps": [{"i", "action",
+    "status": "pass"|"fail", "detail" (on pass) | "error" (on fail)}, ...]}.
+    `ok` is true only if every step ran and passed.
+
+    NOT atomic across concurrent agents: only individual gestures are
+    serialized (via the existing per-gesture lock), not the sequence as a
+    whole, so a multi-second wait_for/assert_* inside it can interleave with
+    another agent's action between steps. This is meant for single-agent
+    scripted flows, not for holding the device off-limits to others while it
+    runs.
+    """
+    if not isinstance(steps, list) or not steps:
+        raise MCPToolError("steps must be a non-empty list", kind=ErrorKind.VALIDATION)
+    for i, step in enumerate(steps, start=1):
+        _validate_seq_step(i, step)
+
+    results: list[dict[str, Any]] = []
+    ok = True
+    ran = 0
+    for i, step in enumerate(steps, start=1):
+        action = step["action"]
+        kwargs = {k: v for k, v in step.items() if k != "action"}
+        ran = i
+        try:
+            detail = _SEQ_ACTIONS[action]["fn"](**kwargs)
+            results.append({"i": i, "action": action, "status": "pass", "detail": detail})
+        except Exception as e:
+            results.append({"i": i, "action": action, "status": "fail", "error": str(e)})
+            ok = False
+            break
+    return json.dumps({"ok": ok, "ran": ran, "total": len(steps), "steps": results})
 
 
 def _make_timelapse(fmt: str) -> tuple[str | None, str]:
@@ -1190,13 +2199,30 @@ def _render_step(s: dict, started: float) -> str:
     if s["action"] == "note":
         cls = {"pass": "ok", "fail": "bad"}.get(s["note"], "info")
         badge = f'<span class="badge {cls}">{html.escape(s["note"])}</span>'
+    verdict_html = ""
+    v = s.get("verdict")
+    if v:
+        kind = v.get("kind", "")
+        if not badge:
+            cls = {"fail": "bad", "pass": "ok"}.get(kind, "info")
+            badge = f'<span class="badge {cls}">{html.escape(str(kind))}</span>'
+        parts = []
+        reason = v.get("reason")
+        if reason:
+            parts.append(html.escape(str(reason)))
+        if v.get("error_kind"):
+            parts.append(f"error_kind={html.escape(str(v['error_kind']))}")
+        if v.get("error_code"):
+            parts.append(f"error_code={html.escape(str(v['error_code']))}")
+        if parts:
+            verdict_html = f'<div class="verdict">{" · ".join(parts)}</div>'
     img = _screenshot_img(s["screenshot"], f'step {s["i"]}') if s["screenshot"] else ""
     return (
         f'<div class="step" id="step-{s["i"]}">'
         f'<div class="meta"><span class="i">#{s["i"]}</span>'
         f'<span class="act">{html.escape(s["action"])}</span>'
         f'<span class="off">+{off:.1f}s</span>{badge}</div>'
-        f'<div class="detail">{html.escape(s["detail"])}</div>{img}</div>'
+        f'<div class="detail">{html.escape(s["detail"])}</div>{verdict_html}{img}</div>'
     )
 
 
@@ -1220,7 +2246,7 @@ def _split_sections(steps: list[dict]) -> list[dict]:
         cur["steps"].append(s)
         if s["action"] == "note" and s["note"] == "pass":
             cur["passes"] += 1
-        elif s["action"] == "note" and s["note"] == "fail":
+        elif _step_is_fail(s):
             cur["fails"] += 1
     return sections
 
@@ -1228,7 +2254,12 @@ def _split_sections(steps: list[dict]) -> list[dict]:
 def _render_report(ended: float, clip: str | None = None, clip_note: str = "") -> str:
     steps = _run["steps"]
     started = _run["started"] or ended
-    fails = sum(1 for s in steps if s["action"] == "note" and s["note"] == "fail")
+    # Rollup semantics (I8): counts a legacy note="fail" step AND a step with a
+    # structured fail verdict (auto-recorded by @_recorded on a raise). This is
+    # an intentional, non-backward-compatible change to the rollup — a report
+    # that previously showed PASS because a raised failure went unrecorded now
+    # shows FAIL. An "idle" verdict from ios_await_idle never counts here.
+    fails = sum(1 for s in steps if _step_is_fail(s))
     passes = sum(1 for s in steps if s["action"] == "note" and s["note"] == "pass")
     shots = sum(1 for s in steps if s["screenshot"])
     action_steps = sum(1 for s in steps if s["action"] != "section")
@@ -1273,7 +2304,7 @@ def _render_report(ended: float, clip: str | None = None, clip_note: str = "") -
         items = []
         for n, sec in enumerate(sections, 1):
             for s in sec["steps"]:
-                if s["action"] == "note" and s["note"] == "fail":
+                if _step_is_fail(s):
                     items.append(
                         f'<li><a href="#step-{s["i"]}">'
                         f'<span class="fp-sec">{html.escape(sec["title"])}</span>'
@@ -1425,6 +2456,7 @@ _REPORT_CSS = """
   .off { margin-left:auto; font-variant-numeric:tabular-nums; }
   .detail { margin:6px 0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace;
             font-size:13px; word-break:break-word; }
+  .verdict { margin:0 0 6px; color:var(--muted); font-size:12px; word-break:break-word; }
   .shot { margin-top:8px; max-width:100%; border-radius:8px; border:1px solid #0002;
           display:block; }
   .missing { color:var(--bad); font-size:13px; }
