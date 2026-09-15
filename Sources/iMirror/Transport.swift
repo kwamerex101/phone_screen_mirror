@@ -61,15 +61,19 @@ final class ManagedProcess {
     private let workDir: URL
     private var process: Process?
     private var stopped = false
-    // `stopped`/`process` are touched from the caller's thread, the spawn-delay
-    // queue, AND Process.terminationHandler's private queue — guard every access.
+    // `stopped`/`process`/`generation`/`readySeen`/`killedUnready` are touched
+    // from the caller's thread, the spawn-delay queue, the readiness-poll queue,
+    // AND Process.terminationHandler's private queue — guard every access.
     private let lock = NSLock()
 
     // Circuit breaker: a child that can never start (bad signing, unsupported
     // iOS) would otherwise crash-loop at `restartDelay` forever. Count quick
     // deaths; back off exponentially, and after `maxQuickFailures` give up so the
     // app's slower chain-level watchdog takes over instead of a tight spin.
-    private var spawnedAt: Date?
+    // Monotonic (systemUptime, never Date()) and read/written only inside
+    // `lock`, matching the readiness-poll code, so `ranFor` below can't tear
+    // or get skewed by a Mac sleep between spawn and exit.
+    private var spawnedAt: TimeInterval?
     private var consecutiveFailures = 0
     private let maxQuickFailures = 8
     // A child that stayed up at least this long was healthy — a later exit is a
@@ -81,12 +85,36 @@ final class ManagedProcess {
     /// instead of the channel silently looping on red.
     var onGaveUp: ((String) -> Void)?
 
-    init(binary: URL, args: [String], label: String, restartDelay: TimeInterval, workDir: URL) {
+    // Readiness deadline: a wedged `runwda` never exits, so the exit-triggered
+    // respawn above never fires for it. If a readiness check is supplied, poll it
+    // after spawn and SIGKILL the child if it never reports ready within
+    // `readyWithin`, so the existing termination handler respawns it anyway.
+    private let readinessCheck: (() -> Bool)?
+    private let readyWithin: TimeInterval
+    // Production cadence is 2s so an idle readiness check (typically an HTTP
+    // probe) doesn't spin. Tests inject a much shorter interval to exercise the
+    // deadline without a multi-second sleep per case.
+    private let readinessPollInterval: TimeInterval
+    // Bumped on every spawn so a readiness poll from a previous spawn can never
+    // act on (or kill) a newer process.
+    private var generation = 0
+    private var readySeen = false
+    // Set right before a readiness-deadline kill and consumed by the termination
+    // handler for that same spawn, so the failure counter can tell a wedge apart
+    // from a normal exit — see the termination handler below.
+    private var killedUnready = false
+
+    init(binary: URL, args: [String], label: String, restartDelay: TimeInterval, workDir: URL,
+         readinessCheck: (() -> Bool)? = nil, readyWithin: TimeInterval = 0,
+         readinessPollInterval: TimeInterval = 2) {
         self.binary = binary
         self.args = args
         self.label = label
         self.restartDelay = restartDelay
         self.workDir = workDir
+        self.readinessCheck = readinessCheck
+        self.readyWithin = readyWithin
+        self.readinessPollInterval = readinessPollInterval
     }
 
     private var isStopped: Bool {
@@ -94,8 +122,18 @@ final class ManagedProcess {
         return stopped
     }
 
+    /// The pid of the currently running spawn, if any. Test-only introspection.
+    var currentPidForTesting: pid_t? {
+        lock.lock(); defer { lock.unlock() }
+        return process?.isRunning == true ? process?.processIdentifier : nil
+    }
+
     func start() {
-        lock.lock(); stopped = false; consecutiveFailures = 0; lock.unlock()
+        lock.lock()
+        stopped = false
+        consecutiveFailures = 0
+        killedUnready = false
+        lock.unlock()
         spawn()
     }
 
@@ -124,6 +162,52 @@ final class ManagedProcess {
         NSLog("iMirror: bouncing \(label)")
         lock.lock(); let p = process; lock.unlock()
         p?.terminate()
+        // terminate() only sends SIGTERM; a wedged child ignores it and would
+        // never actually bounce. Escalate to SIGKILL shortly after if it's still
+        // running, off the caller's thread, same pattern as stop().
+        if let p {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            }
+        }
+    }
+
+    /// Poll `readinessCheck` for the spawn identified by `myGeneration`, killing
+    /// its process if it never reports ready within `readyWithin`. Stops on its
+    /// own once ready, once a newer spawn replaces this one, or once stopped.
+    private func scheduleReadinessPoll(process p: Process, generation myGeneration: Int,
+                                       start: TimeInterval, check: @escaping () -> Bool) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + readinessPollInterval) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let stillCurrent = self.generation == myGeneration && !self.stopped
+            self.lock.unlock()
+            guard stillCurrent else { return }
+
+            if check() {
+                self.lock.lock()
+                if self.generation == myGeneration { self.readySeen = true }
+                self.lock.unlock()
+                return   // ready — poll is done
+            }
+
+            // Monotonic clock: ProcessInfo.systemUptime, never Date(), so a Mac
+            // sleep between polls can't skew the elapsed time and trigger a
+            // spurious kill right after wake.
+            let uptime = ProcessInfo.processInfo.systemUptime - start
+            self.lock.lock()
+            let shouldKill = self.generation == myGeneration && !self.stopped
+                && managedProcessShouldKillForUnreadiness(uptime: uptime, readySeen: self.readySeen, readyWithin: self.readyWithin)
+            if shouldKill { self.killedUnready = true }
+            self.lock.unlock()
+
+            if shouldKill {
+                NSLog("iMirror: \(self.label) not ready within \(Int(self.readyWithin))s — killing")
+                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+                return
+            }
+            self.scheduleReadinessPoll(process: p, generation: myGeneration, start: start, check: check)
+        }
     }
 
     private func spawn() {
@@ -147,10 +231,21 @@ final class ManagedProcess {
             p.standardError = FileHandle.nullDevice
         }
         p.terminationHandler = { [weak self] _ in
-            guard let self, !self.isStopped else { return }
-            let ranFor = self.spawnedAt.map { Date().timeIntervalSince($0) } ?? 0
+            guard let self else { return }
             self.lock.lock()
-            if ranFor >= self.healthyRuntimeSec {
+            guard !self.stopped else { self.lock.unlock(); return }
+            // F8: read alongside the other spawn-generation state, under the
+            // same lock, instead of racing the wall clock outside it.
+            let ranFor = self.spawnedAt.map { ProcessInfo.processInfo.systemUptime - $0 } ?? 0
+            let wasKilledUnready = self.killedUnready
+            self.killedUnready = false
+            if wasKilledUnready {
+                // A readiness-deadline kill is a failed launch no matter how long
+                // the wedged process happened to sit there — it never actually
+                // served WDA, so it must NOT reset the streak like a healthy exit
+                // would, or a permanent wedge would never trip the give-up breaker.
+                self.consecutiveFailures += 1
+            } else if ranFor >= self.healthyRuntimeSec {
                 self.consecutiveFailures = 0        // was healthy; this is a normal drop
             } else {
                 self.consecutiveFailures += 1       // died fast; likely a failed launch
@@ -178,8 +273,31 @@ final class ManagedProcess {
         }
         do {
             try p.run()
-            lock.lock(); process = p; spawnedAt = Date(); lock.unlock()
+            lock.lock()
+            if stopped {
+                // stop() landed between p.run() succeeding and this lock —
+                // no handle was ever assigned for this spawn, so stop()'s
+                // own terminate()/SIGKILL never reached it. Tear it down
+                // ourselves here instead of leaving it running, orphaned.
+                lock.unlock()
+                p.terminationHandler = nil
+                p.terminate()
+                DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+                    if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+                }
+                return
+            }
+            process = p
+            spawnedAt = ProcessInfo.processInfo.systemUptime
+            generation += 1
+            let myGeneration = generation
+            readySeen = false
+            lock.unlock()
             NSLog("iMirror: started \(label) (pid \(p.processIdentifier))")
+            if let readinessCheck, readyWithin > 0 {
+                scheduleReadinessPoll(process: p, generation: myGeneration,
+                                      start: ProcessInfo.processInfo.systemUptime, check: readinessCheck)
+            }
         } catch {
             NSLog("iMirror: failed to start \(label): \(error.localizedDescription)")
         }
@@ -251,6 +369,15 @@ final class Transport {
     private var forward: ManagedProcess?
     private var mjpegForward: ManagedProcess?
 
+    // F7: one shared session for the readiness poll, reused for the app's
+    // whole lifetime, instead of a fresh `URLSession` (and its background
+    // threads) per probe — the poll fires every ~2s while runwda is booting.
+    private let readinessSession: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.waitsForConnectivity = false
+        return URLSession(configuration: cfg)
+    }()
+
     /// Set by the app to surface a terminal state when the WDA runner can't be
     /// started at all (bad signing / unsupported device) — invoked on the main
     /// thread. Distinct from a transient drop, which self-heals silently.
@@ -259,6 +386,14 @@ final class Transport {
     /// Set by the app to reflect the runner check/install (progress + outcome) in
     /// the UI. Invoked on the main thread.
     var onRunnerInstall: ((RunnerInstallEvent) -> Void)?
+
+    /// Set by the app to seed the chain-recovery ladder's clock at the point
+    /// `runwda` actually starts — after the tunnel is ready and the runner
+    /// install has finished — rather than at automation-on, which would
+    /// count tunnel/install time against WDA's own boot grace. Invoked on
+    /// the main thread once per chain bring-up (the initial `start()` and
+    /// each `restartChain()`).
+    var onRunwdaStarted: (() -> Void)?
 
     private func emitInstall(_ event: RunnerInstallEvent) {
         guard let cb = onRunnerInstall else { return }
@@ -280,6 +415,7 @@ final class Transport {
     var canSelfManage: Bool { goios != nil }
 
     func start() {
+        chainGeneration += 1   // F5: a fresh bring-up supersedes any prior one
         do { try relay.start() }
         catch { NSLog("iMirror: relay failed: \(error.localizedDescription)") }
         guard goios != nil else {
@@ -356,6 +492,34 @@ final class Transport {
         return ready
     }
 
+    /// Readiness probe for `runwda`'s readiness deadline: is WDA actually
+    /// serving `/status` as ready? Goes through the in-process relay on
+    /// 127.0.0.1:8100 — the SAME path WDAClient and everything else talks to
+    /// WDA through — rather than go-ios's raw `forward` port (8101) directly,
+    /// because CFNetwork/URLSession is unreliable against that port (see this
+    /// file's header comment; it's exactly why LocalRelay exists). The relay
+    /// is guaranteed up by the time this runs: `start()` calls `relay.start()`
+    /// synchronously before spawning any child, and `restartChain()` never
+    /// stops the relay, so it stays listening for the app's whole lifetime —
+    /// only the chain underneath it (tunnel/runwda/forward) gets torn down
+    /// and rebuilt.
+    private func wdaReadyThroughRelay() -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:8100/status") else { return false }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 2.0
+        let sem = DispatchSemaphore(value: 0)
+        var ready = false
+        readinessSession.dataTask(with: req) { data, resp, _ in
+            if let code = (resp as? HTTPURLResponse)?.statusCode, (200..<300).contains(code),
+               let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                ready = WDAParse.ready(json)
+            }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 2.5)
+        return ready
+    }
+
     /// Start the go-ios children: the tunnel first, then — once the tunnel is
     /// actually ready — check/install the runner and launch runwda + forward.
     ///
@@ -396,12 +560,25 @@ final class Transport {
                            "--bundleid=\(WDAIdentity.runnerBundleId)",
                            "--testrunnerbundleid=\(WDAIdentity.testRunnerBundleId)",
                            "--xctestconfig=\(WDAIdentity.xctestConfig)"],
-                    label: "runwda", restartDelay: 6, workDir: self.workDir)
+                    label: "runwda", restartDelay: 6, workDir: self.workDir,
+                    // A wedged runwda never exits on its own, so the exit-triggered
+                    // respawn above can't recover it — give it a readiness deadline
+                    // instead. 40s is past the observed ~17-20s WDA boot. The check
+                    // runs on a background poll queue via wdaReadyThroughRelay(),
+                    // NOT a direct probe of go-ios's `forward` port: CFNetwork is
+                    // unreliable against that port (see the file header), which is
+                    // exactly why the relay exists.
+                    readinessCheck: { [weak self] in self?.wdaReadyThroughRelay() ?? false },
+                    readyWithin: 40, readinessPollInterval: 2)
                 wda.onGaveUp = { [weak self] _ in
                     DispatchQueue.main.async { self?.onWDAUnrecoverable?() }
                 }
                 self.wda = wda
                 wda.start()
+                // F2: this is the point the wedge risk actually starts —
+                // not automation-on, which also counts tunnel bring-up and
+                // the runner install against WDA's own boot grace.
+                self.onRunwdaStarted?()
                 self.forward = ManagedProcess(binary: bin, args: ["forward", "8101", "8100"],
                                               label: "forward", restartDelay: 3, workDir: self.workDir)
                 self.forward?.start()
@@ -505,6 +682,27 @@ final class Transport {
         tunnel?.stop()
     }
 
+    /// Bounces just the `forward` child carrying the MJPEG port (9110 -> 9100),
+    /// for the app's MJPEG partial-wedge watchdog: WDA's HTTP session can stay
+    /// healthy while this narrower forward has quietly dropped, so it's worth
+    /// trying the cheap fix before escalating to a full chain restart.
+    func bounceMJPEGForward() {
+        mjpegForward?.bounce()
+    }
+
+    /// F1: stop just the chain's children — NOT the in-process relay, which
+    /// must stay up so the readiness probe path keeps working and a later
+    /// `forceProbe()` -> `restartChain()` can still bring the chain back.
+    /// Used when the app's recovery ladder gives up for good: without this,
+    /// `runwda` keeps respawning (and getting SIGKILLed by its own readiness
+    /// deadline) forever after a hard stop, contradicting the whole point of
+    /// giving up.
+    func stopChain() {
+        chainGeneration += 1
+        forward?.stop(); mjpegForward?.stop(); wda?.stop(); tunnel?.stop()
+        forward = nil; mjpegForward = nil; wda = nil; tunnel = nil
+    }
+
     /// Full chain reset for the watchdog: when WDA is wedged early (often the
     /// tunnel/testmanagerd state), bouncing runwda alone isn't enough — tear the
     /// whole chain down, let the device settle, then bring it back up in order.
@@ -512,15 +710,24 @@ final class Transport {
     func restartChain() {
         NSLog("iMirror: restarting full go-ios chain")
         chainGeneration += 1
+        // F5: capture the generation this restart owns so the delayed
+        // bring-up below can tell whether a *later* stop/restart/stopChain
+        // has already superseded it before it sweeps and spawns — otherwise
+        // an automation toggle within this 4s window could spawn a second
+        // runwda/forward contending for the same port.
+        let gen = chainGeneration
         forward?.stop(); mjpegForward?.stop(); wda?.stop(); tunnel?.stop()
         forward = nil; mjpegForward = nil; wda = nil; tunnel = nil
         DispatchQueue.global().asyncAfter(deadline: .now() + 4) { [weak self] in
-            guard let self else { return }
+            guard let self, self.chainGeneration == gen else { return }
             // Our handles are stopped; reap any child that outlived its handle
             // (e.g. a tunnel reparented to launchd) so the fresh chain owns a
             // clean device + port 60105.
             self.sweepStrayProcesses()
-            DispatchQueue.main.async { self.startChildren() }
+            DispatchQueue.main.async {
+                guard self.chainGeneration == gen else { return }
+                self.startChildren()
+            }
         }
     }
 }

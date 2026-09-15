@@ -534,6 +534,103 @@ final class CaptureWaitingReasonTests: XCTestCase {
     }
 }
 
+// MARK: - ManagedProcess readiness-deadline boundary
+
+final class ManagedProcessLivenessTests: XCTestCase {
+    func testBelowDeadlineDoesNotKill() {
+        XCTAssertFalse(managedProcessShouldKillForUnreadiness(uptime: 1.4, readySeen: false, readyWithin: 1.5))
+    }
+
+    func testAtDeadlineKills() {
+        XCTAssertTrue(managedProcessShouldKillForUnreadiness(uptime: 1.5, readySeen: false, readyWithin: 1.5))
+    }
+
+    func testAboveDeadlineKills() {
+        XCTAssertTrue(managedProcessShouldKillForUnreadiness(uptime: 3.0, readySeen: false, readyWithin: 1.5))
+    }
+
+    func testReadySeenNeverKillsEvenPastDeadline() {
+        XCTAssertFalse(managedProcessShouldKillForUnreadiness(uptime: 10, readySeen: true, readyWithin: 1.5))
+    }
+
+    func testDeadlineDisabledWhenReadyWithinIsZero() {
+        XCTAssertFalse(managedProcessShouldKillForUnreadiness(uptime: 100, readySeen: false, readyWithin: 0))
+    }
+
+    func testDeadlineDisabledWhenReadyWithinIsNegative() {
+        XCTAssertFalse(managedProcessShouldKillForUnreadiness(uptime: 100, readySeen: false, readyWithin: -1))
+    }
+}
+
+// MARK: - Chain-level and MJPEG recovery ladders
+
+final class ChainRecoveryActionTests: XCTestCase {
+    func testBelowGraceWaitsAtStageZero() {
+        XCTAssertEqual(nextChainRecoveryAction(downForSec: 30, stage: 0, graceSec: 55), .wait)
+    }
+
+    func testBelowGraceWaitsAtStageOne() {
+        XCTAssertEqual(nextChainRecoveryAction(downForSec: 30, stage: 1, graceSec: 55), .wait)
+    }
+
+    func testAtGraceAtStageZeroRestartsChain() {
+        XCTAssertEqual(nextChainRecoveryAction(downForSec: 55, stage: 0, graceSec: 55), .restartChain)
+    }
+
+    func testAboveGraceAtStageZeroRestartsChain() {
+        XCTAssertEqual(nextChainRecoveryAction(downForSec: 90, stage: 0, graceSec: 55), .restartChain)
+    }
+
+    func testAtGraceAtStageOneGivesUp() {
+        XCTAssertEqual(nextChainRecoveryAction(downForSec: 55, stage: 1, graceSec: 55), .giveUp)
+    }
+
+    func testAboveGraceAtStageOneGivesUp() {
+        XCTAssertEqual(nextChainRecoveryAction(downForSec: 120, stage: 1, graceSec: 55), .giveUp)
+    }
+}
+
+final class ChainRecoveryGraceSecTests: XCTestCase {
+    func testStageZeroPostConnectionOutageEscalatesQuickly() {
+        XCTAssertEqual(chainRecoveryGraceSec(stage: 0, postConnectionOutage: true), 30)
+    }
+
+    func testStageZeroInitialBootGetsFullBootWindow() {
+        XCTAssertEqual(chainRecoveryGraceSec(stage: 0, postConnectionOutage: false), 90)
+    }
+
+    func testStageOneGetsFullBootWindowRegardlessOfPostConnectionOutage() {
+        XCTAssertEqual(chainRecoveryGraceSec(stage: 1, postConnectionOutage: true), 90)
+        XCTAssertEqual(chainRecoveryGraceSec(stage: 1, postConnectionOutage: false), 90)
+    }
+}
+
+final class MjpegRecoveryActionTests: XCTestCase {
+    func testBelowThresholdWaits() {
+        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 19.9, alreadyBounced: false, thresholdSec: 20), .wait)
+    }
+
+    func testBelowThresholdWaitsEvenAlreadyBounced() {
+        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 5, alreadyBounced: true, thresholdSec: 20), .wait)
+    }
+
+    func testAtThresholdNotYetBouncedBouncesForward() {
+        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 20, alreadyBounced: false, thresholdSec: 20), .bounceForward)
+    }
+
+    func testAboveThresholdNotYetBouncedBouncesForward() {
+        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 45, alreadyBounced: false, thresholdSec: 20), .bounceForward)
+    }
+
+    func testAtThresholdAlreadyBouncedEscalates() {
+        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 20, alreadyBounced: true, thresholdSec: 20), .escalate)
+    }
+
+    func testAboveThresholdAlreadyBouncedEscalates() {
+        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 41, alreadyBounced: true, thresholdSec: 20), .escalate)
+    }
+}
+
 final class CaptureContentSignalDoesNotAffectRecoveryTests: XCTestCase {
 
     private func decisionsMatch(visible: Bool = true,
