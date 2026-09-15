@@ -1,8 +1,9 @@
-// iMirror — mirror a USB-connected iPhone to a macOS window, record to mp4, take
-// screenshots, and (Phase 2) control it from the Mac via WebDriverAgent — while
-// the phone stays physically usable (unlike Apple's "iPhone Mirroring").
+// iMirror — mirror a USB-connected iPhone to a macOS window, take screenshots,
+// and control it from the Mac via WebDriverAgent — while the phone stays
+// physically usable (unlike Apple's "iPhone Mirroring").
 //
-// Dependency-free: AppKit + AVFoundation + CoreImage + CoreMediaIO + Foundation.
+// Dependency-free: AppKit + Foundation. The mirror itself is decoded WDA-MJPEG
+// frames (plain CGImages), not a local capture session.
 //
 // UI: a native unified NSToolbar (Liquid Glass on macOS 26) with SF Symbol
 // controls and an NSSwitch for control; status shown in the window subtitle.
@@ -11,9 +12,6 @@
 // is OFF by default — you must explicitly connect and flip the Control switch.
 
 import AppKit
-import AVFoundation
-import CoreImage
-import CoreMediaIO
 import iMirrorCore
 import os
 
@@ -21,27 +19,17 @@ import os
 /// field reports (black mirror on a user's Mac) undiagnosable without a debugger.
 let mirrorLog = Logger(subsystem: "com.local.imirror", category: "capture")
 
-// MARK: - Enable CoreMediaIO screen-capture (DAL) devices
-
-func enableScreenCaptureDevices() {
-    var address = CMIOObjectPropertyAddress(
-        mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyAllowScreenCaptureDevices),
-        mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
-        mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain)
-    )
-    var allow: UInt32 = 1
-    let result = CMIOObjectSetPropertyData(
-        CMIOObjectID(kCMIOObjectSystemObject), &address, 0, nil,
-        UInt32(MemoryLayout<UInt32>.size), &allow)
-    if result != kCMIOHardwareNoError {
-        NSLog("iMirror: failed to enable screen-capture devices (status \(result))")
-    }
-}
-
 // MARK: - Preview view (hosts preview layer + captures mouse/keyboard)
 
 final class PreviewView: NSView {
-    let previewLayer = AVCaptureVideoPreviewLayer()
+    /// Displays decoded WDA-MJPEG frames (plain CGImages).
+    private let imageLayer = CALayer()
+
+    /// Pixel size of the most recently displayed frame (set by `setFrame`).
+    /// AppDelegate uses this to compute the aspect-fit video rect for coordinate
+    /// mapping, the same role AVCaptureVideoPreviewLayer's own rect conversion
+    /// used to play.
+    private(set) var lastFrameSize: CGSize?
 
     // View-space callbacks (AppDelegate transforms to device coordinates).
     var onTap: ((CGPoint) -> Void)?
@@ -57,11 +45,26 @@ final class PreviewView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer = previewLayer
-        previewLayer.videoGravity = .resizeAspect
-        previewLayer.backgroundColor = NSColor.black.cgColor
+        layer = CALayer()
+        imageLayer.contentsGravity = .resizeAspect
+        imageLayer.backgroundColor = NSColor.black.cgColor
+        imageLayer.frame = bounds
+        layer?.addSublayer(imageLayer)
     }
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func layout() {
+        super.layout()
+        imageLayer.frame = bounds
+    }
+
+    /// Displays a freshly decoded MJPEG frame. Main-thread only: the MJPEG
+    /// client delivers frames on its own queue, so callers must hop to main
+    /// before calling this.
+    func setFrame(_ image: CGImage) {
+        imageLayer.contents = image
+        lastFrameSize = CGSize(width: image.width, height: image.height)
+    }
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -91,7 +94,7 @@ final class PreviewView: NSView {
         ripple.strokeColor = NSColor.controlAccentColor.withAlphaComponent(0.9).cgColor
         ripple.lineWidth = 2
         ripple.opacity = 0
-        previewLayer.addSublayer(ripple)
+        layer?.addSublayer(ripple)
 
         let scale = CABasicAnimation(keyPath: "transform.scale")
         scale.fromValue = 0.35
@@ -220,79 +223,10 @@ final class PassthroughEffectView: NSVisualEffectView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
-// MARK: - Frame grabber (keeps the latest decoded frame for screenshots)
-
-final class FrameGrabber: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    let queue = DispatchQueue(label: "imirror.frames")
-    private let lock = NSLock()
-    private var latest: CVPixelBuffer?
-    private var lastFrameAt = Date.distantPast
-
-    func captureOutput(_ output: AVCaptureOutput,
-                       didOutput sampleBuffer: CMSampleBuffer,
-                       from connection: AVCaptureConnection) {
-        guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        lock.lock(); latest = pb; lastFrameAt = Date(); lock.unlock()   // holds one frame; pool keeps the rest
-    }
-
-    func snapshot() -> CVPixelBuffer? {
-        lock.lock(); defer { lock.unlock() }; return latest
-    }
-
-    /// Reset the liveness clock — call when (re)binding a device so the frame
-    /// watchdog gives a fresh grace window instead of firing on the stale gap.
-    func markActive() { lock.lock(); lastFrameAt = Date(); lock.unlock() }
-
-    /// Sample plane-0 luma on a `gridSize` x `gridSize` stride grid from the
-    /// latest buffer. Runs once per watchdog tick (~3s in checkCaptureLiveness),
-    /// never in captureOutput — a full-buffer luma pass there would run at
-    /// ~350-700MB/s on the frames queue. Handles both planar (YCbCr, plane 0 =
-    /// luma) and non-planar (e.g. BGRA) buffers: for non-planar formats it
-    /// samples the first byte of each pixel's byte group, which still moves when
-    /// content changes and still tracks darkness closely enough for this
-    /// heuristic. Returns an empty array if there is no frame yet.
-    func sampledLumaBytes(gridSize: Int = 16) -> [UInt8] {
-        guard let pixelBuffer = snapshot() else { return [] }
-        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-
-        let planar = CVPixelBufferIsPlanar(pixelBuffer)
-        let width = planar ? CVPixelBufferGetWidthOfPlane(pixelBuffer, 0) : CVPixelBufferGetWidth(pixelBuffer)
-        let height = planar ? CVPixelBufferGetHeightOfPlane(pixelBuffer, 0) : CVPixelBufferGetHeight(pixelBuffer)
-        let stride = planar ? CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0) : CVPixelBufferGetBytesPerRow(pixelBuffer)
-        let base = planar ? CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) : CVPixelBufferGetBaseAddress(pixelBuffer)
-        guard width > 0, height > 0, gridSize > 0, stride > 0, let base else { return [] }
-
-        let bytesPerElement = planar ? 1 : max(1, stride / max(width, 1))
-        let ptr = base.assumingMemoryBound(to: UInt8.self)
-        var samples: [UInt8] = []
-        samples.reserveCapacity(gridSize * gridSize)
-        for row in 0..<gridSize {
-            let y = min(height - 1, (row * height) / gridSize)
-            for col in 0..<gridSize {
-                let x = min(width - 1, (col * width) / gridSize)
-                let byteOffset = min(stride - bytesPerElement, x * bytesPerElement)
-                samples.append(ptr[y * stride + byteOffset])
-            }
-        }
-        return samples
-    }
-
-    /// Seconds since the last delivered frame (or last markActive). The capture
-    /// watchdog uses this to detect a silently stalled stream (green WDA, black
-    /// mirror) that fires no runtime-error or disconnect notification.
-    var secondsSinceLastFrame: TimeInterval {
-        lock.lock(); defer { lock.unlock() }; return Date().timeIntervalSince(lastFrameAt)
-    }
-}
-
 // MARK: - Toolbar item identifiers
 
 private extension NSToolbarItem.Identifier {
-    static let device     = NSToolbarItem.Identifier("device")
-    static let record     = NSToolbarItem.Identifier("record")
     static let screenshot = NSToolbarItem.Identifier("screenshot")
-    static let audio      = NSToolbarItem.Identifier("audio")
     static let health     = NSToolbarItem.Identifier("health")
     static let control    = NSToolbarItem.Identifier("control")
     static let settings   = NSToolbarItem.Identifier("settings")
@@ -301,18 +235,13 @@ private extension NSToolbarItem.Identifier {
 
 // MARK: - App delegate
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
-                         AVCaptureFileOutputRecordingDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private var window: NSWindow!
     private var previewView: PreviewView!
     private var emptyStateView: NSView!
-    private var emptyStateTitle: NSTextField!
-    private var emptyStateHint: NSTextField!
-    private let cameraActionButton = NSButton()
     private var statusLabel: NSTextField!
 
     // Toolbar controls
-    private let devicePopUp = NSPopUpButton(frame: .zero, pullsDown: false)
     private let controlSwitch = NSSwitch()
     private let automationSwitch = NSSwitch()
     private let settingsButton = NSButton()
@@ -329,23 +258,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private let iosRunnerLabel = NSTextField(labelWithString: "")
     private var lastRunnerInstall: RunnerInstall?
     private let healthButton = NSButton()
-    private var recordItem: NSToolbarItem!
     private var screenshotItem: NSToolbarItem!
-    private var audioItem: NSToolbarItem!
     private var controlItem: NSToolbarItem!
     private var homeItem: NSToolbarItem!
 
-    private let session = AVCaptureSession()
-    private let movieOutput = AVCaptureMovieFileOutput()
-    private let videoDataOutput = AVCaptureVideoDataOutput()
-    private let audioPreview = AVCaptureAudioPreviewOutput()
-    private var audioOn = false                 // muted by default (avoid echo with the phone)
-    private let frameGrabber = FrameGrabber()
-    private let ciContext = CIContext()
-    private var currentInput: AVCaptureDeviceInput?
-
-    private var discovery: AVCaptureDevice.DiscoverySession!
-    private var devices: [AVCaptureDevice] = []
+    private var mjpeg: MJPEGClient?
+    /// True once WDA-MJPEG frames are actually flowing. Distinct from `health`,
+    /// which only reflects the WDA HTTP session — the MJPEG socket can connect,
+    /// drop, and reconnect independently of that session.
+    private var mirroring = false
+    /// Latest decoded WDA-MJPEG frame (updated on main by the mjpeg.onFrame handler).
+    /// Screenshot now saves this instead of the (now-unused) capture pixel buffer.
+    private var lastFrame: CGImage?
 
     // Control + health monitor
     private enum Health { case down, connecting, connected }
@@ -364,60 +288,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private var downSince: Date?
     private var lastWDARestart: Date?
 
-    // Capture-pipe recovery (separate from WDA: the mirror is a CoreMediaIO/AVFoundation
-    // stream that can stall on USB churn without disconnecting the device, leaving a
-    // green WDA dot over a black screen).
-    private var captureWatchdogTimer: Timer?
-    private var lastCaptureRecovery: Date?
-    // Consecutive frameless recoveries. Reset to 0 the moment frames flow again;
-    // once it crosses CaptureLiveness.deadAfterFailedRecoveries the source is
-    // treated as dead (see checkCaptureLiveness).
-    private var consecutiveCaptureRecoveries = 0
-    /// Whether the mirror is currently showing live frames or the "waiting for
-    /// video" overlay. Driven solely by real frame delivery via the watchdog.
-    private enum CaptureUIState { case mirroring, waiting }
-    private var captureUIState: CaptureUIState = .mirroring
-
-    // Frame-content-aware liveness (I3, advisory only — see CaptureLiveness.swift).
-    // Computed once per watchdog tick from FrameGrabber.snapshot(), never per
-    // delivered frame. Never allowed to influence recovery/dead-marking, only
-    // which waiting-overlay message checkCaptureLiveness picks.
-    private var lastContentFingerprint: FrameFingerprint?
-    private var consecutiveStaticFrames = 0
-    private var lastShownWaitingReason: CaptureWaitingReason?
-    /// True while an AVCaptureSessionWasInterrupted is active for this session (no
-    /// matching InterruptionEnded yet). Corroborates the content signal so a
-    /// frozen call/occlusion screen reads as "call/occlusion" rather than a
-    /// generic stalled source.
-    ///
-    /// NOTE (deviation from the plan): the plan asked for this to be gated on
-    /// AVCaptureSessionInterruptionReasonKey and telephony-specific reasons
-    /// (videoDeviceNotAvailableWithMultipleForegroundApps, etc). Both that key and
-    /// AVCaptureSession.InterruptionReason are marked
-    /// `API_UNAVAILABLE(macos)` in the AVFoundation SDK — this is a macOS app, and
-    /// macOS's AVCaptureSessionWasInterrupted carries no reason in userInfo at
-    /// all. So the reason-based filter cannot be built as specified; any
-    /// interruption of this session is treated as corroborating, which is the
-    /// only signal this platform actually exposes.
-    private var interruptionActive = false
-
-    // True while the window shows any pixels. When it's fully hidden (miniaturized
-    // or occluded) we pause the screenshot frame-grabber and the capture watchdog
-    // so a hidden window costs no continuous decode/probe work.
-    private var appVisible = true
-
     // MARK: Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        enableScreenCaptureDevices()
         buildMainMenu()
         buildWindow()
-        requestCameraAccessThenStart()
-        observeDeviceChanges()
-        // Automation (WebDriverAgent) is OFF by default: opening the app is pure
-        // view-only mirroring, so nothing runs on the phone and iOS shows no
-        // "Automation Running" overlay. Flip the Automation toggle to bring WDA up.
-        startCaptureWatchdog()
         // Surface a terminal-looking state if the WDA runner just can't start
         // (bad signing / unsupported device) rather than looping silently on red.
         transport.onWDAUnrecoverable = { [weak self] in
@@ -456,21 +331,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             }
         }
         updateHealthDot()        // grey — automation off
-        // Restore the last Automation choice (default off = view-only mirroring).
-        if UserDefaults.standard.bool(forKey: "imirror.automationEnabled") {
-            automationSwitch.state = .on
-            setAutomation(true)
-        }
+        // Automation now drives the entire mirror (WDA-MJPEG frames replace camera
+        // capture), so it always starts on launch instead of waiting for an opt-in.
+        automationSwitch.state = .on
+        setAutomation(true)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
         healthTimer?.invalidate()
-        captureWatchdogTimer?.invalidate()
         transport.stop()
-        if movieOutput.isRecording { movieOutput.stopRecording() }
-        if session.isRunning { session.stopRunning() }
+        mjpeg?.stop()
     }
 
     // MARK: UI
@@ -503,8 +375,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         mainMenu.addItem(ctrlItem)
         let ctrlMenu = NSMenu(title: "Controls")
         ctrlItem.submenu = ctrlMenu
-        let rec = ctrlMenu.addItem(withTitle: "Record", action: #selector(toggleRecord), keyEquivalent: "r")
-        rec.target = self
         let shot = ctrlMenu.addItem(withTitle: "Screenshot", action: #selector(takeScreenshot), keyEquivalent: "s")
         shot.target = self
         let home = ctrlMenu.addItem(withTitle: "Home", action: #selector(pressHome), keyEquivalent: "h")
@@ -542,7 +412,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 430, height: 880))
 
         previewView = PreviewView(frame: container.bounds)
-        previewView.previewLayer.session = session
         previewView.autoresizingMask = [.width, .height]
         wireInput()
         container.addSubview(previewView)
@@ -582,12 +451,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         ])
 
         window.contentView = container
-
-        // Device picker styling
-        devicePopUp.target = self
-        devicePopUp.action = #selector(deviceSelected)
-        devicePopUp.controlSize = .large
-        devicePopUp.bezelStyle = .toolbar
 
         // Control switch (iOS-style toggle) — arms sending taps; needs WDA connected.
         controlSwitch.target = self
@@ -656,7 +519,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         title.alignment = .center
         title.isSelectable = false
         title.preferredMaxLayoutWidth = 300
-        emptyStateTitle = title
 
         let hint = NSTextField(wrappingLabelWithString: "Plug in via USB, unlock, and tap “Trust.”")
         hint.font = .systemFont(ofSize: 12)
@@ -664,16 +526,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         hint.alignment = .center
         hint.isSelectable = false
         hint.preferredMaxLayoutWidth = 300
-        emptyStateHint = hint
 
-        // Actionable button, shown only for the camera-permission empty state.
-        cameraActionButton.bezelStyle = .rounded
-        cameraActionButton.title = "Allow Camera Access"
-        cameraActionButton.target = self
-        cameraActionButton.action = #selector(cameraActionTapped)
-        cameraActionButton.isHidden = true
-
-        let stack = NSStackView(views: [icon, title, hint, cameraActionButton])
+        let stack = NSStackView(views: [icon, title, hint])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 6
@@ -682,33 +536,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.wantsLayer = true                    // layer-backed so alphaValue animates
         return stack
-    }
-
-    /// Tapped from the camera-permission empty state. If access was never decided,
-    /// this triggers the system prompt (accept/decline). Once the user has denied,
-    /// macOS won't show that prompt again, so open the Camera privacy pane instead.
-    @objc private func cameraActionTapped() {
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
-        case .authorized:
-            configureSession()
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-                DispatchQueue.main.async {
-                    if granted {
-                        self?.cameraActionButton.isHidden = true
-                        self?.setStatus("Camera access granted.")
-                        self?.configureSession()
-                    } else {
-                        self?.showCameraDenied()
-                    }
-                }
-            }
-        default:  // denied / restricted — the system prompt can't be reshown
-            if let url = URL(string:
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") {
-                NSWorkspace.shared.open(url)
-            }
-        }
     }
 
     /// Cross-fade the empty state instead of snapping it — the first mirror frame
@@ -731,13 +558,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         }
     }
 
-    /// Update the empty-state copy to match the real reason there's no mirror, so
-    /// a permission failure doesn't show the generic "plug in via USB" guidance.
-    private func setEmptyStateReason(title: String, hint: String) {
-        emptyStateTitle?.stringValue = title
-        emptyStateHint?.stringValue = hint
-    }
-
     private func actionItem(_ id: NSToolbarItem.Identifier, _ label: String,
                             _ symbolName: String, _ action: Selector,
                             enabled: Bool) -> NSToolbarItem {
@@ -755,36 +575,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     // MARK: NSToolbarDelegate
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.device, .record, .screenshot, .audio, .flexibleSpace, .health, .control, .settings, .home]
+        [.screenshot, .flexibleSpace, .health, .control, .settings, .home]
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.device, .record, .screenshot, .audio, .health, .control, .settings, .home, .flexibleSpace, .space]
+        [.screenshot, .health, .control, .settings, .home, .flexibleSpace, .space]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier,
                  willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
         switch id {
-        case .device:
-            let item = NSToolbarItem(itemIdentifier: .device)
-            item.label = "Device"
-            item.view = devicePopUp
-            return item
-
-        case .record:
-            recordItem = actionItem(.record, "Record", "record.circle",
-                                    #selector(toggleRecord), enabled: false)
-            return recordItem
-
         case .screenshot:
+            // enabled starts false and flips on via setHealth's .connected/.down
+            // branches now that there's no device-bind step to gate it on.
             screenshotItem = actionItem(.screenshot, "Screenshot", "camera.viewfinder",
                                         #selector(takeScreenshot), enabled: false)
             return screenshotItem
-
-        case .audio:
-            audioItem = actionItem(.audio, "Sound", "speaker.slash.fill",
-                                   #selector(toggleAudio), enabled: false)
-            return audioItem
 
         case .health:
             let item = NSToolbarItem(itemIdentifier: .health)
@@ -825,395 +631,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         }
     }
 
-    // MARK: Permissions + session start
-
-    private func requestCameraAccessThenStart() {
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
-        case .authorized:
-            configureSession()
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-                DispatchQueue.main.async {
-                    if granted { self?.configureSession() }
-                    else { self?.showCameraDenied() }
-                }
-            }
-        default:
-            showCameraDenied()
-        }
-    }
-
-    /// Camera access is what feeds the mirror; without it there's nothing to show.
-    /// Say so in the primary empty state (not just the footer HUD) and offer a
-    /// button: a fresh prompt if the choice was never made, otherwise a shortcut
-    /// to the Camera privacy pane (macOS won't reshow the prompt after a denial).
-    private func showCameraDenied() {
-        if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
-            setEmptyStateReason(title: "Camera access needed",
-                hint: "iMirror uses your Mac’s camera permission to show the iPhone’s screen. Allow access to start mirroring.")
-            cameraActionButton.title = "Allow Camera Access"
-        } else {
-            setEmptyStateReason(title: "Camera access needed",
-                hint: "Turn on Camera for iMirror in System Settings ▸ Privacy & Security ▸ Camera.")
-            cameraActionButton.title = "Open Camera Settings"
-        }
-        cameraActionButton.isHidden = false
-        setEmptyState(hidden: false)
-        setStatus("Camera access needed — grant it to start mirroring.")
-    }
-
-    private func configureSession() {
-        session.beginConfiguration()
-        if session.canAddOutput(movieOutput) { session.addOutput(movieOutput) }
-        videoDataOutput.alwaysDiscardsLateVideoFrames = true
-        videoDataOutput.setSampleBufferDelegate(frameGrabber, queue: frameGrabber.queue)
-        if session.canAddOutput(videoDataOutput) { session.addOutput(videoDataOutput) }
-        audioPreview.volume = 0   // muted until the user enables sound
-        if session.canAddOutput(audioPreview) { session.addOutput(audioPreview) }
-        session.commitConfiguration()
-        refreshDevices()
-        if !session.isRunning {
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                self?.session.startRunning()
-            }
-        }
-    }
-
-    // MARK: Device discovery
-
-    private func observeDeviceChanges() {
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(deviceChanged),
-            name: .AVCaptureDeviceWasConnected, object: nil)
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(deviceChanged),
-            name: .AVCaptureDeviceWasDisconnected, object: nil)
-        // The capture session can fail or be interrupted without the device ever
-        // "disconnecting" (USB renegotiation, media services reset). Without these
-        // the mirror goes black and never recovers until the app is relaunched.
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(sessionRuntimeError),
-            name: .AVCaptureSessionRuntimeError, object: session)
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(sessionInterrupted),
-            name: .AVCaptureSessionWasInterrupted, object: session)
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(sessionInterruptionEnded),
-            name: .AVCaptureSessionInterruptionEnded, object: session)
-        // Pause per-frame work + the capture watchdog while the window is hidden.
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(occlusionChanged),
-            name: NSWindow.didChangeOcclusionStateNotification, object: window)
-    }
-
-    @objc private func occlusionChanged() {
-        let visible = window.occlusionState.contains(.visible)
-        guard visible != appVisible else { return }
-        appVisible = visible
-        // Stop delivering frames to the screenshot grabber while hidden (the live
-        // preview layer is driven separately and unaffected). On reveal, reset the
-        // liveness clock so the watchdog doesn't fire on the hidden gap.
-        videoDataOutput.connection(with: .video)?.isEnabled = visible
-        // Only refresh the liveness clock if the mirror was actually healthy before
-        // it hid. Revealing the window mid-stall (e.g. during a phone call) must NOT
-        // fake a frame — that would report the source healthy and flip the UI back to
-        // "Mirroring" over a black preview, reintroducing the bug this state machine
-        // fixes. A source that was already waiting stays waiting until real frames
-        // return.
-        if visible, captureUIState == .mirroring {
-            frameGrabber.markActive()
-            resetContentLiveness()
-        }
-    }
-
-    @objc private func deviceChanged(_ note: Notification) {
-        refreshDevices()
-        // Fast replug recovery: when a phone (re)appears while automation is on but
-        // WDA is down, the go-ios chain has likely backed off — kick a clean chain
-        // restart now instead of waiting out the slow down-watchdog. Rate-limited
-        // (and shares lastWDARestart) so it can't storm if the device flaps.
-        // Gated on a prior successful connect so this only ever fires on a genuine
-        // replug, never during the initial bring-up (health starts .down).
-        guard automationEnabled, transport.canSelfManage, hadSuccessfulConnection,
-              !devices.isEmpty, health == .down else { return }
-        if let last = lastWDARestart, Date().timeIntervalSince(last) < 30 { return }
-        lastWDARestart = Date()
-        downSince = Date()
-        setStatus("iPhone reconnected — restarting WebDriverAgent…")
-        transport.restartChain()
-    }
-
-    @objc private func sessionRuntimeError(_ note: Notification) {
-        let err = note.userInfo?[AVCaptureSessionErrorKey] as? NSError
-        mirrorLog.error("AVCaptureSession runtime error: \(err?.localizedDescription ?? "unknown", privacy: .public)")
-        DispatchQueue.main.async { [weak self] in self?.recoverCapture("runtime error") }
-    }
-
-    @objc private func sessionInterrupted(_ note: Notification) {
-        // Corroborates the content-liveness advisory: an active interruption plus
-        // a sustained static/near-black frame reads as a call/occlusion rather
-        // than a generic stalled source. See checkCaptureLiveness. (macOS exposes
-        // no interruption-reason userInfo — see the `interruptionActive` doc
-        // comment for why this can't be filtered to telephony-specific reasons.)
-        interruptionActive = true
-        DispatchQueue.main.async { [weak self] in self?.setStatus("Mirror paused — capture interrupted.") }
-    }
-
-    @objc private func sessionInterruptionEnded(_ note: Notification) {
-        interruptionActive = false
-        DispatchQueue.main.async { [weak self] in self?.recoverCapture("interruption ended") }
-    }
-
-    // MARK: Capture-pipe recovery
-
-    private func startCaptureWatchdog() {
-        let t = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.checkCaptureLiveness() }
-        RunLoop.main.add(t, forMode: .common)
-        captureWatchdogTimer = t
-    }
-
-    /// Detects a stalled mirror that fires no notification: a device is bound but
-    /// frames stopped arriving (or the session quietly stopped running). Rebinds
-    /// the input to restart the CoreMediaIO stream. Rate-limited so a device that
-    /// can't deliver (e.g. truly unplugged) isn't bounced every tick.
-    private func checkCaptureLiveness() {
-        let now = Date()
-        // Content-liveness sample: once per tick, on this (watchdog/main) thread,
-        // never in captureOutput. Advisory only — feeds captureWaitingReason below,
-        // never captureWatchdogDecision.
-        let samples = frameGrabber.sampledLumaBytes()
-        if !samples.isEmpty {
-            let fingerprint = FrameContentSampling.fingerprint(samples: samples)
-            if let last = lastContentFingerprint, last.hash == fingerprint.hash {
-                consecutiveStaticFrames += 1
-            } else {
-                consecutiveStaticFrames = 0
-            }
-            lastContentFingerprint = fingerprint
-        }
-        let state = CaptureWatchdogState(
-            visible: appVisible,
-            hasInput: currentInput != nil,
-            sessionRunning: session.isRunning,
-            secondsSinceLastFrame: frameGrabber.secondsSinceLastFrame,
-            secondsSinceRecoveryStarted: lastCaptureRecovery.map { now.timeIntervalSince($0) },
-            consecutiveFailedRecoveries: consecutiveCaptureRecoveries,
-            consecutiveStaticFrames: consecutiveStaticFrames,
-            nearBlack: lastContentFingerprint?.nearBlack ?? false,
-            interruptionActive: interruptionActive)
-        let decision = captureWatchdogDecision(state)
-        if decision.sourceHealthy {
-            // Real frames are flowing (only real delivery can set this now that a
-            // recovery rebind no longer fakes the liveness clock). Restore mirroring
-            // and reset the streak so a future stall counts from zero.
-            if captureUIState != .mirroring {
-                captureUIState = .mirroring
-                showMirroringUI()
-            }
-            consecutiveCaptureRecoveries = 0
-            return
-        }
-        // Not healthy. Only surface the waiting overlay when a phone is actually
-        // bound and the window is visible — a hidden window or a no-device state has
-        // its own UI and must not be overwritten. Re-show it if the advisory reason
-        // has changed since it was last displayed (e.g. a call starts partway
-        // through an existing stall) even though the UI state is already .waiting.
-        let waitingReason = captureWaitingReason(state)
-        if appVisible, currentInput != nil,
-           captureUIState != .waiting || waitingReason != lastShownWaitingReason {
-            captureUIState = .waiting
-            lastShownWaitingReason = waitingReason
-            showWaitingUI(reason: waitingReason)
-        }
-        if case .recover(let reason) = decision.action {
-            consecutiveCaptureRecoveries += 1
-            recoverCapture(reason)
-        }
-    }
-
-    /// Rebuild the current device's input (a fresh AVCaptureDeviceInput forces the
-    /// CMIO stream to re-establish) and ensure the session is running. Covers both
-    /// a stopped session (runtime error) and a silently dead stream (USB churn).
-    private func recoverCapture(_ reason: String) {
-        guard let device = currentInput?.device else { refreshDevices(); return }
-        // Stamped before the rebind: the grace window in captureWatchdogDecision
-        // measures from here, so it spans the CMIO teardown (up to ~12s) and the
-        // stream's first-frame latency. That window -- not a faked frame -- is what
-        // stops the watchdog re-firing mid-recovery.
-        lastCaptureRecovery = Date()
-        mirrorLog.notice("recovering capture (\(reason, privacy: .public)) on \(device.localizedName, privacy: .public)")
-        // isRecovery: rebind WITHOUT faking the liveness clock. Only real delivered
-        // frames may report the source healthy -- otherwise a source that rebinds but
-        // never delivers (an iPhone on a call, a wedged endpoint) would look healthy
-        // every cycle, reset the failed-recovery counter, and never be declared dead.
-        switchToDevice(device, isRecovery: true)
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            if !self.session.isRunning { self.session.startRunning() }
-            mirrorLog.notice("capture rebind complete; stream restarted")
-        }
-    }
-
-    /// Frames stopped arriving while a phone is bound. We can't tell a transient
-    /// telephony pause (frames resume when the call ends) from a wedged capture
-    /// endpoint (needs a replug), so the message covers both honestly instead of
-    /// claiming to mirror over a black rectangle.
-    private func showWaitingUI(reason: CaptureWaitingReason) {
-        mirrorLog.notice("no frames from bound device — showing waiting-for-video guidance (\(String(describing: reason), privacy: .public))")
-        setStatus("Waiting for video from iPhone…")
-        switch reason {
-        case .callOrOcclusion:
-            // Corroborated by an active telephony-relevant interruption — confident
-            // enough to name the likely cause outright.
-            setEmptyStateReason(title: "Waiting for video",
-                                hint: "Looks like you’re on a phone call — the screen resumes when it ends. If it stays blank, unplug and replug the USB cable.")
-        case .staticSource, .none:
-            // Uncorroborated (or no sustained stall detected yet): stay honest that
-            // this could be a call OR a wedged endpoint, per the existing design —
-            // the content signal never gets to claim more certainty than that.
-            setEmptyStateReason(title: "Waiting for video",
-                                hint: "If you’re on a phone call, the screen resumes when the call ends. If it stays blank, unplug and replug the USB cable.")
-        }
-        cameraActionButton.isHidden = true
-        setEmptyState(hidden: false)
-    }
-
-    /// Real frames returned — restore the normal mirroring UI.
-    private func showMirroringUI() {
-        mirrorLog.notice("frames flowing again; restoring mirror UI")
-        if let name = currentInput?.device.localizedName {
-            setStatus("Mirroring \(name) — phone stays usable.")
-        }
-        setEmptyState(hidden: true)
-        setEmptyStateReason(title: "No iPhone connected",
-                            hint: "Plug in via USB, unlock, and tap “Trust.”")
-        lastShownWaitingReason = nil
-    }
-
-    /// Reset the content-liveness counters — call alongside every
-    /// `frameGrabber.markActive()` (fresh bind or a visibility reveal). Otherwise
-    /// a recovery that resumes on the same static screen it left would find its
-    /// old fingerprint still matching and instantly re-trip the static-frame gate.
-    private func resetContentLiveness() {
-        lastContentFingerprint = nil
-        consecutiveStaticFrames = 0
-    }
-
-    private func refreshDevices() {
-        discovery = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.external], mediaType: .muxed, position: .unspecified)
-        devices = discovery.devices
-
-        let previouslySelected = currentInput?.device.uniqueID
-        devicePopUp.removeAllItems()
-
-        if devices.isEmpty {
-            setStatus("No iPhone found — plug in via USB, unlock, tap “Trust”.")
-            devicePopUp.addItem(withTitle: "No device")
-            devicePopUp.isEnabled = false
-            recordItem?.isEnabled = false
-            screenshotItem?.isEnabled = false
-            audioItem?.isEnabled = false
-            switchToDevice(nil)
-            return
-        }
-
-        devicePopUp.isEnabled = true
-        for device in devices { devicePopUp.addItem(withTitle: device.localizedName) }
-
-        if let prev = previouslySelected,
-           let device = devices.first(where: { $0.uniqueID == prev }) {
-            devicePopUp.selectItem(withTitle: device.localizedName)
-        } else {
-            devicePopUp.selectItem(at: 0)
-            switchToDevice(devices[0])
-        }
-    }
-
-    @objc private func deviceSelected() {
-        let index = devicePopUp.indexOfSelectedItem
-        guard index >= 0, index < devices.count else { return }
-        switchToDevice(devices[index])
-    }
-
-    /// Bind (or clear) the mirrored device. `isRecovery` marks a silent watchdog
-    /// rebind: it must not fake the liveness clock (only real frames may report the
-    /// source healthy) and must leave the mirror chrome to the watchdog, which owns
-    /// the waiting/mirroring state during a stall.
-    private func switchToDevice(_ device: AVCaptureDevice?, isRecovery: Bool = false) {
-        session.beginConfiguration()
-        if let currentInput { session.removeInput(currentInput) }
-        currentInput = nil
-        if let device {
-            do {
-                let input = try AVCaptureDeviceInput(device: device)
-                if session.canAddInput(input) {
-                    session.addInput(input)
-                    currentInput = input
-                    if !isRecovery {
-                        frameGrabber.markActive()   // fresh bind: start the watchdog's grace window
-                        resetContentLiveness()
-                        setStatus("Mirroring \(device.localizedName) — phone stays usable.")
-                    }
-                    recordItem?.isEnabled = true
-                    screenshotItem?.isEnabled = true
-                    audioItem?.isEnabled = true
-                } else {
-                    setStatus("Cannot add \(device.localizedName) to session.")
-                }
-            } catch {
-                setStatus("Failed to open device: \(error.localizedDescription)")
-            }
-        }
-        session.commitConfiguration()
-        // A silent recovery rebind that SUCCEEDED leaves all mirror chrome to the
-        // watchdog (it owns the waiting/mirroring state). If the rebind failed
-        // (currentInput is nil), fall through so the no-device guidance is restored
-        // rather than leaving a stale "Waiting for video" overlay up with no source.
-        if isRecovery, currentInput != nil { return }
-        if currentInput == nil {
-            // Back to no-device: restore the default guidance (a prior failure may
-            // have changed it) unless the camera itself is blocked.
-            if AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
-                cameraActionButton.isHidden = true       // camera fine — no button here
-                setEmptyStateReason(title: "No iPhone connected",
-                                    hint: "Plug in via USB, unlock, and tap “Trust.”")
-            }
-        }
-        setEmptyState(hidden: currentInput != nil)         // fade out once a phone is bound
-    }
-
-    // MARK: Recording
-
-    @objc private func toggleRecord() {
-        if movieOutput.isRecording { movieOutput.stopRecording(); return }
-        guard currentInput != nil else { return }
-        let name = "iMirror_\(timestamp()).mp4"
-        let url = FileManager.default
-            .urls(for: .moviesDirectory, in: .userDomainMask).first!
-            .appendingPathComponent(name)
-        movieOutput.startRecording(to: url, recordingDelegate: self)
-        recordItem?.image = symbol("stop.circle.fill", "Stop")
-        recordItem?.label = "Stop"
-        setStatus("Recording → \(url.path)")
-    }
-
-    func fileOutput(_ output: AVCaptureFileOutput,
-                    didFinishRecordingTo outputFileURL: URL,
-                    from connections: [AVCaptureConnection], error: Error?) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.recordItem?.image = self.symbol("record.circle", "Record")
-            self.recordItem?.label = "Record"
-            if let error { self.setStatus("Recording error: \(error.localizedDescription)") }
-            else { self.setStatus("Saved \(outputFileURL.lastPathComponent) → ~/Movies") }
-        }
-    }
-
     // MARK: Screenshot
 
     @objc private func takeScreenshot() {
-        guard let pixelBuffer = frameGrabber.snapshot() else {
+        guard let cgImage = lastFrame else {
             setStatus("No frame yet — wait for the mirror to start.")
             return
         }
@@ -1221,17 +642,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         let url = FileManager.default
             .urls(for: .picturesDirectory, in: .userDomainMask).first!
             .appendingPathComponent(name)
-        // Render + PNG-encode + write off the main thread: a CIContext render and a
-        // blocking file write (to a possibly iCloud-synced ~/Pictures) would
-        // otherwise hitch the UI on a click that should feel instant. Only the
-        // status update hops back to main.
+        // PNG-encode + write off the main thread: a blocking file write (to a possibly
+        // iCloud-synced ~/Pictures) would otherwise hitch the UI on a click that should
+        // feel instant. Only the status update hops back to main.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let ciImage = CIImage(cvImageBuffer: pixelBuffer)
-            guard let cgImage = self.ciContext.createCGImage(ciImage, from: ciImage.extent) else {
-                DispatchQueue.main.async { self.setStatus("Screenshot failed (could not render frame).") }
-                return
-            }
             let rep = NSBitmapImageRep(cgImage: cgImage)
             guard let png = rep.representation(using: .png, properties: [:]) else {
                 DispatchQueue.main.async { self.setStatus("Screenshot failed (could not encode PNG).") }
@@ -1244,18 +659,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
                 DispatchQueue.main.async { self.setStatus("Screenshot save failed: \(error.localizedDescription)") }
             }
         }
-    }
-
-    // MARK: Audio
-
-    @objc private func toggleAudio() {
-        audioOn.toggle()
-        audioPreview.volume = audioOn ? 1 : 0
-        audioItem?.image = symbol(audioOn ? "speaker.wave.2.fill" : "speaker.slash.fill",
-                                  audioOn ? "Sound on" : "Sound off")
-        setStatus(audioOn
-            ? "Sound on — phone audio plays through this Mac."
-            : "Sound muted.")
     }
 
     // MARK: Control (WDA)
@@ -1277,8 +680,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             guard let self, self.controlEnabled,
                   let size = self.wda?.deviceSize,
                   let start = self.devicePoint(fromViewPoint: viewPoint) else { return }
-            let videoRect = self.previewView.previewLayer.layerRectConverted(
-                fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
+            guard let frameSize = self.previewView.lastFrameSize else { return }
+            let videoRect = self.displayedImageRect(in: self.previewView.bounds, imageSize: frameSize)
             guard videoRect.width > 1, videoRect.height > 1 else { return }
             // Scale view-space scroll distance into device points and send one fast
             // swipe. Since the phone can't add inertia, `gain` amplifies the swipe
@@ -1302,13 +705,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         }
     }
 
-    /// Map a click in the preview to a device point. The preview layer's own rect
-    /// conversion handles letterboxing + orientation; mapToDevice (in iMirrorCore)
-    /// does the normalize + y-flip and is unit-tested.
+    /// Aspect-fit rect of `imageSize` centered within `bounds` (both in the view's
+    /// own y-up coordinate space) — the CALayer analogue of what
+    /// AVCaptureVideoPreviewLayer.layerRectConverted(fromMetadataOutputRect:) used
+    /// to compute automatically when the preview was capture-backed.
+    private func displayedImageRect(in bounds: CGRect, imageSize: CGSize) -> CGRect {
+        guard imageSize.width > 0, imageSize.height > 0, bounds.width > 0, bounds.height > 0 else { return bounds }
+        let scale = min(bounds.width / imageSize.width, bounds.height / imageSize.height)
+        let w = imageSize.width * scale
+        let h = imageSize.height * scale
+        let x = bounds.minX + (bounds.width - w) / 2
+        let y = bounds.minY + (bounds.height - h) / 2
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+
+    /// Map a click in the preview to a device point. The aspect-fit rect of the
+    /// latest MJPEG frame within the view handles letterboxing + orientation;
+    /// mapToDevice (in iMirrorCore) does the normalize + y-flip and is unit-tested.
     private func devicePoint(fromViewPoint p: CGPoint) -> CGPoint? {
-        guard let size = wda?.deviceSize else { return nil }
-        let videoRect = previewView.previewLayer.layerRectConverted(
-            fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
+        guard let size = wda?.deviceSize, let frameSize = previewView.lastFrameSize else { return nil }
+        let videoRect = displayedImageRect(in: previewView.bounds, imageSize: frameSize)
         return mapToDevice(viewPoint: p, videoRect: videoRect, deviceSize: size)
     }
 
@@ -1393,6 +809,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             downStatusWorkItem?.cancel(); downStatusWorkItem = nil
             controlSwitch.isEnabled = true
             homeItem?.isEnabled = true
+            screenshotItem?.isEnabled = true
             if changed {
                 let s = wda?.deviceSize ?? .zero
                 // Lock resizing to the phone's proportions so the mirror fills the
@@ -1402,6 +819,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
                     window.contentAspectRatio = NSSize(width: s.width, height: s.height)
                 }
                 setStatus("WDA connected — \(Int(s.width))×\(Int(s.height)) pts. Flip Control to drive.")
+            }
+            // Start the MJPEG mirror the moment WDA is healthy. Guarded against
+            // double-start: setHealth(.connected) can fire on every probe tick
+            // once connected, and MJPEGClient.start() would otherwise tear down
+            // and reopen a perfectly good stream each time.
+            if mjpeg == nil {
+                // Host port 9110 forwards to the device's fixed WDA mjpegServerPort 9100, chosen to avoid colliding with other local services that commonly use 9100.
+                let client = MJPEGClient(port: 9110)
+                client.onFrame = { [weak self] cg in
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        self.lastFrame = cg
+                        self.previewView.setFrame(cg)
+                        if !self.mirroring {
+                            self.mirroring = true
+                            self.setEmptyState(hidden: true)
+                            self.setStatus("Mirroring — phone stays usable.")
+                        }
+                    }
+                }
+                client.onStateChange = { [weak self] connected in
+                    DispatchQueue.main.async {
+                        guard let self, !connected else { return }
+                        // MJPEG socket dropped independently of the WDA HTTP session — show
+                        // the waiting state until frames resume.
+                        self.mirroring = false
+                        self.setEmptyState(hidden: false)
+                        self.setStatus("Waiting for video from iPhone…")
+                    }
+                }
+                mjpeg = client
+                client.start()
             }
         case .connecting:
             downStatusWorkItem?.cancel(); downStatusWorkItem = nil
@@ -1417,6 +866,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             }
             controlSwitch.isEnabled = false
             homeItem?.isEnabled = false
+            screenshotItem?.isEnabled = false
+            mjpeg?.stop()
+            mjpeg = nil
+            mirroring = false
+            setEmptyState(hidden: false)
             // Debounce the *status text* by 6s: a brief probe blip during heavy
             // scrolling flips health to .down for one cycle, and flashing
             // "Starting WebDriverAgent…" on every scroll is alarming and wrong.
@@ -1538,6 +992,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             installingRunner = false
             wda = nil
             transport.stop()
+            mjpeg?.stop()
+            mjpeg = nil
+            mirroring = false
             health = .down; downSince = nil
             updateHealthDot()        // grey — automation off
             setStatus("Automation off — mirror only (no control, no on-phone overlay).")

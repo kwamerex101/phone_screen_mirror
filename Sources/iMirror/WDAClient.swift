@@ -57,6 +57,7 @@ final class WDAClient {
             }
             self.sessionId = sid
             self.applyFastGestureSettings(sid: sid)
+            self.applyMJPEGSettings(sid: sid)
             self.fetchWindowSize(completion: completion)
         }
     }
@@ -72,6 +73,16 @@ final class WDAClient {
     private func applyFastGestureSettings(sid: String) {
         send("POST", "/session/\(sid)/appium/settings",
              ["settings": ["waitForIdleTimeout": 0, "animationCoolOffTimeout": 0]]) { _, _, _ in }
+    }
+
+    /// Tune WDA's MJPEG stream (framerate/quality/scale) via the same appium
+    /// settings route. Best-effort, fire-and-forget: a failure here must not
+    /// break connect(): the MJPEG server still runs with WDA's own defaults.
+    private func applyMJPEGSettings(sid: String) {
+        send("POST", "/session/\(sid)/appium/settings",
+             ["settings": ["mjpegServerFramerate": 30,
+                           "mjpegServerScreenshotQuality": 60,
+                           "mjpegScalingFactor": 100]]) { _, _, _ in }
     }
 
     private func fetchWindowSize(completion: @escaping (Result<CGSize, Error>) -> Void) {

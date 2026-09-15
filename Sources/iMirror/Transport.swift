@@ -249,6 +249,7 @@ final class Transport {
     private var tunnel: ManagedProcess?
     private var wda: ManagedProcess?
     private var forward: ManagedProcess?
+    private var mjpegForward: ManagedProcess?
 
     /// Set by the app to surface a terminal state when the WDA runner can't be
     /// started at all (bad signing / unsupported device) — invoked on the main
@@ -404,6 +405,9 @@ final class Transport {
                 self.forward = ManagedProcess(binary: bin, args: ["forward", "8101", "8100"],
                                               label: "forward", restartDelay: 3, workDir: self.workDir)
                 self.forward?.start()
+                self.mjpegForward = ManagedProcess(binary: bin, args: ["forward", "9110", "9100"],
+                                                   label: "mjpeg-forward", restartDelay: 3, workDir: self.workDir)
+                self.mjpegForward?.start()
             }
         }
     }
@@ -496,6 +500,7 @@ final class Transport {
         chainGeneration += 1
         relay.stop()
         forward?.stop()
+        mjpegForward?.stop()
         wda?.stop()
         tunnel?.stop()
     }
@@ -507,8 +512,8 @@ final class Transport {
     func restartChain() {
         NSLog("iMirror: restarting full go-ios chain")
         chainGeneration += 1
-        forward?.stop(); wda?.stop(); tunnel?.stop()
-        forward = nil; wda = nil; tunnel = nil
+        forward?.stop(); mjpegForward?.stop(); wda?.stop(); tunnel?.stop()
+        forward = nil; mjpegForward = nil; wda = nil; tunnel = nil
         DispatchQueue.global().asyncAfter(deadline: .now() + 4) { [weak self] in
             guard let self else { return }
             // Our handles are stopped; reap any child that outlived its handle
