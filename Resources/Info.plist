@@ -20,8 +20,6 @@
 	<string>20260813</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
-	<key>NSCameraUsageDescription</key>
-	<string>iMirror needs camera access to receive the screen of your USB-connected iPhone. It does not use your Mac's camera.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSPrincipalClass</key>
