@@ -41,7 +41,16 @@ func enableScreenCaptureDevices() {
 // MARK: - Preview view (hosts preview layer + captures mouse/keyboard)
 
 final class PreviewView: NSView {
-    let previewLayer = AVCaptureVideoPreviewLayer()
+    // TODO(cleanup): remove with CoreMediaIO engine. imageLayer replaces the old
+    // AVCaptureVideoPreviewLayer now that decoded WDA-MJPEG frames (plain
+    // CGImages), not a live capture session, drive what's on screen.
+    private let imageLayer = CALayer()
+
+    /// Pixel size of the most recently displayed frame (set by `setFrame`).
+    /// AppDelegate uses this to compute the aspect-fit video rect for coordinate
+    /// mapping, the same role AVCaptureVideoPreviewLayer's own rect conversion
+    /// used to play.
+    private(set) var lastFrameSize: CGSize?
 
     // View-space callbacks (AppDelegate transforms to device coordinates).
     var onTap: ((CGPoint) -> Void)?
@@ -57,11 +66,26 @@ final class PreviewView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer = previewLayer
-        previewLayer.videoGravity = .resizeAspect
-        previewLayer.backgroundColor = NSColor.black.cgColor
+        layer = CALayer()
+        imageLayer.contentsGravity = .resizeAspect
+        imageLayer.backgroundColor = NSColor.black.cgColor
+        imageLayer.frame = bounds
+        layer?.addSublayer(imageLayer)
     }
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func layout() {
+        super.layout()
+        imageLayer.frame = bounds
+    }
+
+    /// Displays a freshly decoded MJPEG frame. Main-thread only: the MJPEG
+    /// client delivers frames on its own queue, so callers must hop to main
+    /// before calling this.
+    func setFrame(_ image: CGImage) {
+        imageLayer.contents = image
+        lastFrameSize = CGSize(width: image.width, height: image.height)
+    }
 
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -91,7 +115,7 @@ final class PreviewView: NSView {
         ripple.strokeColor = NSColor.controlAccentColor.withAlphaComponent(0.9).cgColor
         ripple.lineWidth = 2
         ripple.opacity = 0
-        previewLayer.addSublayer(ripple)
+        layer?.addSublayer(ripple)
 
         let scale = CABasicAnimation(keyPath: "transform.scale")
         scale.fromValue = 0.35
@@ -222,6 +246,8 @@ final class PassthroughEffectView: NSVisualEffectView {
 
 // MARK: - Frame grabber (keeps the latest decoded frame for screenshots)
 
+// TODO(cleanup): remove with CoreMediaIO engine — unreachable now that WDA-MJPEG
+// drives the mirror (screenshots now read AppDelegate.lastFrame instead).
 final class FrameGrabber: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     let queue = DispatchQueue(label: "imirror.frames")
     private let lock = NSLock()
@@ -312,6 +338,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private var statusLabel: NSTextField!
 
     // Toolbar controls
+    // TODO(cleanup): remove with CoreMediaIO engine — devicePopUp is no longer
+    // attached to the toolbar (see toolbarDefaultItemIdentifiers), so it, and
+    // deviceSelected() below, are unreachable.
     private let devicePopUp = NSPopUpButton(frame: .zero, pullsDown: false)
     private let controlSwitch = NSSwitch()
     private let automationSwitch = NSSwitch()
@@ -335,6 +364,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private var controlItem: NSToolbarItem!
     private var homeItem: NSToolbarItem!
 
+    // TODO(cleanup): remove with CoreMediaIO engine — unreachable now that
+    // WDA-MJPEG drives the mirror; kept in place only so this diff stays
+    // reviewable for the later deletion pass.
     private let session = AVCaptureSession()
     private let movieOutput = AVCaptureMovieFileOutput()
     private let videoDataOutput = AVCaptureVideoDataOutput()
@@ -346,6 +378,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     private var discovery: AVCaptureDevice.DiscoverySession!
     private var devices: [AVCaptureDevice] = []
+
+    private var mjpeg: MJPEGClient?
+    /// True once WDA-MJPEG frames are actually flowing. Distinct from `health`,
+    /// which only reflects the WDA HTTP session — the MJPEG socket can connect,
+    /// drop, and reconnect independently of that session.
+    private var mirroring = false
+    /// Latest decoded WDA-MJPEG frame (updated on main by the mjpeg.onFrame handler).
+    /// Screenshot now saves this instead of the (now-unused) capture pixel buffer.
+    private var lastFrame: CGImage?
 
     // Control + health monitor
     private enum Health { case down, connecting, connected }
@@ -364,6 +405,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     private var downSince: Date?
     private var lastWDARestart: Date?
 
+    // TODO(cleanup): remove with CoreMediaIO engine — unreachable now that
+    // WDA-MJPEG drives the mirror (startCaptureWatchdog() is no longer called).
     // Capture-pipe recovery (separate from WDA: the mirror is a CoreMediaIO/AVFoundation
     // stream that can stall on USB churn without disconnecting the device, leaving a
     // green WDA dot over a black screen).
@@ -412,12 +455,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         enableScreenCaptureDevices()
         buildMainMenu()
         buildWindow()
-        requestCameraAccessThenStart()
-        observeDeviceChanges()
-        // Automation (WebDriverAgent) is OFF by default: opening the app is pure
-        // view-only mirroring, so nothing runs on the phone and iOS shows no
-        // "Automation Running" overlay. Flip the Automation toggle to bring WDA up.
-        startCaptureWatchdog()
+        // Capture no longer starts the mirror; WDA-MJPEG does (see setHealth).
+        // TODO(cleanup): remove with CoreMediaIO engine.
+        // requestCameraAccessThenStart()
+        // observeDeviceChanges()
+        // startCaptureWatchdog()
         // Surface a terminal-looking state if the WDA runner just can't start
         // (bad signing / unsupported device) rather than looping silently on red.
         transport.onWDAUnrecoverable = { [weak self] in
@@ -456,11 +498,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             }
         }
         updateHealthDot()        // grey — automation off
-        // Restore the last Automation choice (default off = view-only mirroring).
-        if UserDefaults.standard.bool(forKey: "imirror.automationEnabled") {
-            automationSwitch.state = .on
-            setAutomation(true)
-        }
+        // Automation now drives the entire mirror (WDA-MJPEG frames replace camera
+        // capture), so it always starts on launch instead of waiting for an opt-in.
+        automationSwitch.state = .on
+        setAutomation(true)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -469,6 +510,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         healthTimer?.invalidate()
         captureWatchdogTimer?.invalidate()
         transport.stop()
+        mjpeg?.stop()
         if movieOutput.isRecording { movieOutput.stopRecording() }
         if session.isRunning { session.stopRunning() }
     }
@@ -542,7 +584,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 430, height: 880))
 
         previewView = PreviewView(frame: container.bounds)
-        previewView.previewLayer.session = session
         previewView.autoresizingMask = [.width, .height]
         wireInput()
         container.addSubview(previewView)
@@ -755,36 +796,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     // MARK: NSToolbarDelegate
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.device, .record, .screenshot, .audio, .flexibleSpace, .health, .control, .settings, .home]
+        [.screenshot, .flexibleSpace, .health, .control, .settings, .home]
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.device, .record, .screenshot, .audio, .health, .control, .settings, .home, .flexibleSpace, .space]
+        [.screenshot, .health, .control, .settings, .home, .flexibleSpace, .space]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier,
                  willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
         switch id {
-        case .device:
-            let item = NSToolbarItem(itemIdentifier: .device)
-            item.label = "Device"
-            item.view = devicePopUp
-            return item
-
-        case .record:
-            recordItem = actionItem(.record, "Record", "record.circle",
-                                    #selector(toggleRecord), enabled: false)
-            return recordItem
-
         case .screenshot:
+            // enabled starts false and flips on via setHealth's .connected/.down
+            // branches now that there's no device-bind step to gate it on.
             screenshotItem = actionItem(.screenshot, "Screenshot", "camera.viewfinder",
                                         #selector(takeScreenshot), enabled: false)
             return screenshotItem
-
-        case .audio:
-            audioItem = actionItem(.audio, "Sound", "speaker.slash.fill",
-                                   #selector(toggleAudio), enabled: false)
-            return audioItem
 
         case .health:
             let item = NSToolbarItem(itemIdentifier: .health)
@@ -827,6 +854,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     // MARK: Permissions + session start
 
+    // TODO(cleanup): remove with CoreMediaIO engine — requestCameraAccessThenStart(),
+    // cameraActionTapped(), and showCameraDenied() are unreachable now that
+    // WDA-MJPEG drives the mirror (none of these are called from
+    // applicationDidFinishLaunching any more).
     private func requestCameraAccessThenStart() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
@@ -862,6 +893,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         setStatus("Camera access needed — grant it to start mirroring.")
     }
 
+    // TODO(cleanup): remove this whole function with the CoreMediaIO engine.
     private func configureSession() {
         session.beginConfiguration()
         if session.canAddOutput(movieOutput) { session.addOutput(movieOutput) }
@@ -872,15 +904,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         if session.canAddOutput(audioPreview) { session.addOutput(audioPreview) }
         session.commitConfiguration()
         refreshDevices()
-        if !session.isRunning {
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                self?.session.startRunning()
-            }
-        }
+        // session.startRunning() intentionally removed: the AVCaptureSession must never
+        // run now that WDA-MJPEG frames drive the mirror (the phone-audio hijack only
+        // happens while this session is RUNNING). TODO(cleanup): remove this whole
+        // function with the CoreMediaIO engine.
     }
 
     // MARK: Device discovery
 
+    // TODO(cleanup): remove with CoreMediaIO engine — observeDeviceChanges(),
+    // deviceChanged(_:), sessionRuntimeError(_:), sessionInterrupted(_:), and
+    // sessionInterruptionEnded(_:) are unreachable now that WDA-MJPEG drives the
+    // mirror (observeDeviceChanges() is no longer called, so none of the
+    // NotificationCenter observers it registers ever fire).
     private func observeDeviceChanges() {
         NotificationCenter.default.addObserver(
             self, selector: #selector(deviceChanged),
@@ -966,6 +1002,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     // MARK: Capture-pipe recovery
 
+    // TODO(cleanup): remove with CoreMediaIO engine — startCaptureWatchdog(),
+    // checkCaptureLiveness(), showWaitingUI(reason:), showMirroringUI(), and
+    // resetContentLiveness() are unreachable now that WDA-MJPEG drives the mirror
+    // (startCaptureWatchdog() is no longer called from applicationDidFinishLaunching).
     private func startCaptureWatchdog() {
         let t = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.checkCaptureLiveness() }
         RunLoop.main.add(t, forMode: .common)
@@ -1047,11 +1087,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         // never delivers (an iPhone on a call, a wedged endpoint) would look healthy
         // every cycle, reset the failed-recovery counter, and never be declared dead.
         switchToDevice(device, isRecovery: true)
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            if !self.session.isRunning { self.session.startRunning() }
-            mirrorLog.notice("capture rebind complete; stream restarted")
-        }
+        // session.startRunning() intentionally removed: the AVCaptureSession must
+        // never run now that WDA-MJPEG frames drive the mirror (the phone-audio
+        // hijack only happens while this session is RUNNING). This function is
+        // otherwise never invoked in practice (see checkCaptureLiveness — its
+        // watchdog no longer runs). TODO(cleanup): remove with the CoreMediaIO engine.
     }
 
     /// Frames stopped arriving while a phone is bound. We can't tell a transient
@@ -1099,6 +1139,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         consecutiveStaticFrames = 0
     }
 
+    // TODO(cleanup): remove with CoreMediaIO engine — refreshDevices(),
+    // switchToDevice(_:isRecovery:), deviceSelected(), and deviceChanged(_:) are
+    // unreachable now that WDA-MJPEG drives the mirror (configureSession(), the
+    // only caller that used to kick off this chain, is never invoked).
     private func refreshDevices() {
         discovery = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.external], mediaType: .muxed, position: .unspecified)
@@ -1185,6 +1229,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
 
     // MARK: Recording
 
+    // TODO(cleanup): remove with CoreMediaIO engine — toggleRecord(), fileOutput(...),
+    // toggleAudio(), and the recordItem/audioItem/audioPreview/audioOn machinery
+    // below are unreachable now that .record and .audio are gone from the toolbar.
     @objc private func toggleRecord() {
         if movieOutput.isRecording { movieOutput.stopRecording(); return }
         guard currentInput != nil else { return }
@@ -1213,7 +1260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
     // MARK: Screenshot
 
     @objc private func takeScreenshot() {
-        guard let pixelBuffer = frameGrabber.snapshot() else {
+        guard let cgImage = lastFrame else {
             setStatus("No frame yet — wait for the mirror to start.")
             return
         }
@@ -1221,17 +1268,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         let url = FileManager.default
             .urls(for: .picturesDirectory, in: .userDomainMask).first!
             .appendingPathComponent(name)
-        // Render + PNG-encode + write off the main thread: a CIContext render and a
-        // blocking file write (to a possibly iCloud-synced ~/Pictures) would
-        // otherwise hitch the UI on a click that should feel instant. Only the
-        // status update hops back to main.
+        // PNG-encode + write off the main thread: a blocking file write (to a possibly
+        // iCloud-synced ~/Pictures) would otherwise hitch the UI on a click that should
+        // feel instant. Only the status update hops back to main.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let ciImage = CIImage(cvImageBuffer: pixelBuffer)
-            guard let cgImage = self.ciContext.createCGImage(ciImage, from: ciImage.extent) else {
-                DispatchQueue.main.async { self.setStatus("Screenshot failed (could not render frame).") }
-                return
-            }
             let rep = NSBitmapImageRep(cgImage: cgImage)
             guard let png = rep.representation(using: .png, properties: [:]) else {
                 DispatchQueue.main.async { self.setStatus("Screenshot failed (could not encode PNG).") }
@@ -1277,8 +1318,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             guard let self, self.controlEnabled,
                   let size = self.wda?.deviceSize,
                   let start = self.devicePoint(fromViewPoint: viewPoint) else { return }
-            let videoRect = self.previewView.previewLayer.layerRectConverted(
-                fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
+            guard let frameSize = self.previewView.lastFrameSize else { return }
+            let videoRect = self.displayedImageRect(in: self.previewView.bounds, imageSize: frameSize)
             guard videoRect.width > 1, videoRect.height > 1 else { return }
             // Scale view-space scroll distance into device points and send one fast
             // swipe. Since the phone can't add inertia, `gain` amplifies the swipe
@@ -1302,13 +1343,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
         }
     }
 
-    /// Map a click in the preview to a device point. The preview layer's own rect
-    /// conversion handles letterboxing + orientation; mapToDevice (in iMirrorCore)
-    /// does the normalize + y-flip and is unit-tested.
+    /// Aspect-fit rect of `imageSize` centered within `bounds` (both in the view's
+    /// own y-up coordinate space) — the CALayer analogue of what
+    /// AVCaptureVideoPreviewLayer.layerRectConverted(fromMetadataOutputRect:) used
+    /// to compute automatically when the preview was capture-backed.
+    private func displayedImageRect(in bounds: CGRect, imageSize: CGSize) -> CGRect {
+        guard imageSize.width > 0, imageSize.height > 0, bounds.width > 0, bounds.height > 0 else { return bounds }
+        let scale = min(bounds.width / imageSize.width, bounds.height / imageSize.height)
+        let w = imageSize.width * scale
+        let h = imageSize.height * scale
+        let x = bounds.minX + (bounds.width - w) / 2
+        let y = bounds.minY + (bounds.height - h) / 2
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+
+    /// Map a click in the preview to a device point. The aspect-fit rect of the
+    /// latest MJPEG frame within the view handles letterboxing + orientation;
+    /// mapToDevice (in iMirrorCore) does the normalize + y-flip and is unit-tested.
     private func devicePoint(fromViewPoint p: CGPoint) -> CGPoint? {
-        guard let size = wda?.deviceSize else { return nil }
-        let videoRect = previewView.previewLayer.layerRectConverted(
-            fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
+        guard let size = wda?.deviceSize, let frameSize = previewView.lastFrameSize else { return nil }
+        let videoRect = displayedImageRect(in: previewView.bounds, imageSize: frameSize)
         return mapToDevice(viewPoint: p, videoRect: videoRect, deviceSize: size)
     }
 
@@ -1393,6 +1447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             downStatusWorkItem?.cancel(); downStatusWorkItem = nil
             controlSwitch.isEnabled = true
             homeItem?.isEnabled = true
+            screenshotItem?.isEnabled = true
             if changed {
                 let s = wda?.deviceSize ?? .zero
                 // Lock resizing to the phone's proportions so the mirror fills the
@@ -1402,6 +1457,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
                     window.contentAspectRatio = NSSize(width: s.width, height: s.height)
                 }
                 setStatus("WDA connected — \(Int(s.width))×\(Int(s.height)) pts. Flip Control to drive.")
+            }
+            // Start the MJPEG mirror the moment WDA is healthy. Guarded against
+            // double-start: setHealth(.connected) can fire on every probe tick
+            // once connected, and MJPEGClient.start() would otherwise tear down
+            // and reopen a perfectly good stream each time.
+            if mjpeg == nil {
+                // Host port 9110 forwards to the device's fixed WDA mjpegServerPort 9100, chosen to avoid colliding with other local services that commonly use 9100.
+                let client = MJPEGClient(port: 9110)
+                client.onFrame = { [weak self] cg in
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        self.lastFrame = cg
+                        self.previewView.setFrame(cg)
+                        if !self.mirroring {
+                            self.mirroring = true
+                            self.setEmptyState(hidden: true)
+                            self.setStatus("Mirroring — phone stays usable.")
+                        }
+                    }
+                }
+                client.onStateChange = { [weak self] connected in
+                    DispatchQueue.main.async {
+                        guard let self, !connected else { return }
+                        // MJPEG socket dropped independently of the WDA HTTP session — show
+                        // the waiting state until frames resume.
+                        self.mirroring = false
+                        self.setEmptyState(hidden: false)
+                        self.setStatus("Waiting for video from iPhone…")
+                    }
+                }
+                mjpeg = client
+                client.start()
             }
         case .connecting:
             downStatusWorkItem?.cancel(); downStatusWorkItem = nil
@@ -1417,6 +1504,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             }
             controlSwitch.isEnabled = false
             homeItem?.isEnabled = false
+            screenshotItem?.isEnabled = false
+            mjpeg?.stop()
+            mjpeg = nil
+            mirroring = false
+            setEmptyState(hidden: false)
             // Debounce the *status text* by 6s: a brief probe blip during heavy
             // scrolling flips health to .down for one cycle, and flashing
             // "Starting WebDriverAgent…" on every scroll is alarming and wrong.
@@ -1538,6 +1630,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate,
             installingRunner = false
             wda = nil
             transport.stop()
+            mjpeg?.stop()
+            mjpeg = nil
+            mirroring = false
             health = .down; downSince = nil
             updateHealthDot()        // grey — automation off
             setStatus("Automation off — mirror only (no control, no on-phone overlay).")
