@@ -562,6 +562,60 @@ final class ManagedProcessLivenessTests: XCTestCase {
     }
 }
 
+// MARK: - Chain-level and MJPEG recovery ladders
+
+final class ChainRecoveryActionTests: XCTestCase {
+    func testBelowGraceWaitsAtStageZero() {
+        XCTAssertEqual(nextChainRecoveryAction(downForSec: 30, stage: 0, graceSec: 55), .wait)
+    }
+
+    func testBelowGraceWaitsAtStageOne() {
+        XCTAssertEqual(nextChainRecoveryAction(downForSec: 30, stage: 1, graceSec: 55), .wait)
+    }
+
+    func testAtGraceAtStageZeroRestartsChain() {
+        XCTAssertEqual(nextChainRecoveryAction(downForSec: 55, stage: 0, graceSec: 55), .restartChain)
+    }
+
+    func testAboveGraceAtStageZeroRestartsChain() {
+        XCTAssertEqual(nextChainRecoveryAction(downForSec: 90, stage: 0, graceSec: 55), .restartChain)
+    }
+
+    func testAtGraceAtStageOneGivesUp() {
+        XCTAssertEqual(nextChainRecoveryAction(downForSec: 55, stage: 1, graceSec: 55), .giveUp)
+    }
+
+    func testAboveGraceAtStageOneGivesUp() {
+        XCTAssertEqual(nextChainRecoveryAction(downForSec: 120, stage: 1, graceSec: 55), .giveUp)
+    }
+}
+
+final class MjpegRecoveryActionTests: XCTestCase {
+    func testBelowThresholdWaits() {
+        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 19.9, alreadyBounced: false, thresholdSec: 20), .wait)
+    }
+
+    func testBelowThresholdWaitsEvenAlreadyBounced() {
+        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 5, alreadyBounced: true, thresholdSec: 20), .wait)
+    }
+
+    func testAtThresholdNotYetBouncedBouncesForward() {
+        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 20, alreadyBounced: false, thresholdSec: 20), .bounceForward)
+    }
+
+    func testAboveThresholdNotYetBouncedBouncesForward() {
+        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 45, alreadyBounced: false, thresholdSec: 20), .bounceForward)
+    }
+
+    func testAtThresholdAlreadyBouncedEscalates() {
+        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 20, alreadyBounced: true, thresholdSec: 20), .escalate)
+    }
+
+    func testAboveThresholdAlreadyBouncedEscalates() {
+        XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 41, alreadyBounced: true, thresholdSec: 20), .escalate)
+    }
+}
+
 final class CaptureContentSignalDoesNotAffectRecoveryTests: XCTestCase {
 
     private func decisionsMatch(visible: Bool = true,

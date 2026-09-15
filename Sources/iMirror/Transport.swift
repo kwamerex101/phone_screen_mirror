@@ -455,6 +455,36 @@ final class Transport {
         return ready
     }
 
+    /// Readiness probe for `runwda`'s readiness deadline: is WDA actually
+    /// serving `/status` as ready? Goes through the in-process relay on
+    /// 127.0.0.1:8100 — the SAME path WDAClient and everything else talks to
+    /// WDA through — rather than go-ios's raw `forward` port (8101) directly,
+    /// because CFNetwork/URLSession is unreliable against that port (see this
+    /// file's header comment; it's exactly why LocalRelay exists). The relay
+    /// is guaranteed up by the time this runs: `start()` calls `relay.start()`
+    /// synchronously before spawning any child, and `restartChain()` never
+    /// stops the relay, so it stays listening for the app's whole lifetime —
+    /// only the chain underneath it (tunnel/runwda/forward) gets torn down
+    /// and rebuilt.
+    private func wdaReadyThroughRelay() -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:8100/status") else { return false }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 2.0
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.waitsForConnectivity = false
+        let sem = DispatchSemaphore(value: 0)
+        var ready = false
+        URLSession(configuration: cfg).dataTask(with: req) { data, resp, _ in
+            if let code = (resp as? HTTPURLResponse)?.statusCode, (200..<300).contains(code),
+               let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                ready = WDAParse.ready(json)
+            }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 2.5)
+        return ready
+    }
+
     /// Start the go-ios children: the tunnel first, then — once the tunnel is
     /// actually ready — check/install the runner and launch runwda + forward.
     ///
@@ -495,7 +525,16 @@ final class Transport {
                            "--bundleid=\(WDAIdentity.runnerBundleId)",
                            "--testrunnerbundleid=\(WDAIdentity.testRunnerBundleId)",
                            "--xctestconfig=\(WDAIdentity.xctestConfig)"],
-                    label: "runwda", restartDelay: 6, workDir: self.workDir)
+                    label: "runwda", restartDelay: 6, workDir: self.workDir,
+                    // A wedged runwda never exits on its own, so the exit-triggered
+                    // respawn above can't recover it — give it a readiness deadline
+                    // instead. 40s is past the observed ~17-20s WDA boot. The check
+                    // runs on a background poll queue via wdaReadyThroughRelay(),
+                    // NOT a direct probe of go-ios's `forward` port: CFNetwork is
+                    // unreliable against that port (see the file header), which is
+                    // exactly why the relay exists.
+                    readinessCheck: { [weak self] in self?.wdaReadyThroughRelay() ?? false },
+                    readyWithin: 40, readinessPollInterval: 2)
                 wda.onGaveUp = { [weak self] _ in
                     DispatchQueue.main.async { self?.onWDAUnrecoverable?() }
                 }
@@ -602,6 +641,14 @@ final class Transport {
         mjpegForward?.stop()
         wda?.stop()
         tunnel?.stop()
+    }
+
+    /// Bounces just the `forward` child carrying the MJPEG port (9110 -> 9100),
+    /// for the app's MJPEG partial-wedge watchdog: WDA's HTTP session can stay
+    /// healthy while this narrower forward has quietly dropped, so it's worth
+    /// trying the cheap fix before escalating to a full chain restart.
+    func bounceMJPEGForward() {
+        mjpegForward?.bounce()
     }
 
     /// Full chain reset for the watchdog: when WDA is wedged early (often the
