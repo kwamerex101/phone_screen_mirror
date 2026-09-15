@@ -34,6 +34,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -44,6 +45,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import FastMCP, Image
+
+import wda_bringup
 
 
 class ErrorKind:
@@ -2466,5 +2469,39 @@ _REPORT_CSS = """
 """
 
 
+def _autowda_bring_up() -> None:
+    """Bring WDA up ourselves before serving, when IMIRROR_AUTOWDA is set.
+
+    When IMIRROR_AUTOWDA is set, this server brings WDA up itself and talks
+    to it directly at the go-ios forward port, 127.0.0.1:8101, with no
+    CFNetwork relay in front of it. That relay exists only for the Swift
+    macOS app's URLSession; this Python MCP server uses plain stdlib
+    sockets/urllib, so it can talk to the forward port directly and never
+    needs a relay. IMIRROR_WDA is not consulted for the AUTOWDA endpoint:
+    the endpoint always comes from WDABringup's own default of
+    127.0.0.1:8101, not from the module-level WDA variable.
+
+    Opt-in only: the default path (no IMIRROR_AUTOWDA) is unchanged, WDA
+    stays whatever IMIRROR_WDA/the default resolved to at import time.
+    Device-only; a simulator's WDA is brought up by scripts/sim-wda-up.sh
+    instead. Runs at serve time, not import time, so importing this module
+    never spawns anything and the loopback guard above still runs first.
+    """
+    global WDA
+    if not os.environ.get("IMIRROR_AUTOWDA") or _IS_SIM:
+        return
+    bringup = wda_bringup.WDABringup(
+        _ios_bin(),
+        udid=os.environ.get("IMIRROR_UDID") or None,
+        wda_ipa=os.environ.get("IMIRROR_WDA_IPA") or None,
+    )
+    try:
+        WDA = bringup.ensure_up()
+    except wda_bringup.WDABringupError as e:
+        print(f"wda_bringup: failed to bring up WebDriverAgent: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 if __name__ == "__main__":
+    _autowda_bring_up()
     mcp.run()

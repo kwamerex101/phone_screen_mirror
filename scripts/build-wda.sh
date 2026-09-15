@@ -12,12 +12,41 @@
 #   DEVELOPMENT_TEAM=<TEAMID> ./scripts/build-wda.sh
 #   tools/go-ios/bin/ios install --path=build/WebDriverAgent.ipa
 set -euo pipefail
+
+# Emits a single "IPHONEOS_DEPLOYMENT_TARGET=<v>" build-setting arg on stdout,
+# or nothing. Additive: only overrides when the active SDK's own minimum
+# deployment target is above WebDriverAgent's pinned 12.0 floor, so older
+# Xcode (whose floor is <= 12.0) is left exactly as before. Set
+# WDA_DEPLOYMENT_TARGET to force a specific value (e.g. 12.0 to opt out).
+wda_deployment_setting() {  # $1 = sdk name: iphonesimulator | iphoneos
+    local sdk="$1" proj_floor="12.0" sdk_min sdkpath plist lowest
+    if [[ -n "${WDA_DEPLOYMENT_TARGET:-}" ]]; then
+        echo "IPHONEOS_DEPLOYMENT_TARGET=${WDA_DEPLOYMENT_TARGET}"; return 0
+    fi
+    sdkpath="$(xcrun --sdk "$sdk" --show-sdk-path 2>/dev/null)" || return 0
+    plist="$sdkpath/SDKSettings.plist"
+    [[ -f "$plist" ]] || return 0
+    sdk_min="$(/usr/libexec/PlistBuddy -c "Print :SupportedTargets:$sdk:MinimumDeploymentTarget" "$plist" 2>/dev/null)" || return 0
+    [[ -n "$sdk_min" ]] || return 0
+    lowest="$(printf '%s\n%s\n' "$proj_floor" "$sdk_min" | sort -V | head -1)"
+    if [[ "$sdk_min" != "$proj_floor" && "$lowest" == "$proj_floor" ]]; then
+        echo "IPHONEOS_DEPLOYMENT_TARGET=$sdk_min"
+    fi
+    return 0
+}
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJ="$ROOT/tools/WebDriverAgent/WebDriverAgent.xcodeproj"
 : "${DEVELOPMENT_TEAM:?set DEVELOPMENT_TEAM to your paid Apple Team id}"
 DERIVED="$ROOT/build/wda-derived"
 BUNDLE_ID="com.local.imirror.WebDriverAgentRunner"
 DISPLAY_NAME="iMirror"
+
+# Additive Xcode-27 accommodation: only set when the device SDK's own
+# minimum deployment target exceeds WDA's pinned 12.0 (see
+# wda_deployment_setting above). Empty on older Xcode, so nothing changes.
+depset=()
+dep_setting="$(wda_deployment_setting iphoneos)"
+[[ -n "$dep_setting" ]] && depset=("$dep_setting")
 
 echo "==> building rebranded WebDriverAgentRunner (bundle id $BUNDLE_ID)"
 # Xcode-26 build accommodations for the vendored WDA:
@@ -42,7 +71,8 @@ xcodebuild build-for-testing \
     PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
     DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
     CODE_SIGN_STYLE=Automatic \
-    GCC_TREAT_WARNINGS_AS_ERRORS=NO
+    GCC_TREAT_WARNINGS_AS_ERRORS=NO \
+    "${depset[@]+"${depset[@]}"}"
 
 PROD="$DERIVED/Build/Products/Debug-iphoneos"
 RUNNER="$PROD/WebDriverAgentRunner-Runner.app"
