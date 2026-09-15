@@ -70,7 +70,10 @@ final class ManagedProcess {
     // iOS) would otherwise crash-loop at `restartDelay` forever. Count quick
     // deaths; back off exponentially, and after `maxQuickFailures` give up so the
     // app's slower chain-level watchdog takes over instead of a tight spin.
-    private var spawnedAt: Date?
+    // Monotonic (systemUptime, never Date()) and read/written only inside
+    // `lock`, matching the readiness-poll code, so `ranFor` below can't tear
+    // or get skewed by a Mac sleep between spawn and exit.
+    private var spawnedAt: TimeInterval?
     private var consecutiveFailures = 0
     private let maxQuickFailures = 8
     // A child that stayed up at least this long was healthy — a later exit is a
@@ -228,9 +231,12 @@ final class ManagedProcess {
             p.standardError = FileHandle.nullDevice
         }
         p.terminationHandler = { [weak self] _ in
-            guard let self, !self.isStopped else { return }
-            let ranFor = self.spawnedAt.map { Date().timeIntervalSince($0) } ?? 0
+            guard let self else { return }
             self.lock.lock()
+            guard !self.stopped else { self.lock.unlock(); return }
+            // F8: read alongside the other spawn-generation state, under the
+            // same lock, instead of racing the wall clock outside it.
+            let ranFor = self.spawnedAt.map { ProcessInfo.processInfo.systemUptime - $0 } ?? 0
             let wasKilledUnready = self.killedUnready
             self.killedUnready = false
             if wasKilledUnready {
@@ -268,8 +274,21 @@ final class ManagedProcess {
         do {
             try p.run()
             lock.lock()
+            if stopped {
+                // stop() landed between p.run() succeeding and this lock —
+                // no handle was ever assigned for this spawn, so stop()'s
+                // own terminate()/SIGKILL never reached it. Tear it down
+                // ourselves here instead of leaving it running, orphaned.
+                lock.unlock()
+                p.terminationHandler = nil
+                p.terminate()
+                DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+                    if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+                }
+                return
+            }
             process = p
-            spawnedAt = Date()
+            spawnedAt = ProcessInfo.processInfo.systemUptime
             generation += 1
             let myGeneration = generation
             readySeen = false
@@ -350,6 +369,15 @@ final class Transport {
     private var forward: ManagedProcess?
     private var mjpegForward: ManagedProcess?
 
+    // F7: one shared session for the readiness poll, reused for the app's
+    // whole lifetime, instead of a fresh `URLSession` (and its background
+    // threads) per probe — the poll fires every ~2s while runwda is booting.
+    private let readinessSession: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.waitsForConnectivity = false
+        return URLSession(configuration: cfg)
+    }()
+
     /// Set by the app to surface a terminal state when the WDA runner can't be
     /// started at all (bad signing / unsupported device) — invoked on the main
     /// thread. Distinct from a transient drop, which self-heals silently.
@@ -358,6 +386,14 @@ final class Transport {
     /// Set by the app to reflect the runner check/install (progress + outcome) in
     /// the UI. Invoked on the main thread.
     var onRunnerInstall: ((RunnerInstallEvent) -> Void)?
+
+    /// Set by the app to seed the chain-recovery ladder's clock at the point
+    /// `runwda` actually starts — after the tunnel is ready and the runner
+    /// install has finished — rather than at automation-on, which would
+    /// count tunnel/install time against WDA's own boot grace. Invoked on
+    /// the main thread once per chain bring-up (the initial `start()` and
+    /// each `restartChain()`).
+    var onRunwdaStarted: (() -> Void)?
 
     private func emitInstall(_ event: RunnerInstallEvent) {
         guard let cb = onRunnerInstall else { return }
@@ -379,6 +415,7 @@ final class Transport {
     var canSelfManage: Bool { goios != nil }
 
     func start() {
+        chainGeneration += 1   // F5: a fresh bring-up supersedes any prior one
         do { try relay.start() }
         catch { NSLog("iMirror: relay failed: \(error.localizedDescription)") }
         guard goios != nil else {
@@ -470,11 +507,9 @@ final class Transport {
         guard let url = URL(string: "http://127.0.0.1:8100/status") else { return false }
         var req = URLRequest(url: url)
         req.timeoutInterval = 2.0
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.waitsForConnectivity = false
         let sem = DispatchSemaphore(value: 0)
         var ready = false
-        URLSession(configuration: cfg).dataTask(with: req) { data, resp, _ in
+        readinessSession.dataTask(with: req) { data, resp, _ in
             if let code = (resp as? HTTPURLResponse)?.statusCode, (200..<300).contains(code),
                let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 ready = WDAParse.ready(json)
@@ -540,6 +575,10 @@ final class Transport {
                 }
                 self.wda = wda
                 wda.start()
+                // F2: this is the point the wedge risk actually starts —
+                // not automation-on, which also counts tunnel bring-up and
+                // the runner install against WDA's own boot grace.
+                self.onRunwdaStarted?()
                 self.forward = ManagedProcess(binary: bin, args: ["forward", "8101", "8100"],
                                               label: "forward", restartDelay: 3, workDir: self.workDir)
                 self.forward?.start()
@@ -651,6 +690,19 @@ final class Transport {
         mjpegForward?.bounce()
     }
 
+    /// F1: stop just the chain's children — NOT the in-process relay, which
+    /// must stay up so the readiness probe path keeps working and a later
+    /// `forceProbe()` -> `restartChain()` can still bring the chain back.
+    /// Used when the app's recovery ladder gives up for good: without this,
+    /// `runwda` keeps respawning (and getting SIGKILLed by its own readiness
+    /// deadline) forever after a hard stop, contradicting the whole point of
+    /// giving up.
+    func stopChain() {
+        chainGeneration += 1
+        forward?.stop(); mjpegForward?.stop(); wda?.stop(); tunnel?.stop()
+        forward = nil; mjpegForward = nil; wda = nil; tunnel = nil
+    }
+
     /// Full chain reset for the watchdog: when WDA is wedged early (often the
     /// tunnel/testmanagerd state), bouncing runwda alone isn't enough — tear the
     /// whole chain down, let the device settle, then bring it back up in order.
@@ -658,15 +710,24 @@ final class Transport {
     func restartChain() {
         NSLog("iMirror: restarting full go-ios chain")
         chainGeneration += 1
+        // F5: capture the generation this restart owns so the delayed
+        // bring-up below can tell whether a *later* stop/restart/stopChain
+        // has already superseded it before it sweeps and spawns — otherwise
+        // an automation toggle within this 4s window could spawn a second
+        // runwda/forward contending for the same port.
+        let gen = chainGeneration
         forward?.stop(); mjpegForward?.stop(); wda?.stop(); tunnel?.stop()
         forward = nil; mjpegForward = nil; wda = nil; tunnel = nil
         DispatchQueue.global().asyncAfter(deadline: .now() + 4) { [weak self] in
-            guard let self else { return }
+            guard let self, self.chainGeneration == gen else { return }
             // Our handles are stopped; reap any child that outlived its handle
             // (e.g. a tunnel reparented to launchd) so the fresh chain owns a
             // clean device + port 60105.
             self.sweepStrayProcesses()
-            DispatchQueue.main.async { self.startChildren() }
+            DispatchQueue.main.async {
+                guard self.chainGeneration == gen else { return }
+                self.startChildren()
+            }
         }
     }
 }

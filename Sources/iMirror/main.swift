@@ -293,8 +293,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     // aren't bringing WDA back.
     //
     // Monotonic (systemUptime, never Date()) so a Mac sleep can't skew it.
-    // Seeded when automation turns on and whenever health first drops to
-    // .down; cleared once health reconnects — see setAutomation/setHealth.
+    // Seeded at the point `runwda` actually starts (Transport.onRunwdaStarted
+    // — not automation-on, which would also count tunnel bring-up and the
+    // runner install against WDA's own boot grace) and, for a mid-session
+    // outage after a real prior connection, the moment health first drops to
+    // .down (a hung-but-still-running runwda never triggers a fresh spawn,
+    // so onRunwdaStarted alone would never catch it). Cleared once health
+    // reconnects — see setHealth.
     private var chainWedgeSince: TimeInterval?
     private var chainRecoveryStage = 0
     /// Set once a full chain restart still hasn't recovered WDA. While set,
@@ -302,9 +307,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     /// dot (forceProbe) re-arms it. Product decision: no silent background
     /// retries after a confirmed give-up.
     private var wdaHardStopped = false
-    /// How long each stage of the ladder gets before escalating: one
-    /// ManagedProcess readiness cycle (40s) plus WDA's own boot time.
-    private let chainRecoveryGraceSec: TimeInterval = 55
 
     // MJPEG partial-wedge watchdog (see nextMjpegRecoveryAction in
     // iMirrorCore): WDA's /status can stay healthy while the MJPEG stream has
@@ -313,6 +315,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private var mjpegLastFrameAt: TimeInterval?
     private var mjpegBounced = false
     private let mjpegNoFrameThresholdSec: TimeInterval = 20
+    /// Counts `.escalate` outcomes for the current connected session, reset
+    /// ONLY when a real frame arrives (not on every `setHealth(.connected)`,
+    /// which fires on every probe tick once connected). Past 2, a chain
+    /// restart clearly isn't bringing the stream back — stop looping and
+    /// surface a terminal state instead of restarting forever.
+    private var mjpegEscalationCount = 0
 
     // MARK: Lifecycle
 
@@ -325,6 +333,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             guard let self, self.automationEnabled, self.health == .down else { return }
             self.setStatus("WebDriverAgent installed but won't start — trust the developer "
                          + "on the phone: Settings ▸ General ▸ VPN & Device Management.")
+        }
+        // Seed the chain-recovery ladder's clock at the point runwda actually
+        // starts, not at automation-on (see the chainWedgeSince comment).
+        // Fires on every chain bring-up, including a restartChain() — that's
+        // fine, and load-bearing: it must NOT touch chainRecoveryStage, or
+        // the ladder would never advance past stage 0 and would never give up.
+        transport.onRunwdaStarted = { [weak self] in
+            self?.chainWedgeSince = ProcessInfo.processInfo.systemUptime
         }
         // Reflect the runner check/install (progress + outcome) in the UI. Invoked
         // on the main thread by Transport.
@@ -774,7 +790,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         guard wdaHardStopped else { probeNow(); return }
         wdaHardStopped = false
         chainRecoveryStage = 0
+        // Transport.onRunwdaStarted reseeds chainWedgeSince once the fresh
+        // chain's runwda actually starts; seed it here too so runWatchdog
+        // doesn't sit on `.wait` with a nil clock in the meantime.
         chainWedgeSince = ProcessInfo.processInfo.systemUptime
+        mjpegEscalationCount = 0     // give the user's retry its own two-strike allowance
+        mjpegBounced = false
         setStatus("Retrying WebDriverAgent…")
         transport.restartChain()
     }
@@ -819,16 +840,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         guard health == .down, !wdaHardStopped else { return }
         guard let wedgeSince = chainWedgeSince else { return }
         let downFor = ProcessInfo.processInfo.systemUptime - wedgeSince
-        switch nextChainRecoveryAction(downForSec: downFor, stage: chainRecoveryStage, graceSec: chainRecoveryGraceSec) {
+        // A mid-session wedge (WDA was up, then hung) escalates faster than
+        // initial boot or a fresh chain after a restart — see
+        // chainRecoveryGraceSec's doc comment in iMirrorCore.
+        let grace = chainRecoveryGraceSec(stage: chainRecoveryStage, postConnectionOutage: hadSuccessfulConnection)
+        switch nextChainRecoveryAction(downForSec: downFor, stage: chainRecoveryStage, graceSec: grace) {
         case .wait:
             break
         case .restartChain:
             chainRecoveryStage = 1
-            chainWedgeSince = ProcessInfo.processInfo.systemUptime   // restart the clock for the next stage
+            // Don't reseed chainWedgeSince here: Transport.onRunwdaStarted
+            // reseeds it once the new chain's runwda actually starts, which
+            // is the point that matters. Leaving the old value in the
+            // meantime means a chain that never even gets to spawning
+            // runwda again (e.g. a repeated install failure) still ages
+            // toward the next grace instead of stalling forever on .wait.
             setStatus("WebDriverAgent is taking longer than usual, resetting the connection…")
             transport.restartChain()
         case .giveUp:
             wdaHardStopped = true
+            // F1: stop the chain outright — otherwise runwda keeps
+            // respawning (and getting SIGKILLed by its own readiness
+            // deadline) forever after a "give up," which defeats the point.
+            // The relay stays up, so forceProbe()'s restartChain() re-arm
+            // below still works.
+            transport.stopChain()
             setStatus("WebDriverAgent won't start. Tap WDA to retry.")
         }
     }
@@ -840,6 +876,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     /// escalate to a full chain restart if that didn't bring frames back.
     private func checkMjpegWatchdog() {
         guard health == .connected, mjpeg != nil, let lastFrame = mjpegLastFrameAt else { return }
+        // With an external WDA (canSelfManage == false) there's no chain to
+        // bounce or restart — bouncing/escalating would be a no-op at best
+        // and a misleading status flash at worst. Once hard-stopped, this
+        // watchdog goes quiet too until the user retries via forceProbe().
+        guard transport.canSelfManage, !wdaHardStopped else { return }
         let noFrameFor = ProcessInfo.processInfo.systemUptime - lastFrame
         switch nextMjpegRecoveryAction(noFrameForSec: noFrameFor, alreadyBounced: mjpegBounced, thresholdSec: mjpegNoFrameThresholdSec) {
         case .wait:
@@ -849,6 +890,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             NSLog("iMirror: no MJPEG frames for \(Int(noFrameFor))s — bouncing the MJPEG forward")
             transport.bounceMJPEGForward()
         case .escalate:
+            mjpegEscalationCount += 1
+            if mjpegEscalationCount >= 2 {
+                // Two escalations with no real frame delivered in between:
+                // restarting the chain clearly isn't fixing this. Stop
+                // looping and surface a terminal state, same as the
+                // chain-recovery ladder's own give-up.
+                NSLog("iMirror: MJPEG still stalled after \(mjpegEscalationCount) chain restarts — giving up")
+                wdaHardStopped = true
+                transport.stopChain()
+                setStatus("No video from WebDriverAgent. Tap WDA to retry.")
+                return
+            }
             NSLog("iMirror: MJPEG still stalled after a forward bounce — escalating to a chain restart")
             // Restart the no-frame clock so this doesn't fire again on the next
             // tick before health actually flips to .down (which is what really
@@ -857,7 +910,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             mjpegBounced = false
             setStatus("Video stalled — resetting the connection…")
             chainRecoveryStage = 1
-            chainWedgeSince = ProcessInfo.processInfo.systemUptime
             transport.restartChain()
         }
     }
@@ -919,6 +971,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
                     DispatchQueue.main.async {
                         guard let self else { return }
                         self.mjpegLastFrameAt = ProcessInfo.processInfo.systemUptime
+                        // A real frame arrived — the stream is actually
+                        // delivering, so any earlier escalations no longer
+                        // count toward the two-strike give-up.
+                        self.mjpegEscalationCount = 0
                         self.lastFrame = cg
                         self.previewView.setFrame(cg)
                         if !self.mirroring {
@@ -951,12 +1007,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             if changed { setStatus("Connecting to WDA…") }
         case .down:
             if downSince == nil { downSince = Date() }
-            // Seed the ladder's monotonic clock the first time this outage
-            // shows up (it's also seeded at automation-on and reset at each
-            // restartChain — see setAutomation/runWatchdog). Without this, an
-            // outage that starts after a prior .connected (which clears it)
-            // would never start timing again.
-            if chainWedgeSince == nil { chainWedgeSince = ProcessInfo.processInfo.systemUptime }
+            // Seed the ladder's monotonic clock right here ONLY for a
+            // mid-session wedge after a real prior connection: a
+            // hung-but-still-running runwda never exits, so it never
+            // triggers a fresh spawn and Transport.onRunwdaStarted would
+            // never fire to seed the clock on its own. During initial boot
+            // (no prior connection yet), leave it nil and let
+            // onRunwdaStarted seed it once runwda actually starts — seeding
+            // it here too would count tunnel/install time against WDA's own
+            // boot grace, which is exactly what onRunwdaStarted exists to
+            // avoid.
+            if hadSuccessfulConnection, chainWedgeSince == nil {
+                chainWedgeSince = ProcessInfo.processInfo.systemUptime
+            }
             // Lost the connection — disarm control so stray clicks can't fire.
             if controlEnabled {
                 controlEnabled = false
@@ -1082,13 +1145,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         wdaHardStopped = false
         mjpegLastFrameAt = nil
         mjpegBounced = false
+        mjpegEscalationCount = 0
         if on {
             setStatus("Automation ON — starting WebDriverAgent… "
                     + "(iOS shows an \"Automation Running\" overlay on the phone).")
-            // Seed the ladder's clock now: WDA is down from the moment
-            // automation turns on, and its own boot time counts against the
-            // stage-0 grace window just like a mid-session outage would.
-            chainWedgeSince = ProcessInfo.processInfo.systemUptime
+            // Don't seed chainWedgeSince here: Transport.onRunwdaStarted
+            // seeds it once runwda actually starts, which is well after
+            // tunnel bring-up and the runner install — seeding it now would
+            // count that time against WDA's own boot grace.
             transport.start()        // spawn tunnel + runwda + forward + relay
             startHealthMonitor()     // begin probing; dot goes yellow → green
         } else {

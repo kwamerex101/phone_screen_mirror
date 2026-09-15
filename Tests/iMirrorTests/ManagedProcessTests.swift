@@ -140,6 +140,31 @@ final class ManagedProcessTests: XCTestCase {
         wait(for: [stillSame], timeout: 4)
     }
 
+    /// `stop()` right after `start()` must leave no child running. This
+    /// doesn't reach the exact `spawn()`-vs-`stop()` interleaving F4 guards
+    /// against (that race needs true concurrency to hit), but it does prove
+    /// the ordinary path -- SIGTERM via `terminate()`, escalating to SIGKILL
+    /// for a child that ignores it -- actually reaps the process rather than
+    /// leaving it to linger.
+    func testStopImmediatelyAfterStartLeavesNoRunningChild() {
+        let process = ManagedProcess(binary: URL(fileURLWithPath: "/bin/sh"),
+                                     args: ["-c", "trap \"\" TERM; exec sleep 100"],
+                                     label: "test-stop-race", restartDelay: 0.1, workDir: tempDir)
+        mp = process
+        process.start()
+        let pid = waitForPid(process)
+        XCTAssertNotNil(pid, "child never started")
+        process.stop()
+
+        let expectation = expectation(description: "child actually exits")
+        pollUntil(timeout: 3) {
+            guard let pid, kill(pid, 0) != 0 else { return false }   // ESRCH: process is gone
+            expectation.fulfill()
+            return true
+        }
+        wait(for: [expectation], timeout: 3)
+    }
+
     // MARK: - helpers
 
     private func waitForPid(_ process: ManagedProcess, timeout: TimeInterval = 2) -> pid_t? {

@@ -29,6 +29,23 @@ public func nextChainRecoveryAction(downForSec: TimeInterval, stage: Int, graceS
     return stage <= 0 ? .restartChain : .giveUp
 }
 
+/// How long stage 0 of the ladder should wait before escalating.
+///
+/// A mid-session wedge (WDA was up, then hung, `postConnectionOutage ==
+/// true`) can't be caught by `ManagedProcess`'s one-shot readiness poll —
+/// that poll only guards a fresh spawn, and a hung-but-still-running
+/// `runwda` never exits to trigger one. So at stage 0 with a real prior
+/// connection, escalate quickly (~30s) rather than waiting out a full boot
+/// window for a recovery path that was never going to fire.
+///
+/// Every other case — initial boot (`postConnectionOutage == false`) or a
+/// fresh chain brought up by a restart (stage >= 1) — needs the full
+/// tunnel + runner-install + WDA-boot cycle, so it gets the longer ~90s
+/// grace regardless of `postConnectionOutage`.
+public func chainRecoveryGraceSec(stage: Int, postConnectionOutage: Bool) -> TimeInterval {
+    (stage == 0 && postConnectionOutage) ? 30 : 90
+}
+
 /// What the MJPEG partial-wedge watchdog should do. WDA's `/status` can stay
 /// healthy while its MJPEG stream has silently died, so `health == .connected`
 /// alone doesn't guarantee frames are actually arriving.

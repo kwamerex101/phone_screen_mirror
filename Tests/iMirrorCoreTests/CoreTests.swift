@@ -590,6 +590,21 @@ final class ChainRecoveryActionTests: XCTestCase {
     }
 }
 
+final class ChainRecoveryGraceSecTests: XCTestCase {
+    func testStageZeroPostConnectionOutageEscalatesQuickly() {
+        XCTAssertEqual(chainRecoveryGraceSec(stage: 0, postConnectionOutage: true), 30)
+    }
+
+    func testStageZeroInitialBootGetsFullBootWindow() {
+        XCTAssertEqual(chainRecoveryGraceSec(stage: 0, postConnectionOutage: false), 90)
+    }
+
+    func testStageOneGetsFullBootWindowRegardlessOfPostConnectionOutage() {
+        XCTAssertEqual(chainRecoveryGraceSec(stage: 1, postConnectionOutage: true), 90)
+        XCTAssertEqual(chainRecoveryGraceSec(stage: 1, postConnectionOutage: false), 90)
+    }
+}
+
 final class MjpegRecoveryActionTests: XCTestCase {
     func testBelowThresholdWaits() {
         XCTAssertEqual(nextMjpegRecoveryAction(noFrameForSec: 19.9, alreadyBounced: false, thresholdSec: 20), .wait)
