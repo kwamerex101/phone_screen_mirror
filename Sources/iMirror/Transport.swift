@@ -61,8 +61,9 @@ final class ManagedProcess {
     private let workDir: URL
     private var process: Process?
     private var stopped = false
-    // `stopped`/`process` are touched from the caller's thread, the spawn-delay
-    // queue, AND Process.terminationHandler's private queue — guard every access.
+    // `stopped`/`process`/`generation`/`readySeen`/`killedUnready` are touched
+    // from the caller's thread, the spawn-delay queue, the readiness-poll queue,
+    // AND Process.terminationHandler's private queue — guard every access.
     private let lock = NSLock()
 
     // Circuit breaker: a child that can never start (bad signing, unsupported
@@ -81,12 +82,36 @@ final class ManagedProcess {
     /// instead of the channel silently looping on red.
     var onGaveUp: ((String) -> Void)?
 
-    init(binary: URL, args: [String], label: String, restartDelay: TimeInterval, workDir: URL) {
+    // Readiness deadline: a wedged `runwda` never exits, so the exit-triggered
+    // respawn above never fires for it. If a readiness check is supplied, poll it
+    // after spawn and SIGKILL the child if it never reports ready within
+    // `readyWithin`, so the existing termination handler respawns it anyway.
+    private let readinessCheck: (() -> Bool)?
+    private let readyWithin: TimeInterval
+    // Production cadence is 2s so an idle readiness check (typically an HTTP
+    // probe) doesn't spin. Tests inject a much shorter interval to exercise the
+    // deadline without a multi-second sleep per case.
+    private let readinessPollInterval: TimeInterval
+    // Bumped on every spawn so a readiness poll from a previous spawn can never
+    // act on (or kill) a newer process.
+    private var generation = 0
+    private var readySeen = false
+    // Set right before a readiness-deadline kill and consumed by the termination
+    // handler for that same spawn, so the failure counter can tell a wedge apart
+    // from a normal exit — see the termination handler below.
+    private var killedUnready = false
+
+    init(binary: URL, args: [String], label: String, restartDelay: TimeInterval, workDir: URL,
+         readinessCheck: (() -> Bool)? = nil, readyWithin: TimeInterval = 0,
+         readinessPollInterval: TimeInterval = 2) {
         self.binary = binary
         self.args = args
         self.label = label
         self.restartDelay = restartDelay
         self.workDir = workDir
+        self.readinessCheck = readinessCheck
+        self.readyWithin = readyWithin
+        self.readinessPollInterval = readinessPollInterval
     }
 
     private var isStopped: Bool {
@@ -94,8 +119,18 @@ final class ManagedProcess {
         return stopped
     }
 
+    /// The pid of the currently running spawn, if any. Test-only introspection.
+    var currentPidForTesting: pid_t? {
+        lock.lock(); defer { lock.unlock() }
+        return process?.isRunning == true ? process?.processIdentifier : nil
+    }
+
     func start() {
-        lock.lock(); stopped = false; consecutiveFailures = 0; lock.unlock()
+        lock.lock()
+        stopped = false
+        consecutiveFailures = 0
+        killedUnready = false
+        lock.unlock()
         spawn()
     }
 
@@ -124,6 +159,52 @@ final class ManagedProcess {
         NSLog("iMirror: bouncing \(label)")
         lock.lock(); let p = process; lock.unlock()
         p?.terminate()
+        // terminate() only sends SIGTERM; a wedged child ignores it and would
+        // never actually bounce. Escalate to SIGKILL shortly after if it's still
+        // running, off the caller's thread, same pattern as stop().
+        if let p {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+            }
+        }
+    }
+
+    /// Poll `readinessCheck` for the spawn identified by `myGeneration`, killing
+    /// its process if it never reports ready within `readyWithin`. Stops on its
+    /// own once ready, once a newer spawn replaces this one, or once stopped.
+    private func scheduleReadinessPoll(process p: Process, generation myGeneration: Int,
+                                       start: TimeInterval, check: @escaping () -> Bool) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + readinessPollInterval) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let stillCurrent = self.generation == myGeneration && !self.stopped
+            self.lock.unlock()
+            guard stillCurrent else { return }
+
+            if check() {
+                self.lock.lock()
+                if self.generation == myGeneration { self.readySeen = true }
+                self.lock.unlock()
+                return   // ready — poll is done
+            }
+
+            // Monotonic clock: ProcessInfo.systemUptime, never Date(), so a Mac
+            // sleep between polls can't skew the elapsed time and trigger a
+            // spurious kill right after wake.
+            let uptime = ProcessInfo.processInfo.systemUptime - start
+            self.lock.lock()
+            let shouldKill = self.generation == myGeneration && !self.stopped
+                && managedProcessShouldKillForUnreadiness(uptime: uptime, readySeen: self.readySeen, readyWithin: self.readyWithin)
+            if shouldKill { self.killedUnready = true }
+            self.lock.unlock()
+
+            if shouldKill {
+                NSLog("iMirror: \(self.label) not ready within \(Int(self.readyWithin))s — killing")
+                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
+                return
+            }
+            self.scheduleReadinessPoll(process: p, generation: myGeneration, start: start, check: check)
+        }
     }
 
     private func spawn() {
@@ -150,7 +231,15 @@ final class ManagedProcess {
             guard let self, !self.isStopped else { return }
             let ranFor = self.spawnedAt.map { Date().timeIntervalSince($0) } ?? 0
             self.lock.lock()
-            if ranFor >= self.healthyRuntimeSec {
+            let wasKilledUnready = self.killedUnready
+            self.killedUnready = false
+            if wasKilledUnready {
+                // A readiness-deadline kill is a failed launch no matter how long
+                // the wedged process happened to sit there — it never actually
+                // served WDA, so it must NOT reset the streak like a healthy exit
+                // would, or a permanent wedge would never trip the give-up breaker.
+                self.consecutiveFailures += 1
+            } else if ranFor >= self.healthyRuntimeSec {
                 self.consecutiveFailures = 0        // was healthy; this is a normal drop
             } else {
                 self.consecutiveFailures += 1       // died fast; likely a failed launch
@@ -178,8 +267,18 @@ final class ManagedProcess {
         }
         do {
             try p.run()
-            lock.lock(); process = p; spawnedAt = Date(); lock.unlock()
+            lock.lock()
+            process = p
+            spawnedAt = Date()
+            generation += 1
+            let myGeneration = generation
+            readySeen = false
+            lock.unlock()
             NSLog("iMirror: started \(label) (pid \(p.processIdentifier))")
+            if let readinessCheck, readyWithin > 0 {
+                scheduleReadinessPoll(process: p, generation: myGeneration,
+                                      start: ProcessInfo.processInfo.systemUptime, check: readinessCheck)
+            }
         } catch {
             NSLog("iMirror: failed to start \(label): \(error.localizedDescription)")
         }

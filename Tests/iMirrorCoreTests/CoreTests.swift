@@ -534,6 +534,34 @@ final class CaptureWaitingReasonTests: XCTestCase {
     }
 }
 
+// MARK: - ManagedProcess readiness-deadline boundary
+
+final class ManagedProcessLivenessTests: XCTestCase {
+    func testBelowDeadlineDoesNotKill() {
+        XCTAssertFalse(managedProcessShouldKillForUnreadiness(uptime: 1.4, readySeen: false, readyWithin: 1.5))
+    }
+
+    func testAtDeadlineKills() {
+        XCTAssertTrue(managedProcessShouldKillForUnreadiness(uptime: 1.5, readySeen: false, readyWithin: 1.5))
+    }
+
+    func testAboveDeadlineKills() {
+        XCTAssertTrue(managedProcessShouldKillForUnreadiness(uptime: 3.0, readySeen: false, readyWithin: 1.5))
+    }
+
+    func testReadySeenNeverKillsEvenPastDeadline() {
+        XCTAssertFalse(managedProcessShouldKillForUnreadiness(uptime: 10, readySeen: true, readyWithin: 1.5))
+    }
+
+    func testDeadlineDisabledWhenReadyWithinIsZero() {
+        XCTAssertFalse(managedProcessShouldKillForUnreadiness(uptime: 100, readySeen: false, readyWithin: 0))
+    }
+
+    func testDeadlineDisabledWhenReadyWithinIsNegative() {
+        XCTAssertFalse(managedProcessShouldKillForUnreadiness(uptime: 100, readySeen: false, readyWithin: -1))
+    }
+}
+
 final class CaptureContentSignalDoesNotAffectRecoveryTests: XCTestCase {
 
     private func decisionsMatch(visible: Bool = true,
