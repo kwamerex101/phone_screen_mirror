@@ -19,11 +19,22 @@ import os
 /// field reports (black mirror on a user's Mac) undiagnosable without a debugger.
 let mirrorLog = Logger(subsystem: "com.local.imirror", category: "capture")
 
+/// Shared ease-out curve for the app's micro-animations (strong deceleration).
+let iMirrorEaseOut = CAMediaTimingFunction(controlPoints: 0.23, 1, 0.32, 1)
+
+/// True when the user asked macOS to minimize motion; animations drop their
+/// movement and keep opacity changes only.
+var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+
 // MARK: - Preview view (hosts preview layer + captures mouse/keyboard)
 
 final class PreviewView: NSView {
     /// Displays decoded WDA-MJPEG frames (plain CGImages).
     private let imageLayer = CALayer()
+
+    /// Accent ring shown while Control is armed. Non-interactive, sits above
+    /// the image and below tap ripples (added later as sublayers).
+    private let controlRing = CAShapeLayer()
 
     /// Pixel size of the most recently displayed frame (set by `setFrame`).
     /// AppDelegate uses this to compute the aspect-fit video rect for coordinate
@@ -50,12 +61,20 @@ final class PreviewView: NSView {
         imageLayer.backgroundColor = NSColor.black.cgColor
         imageLayer.frame = bounds
         layer?.addSublayer(imageLayer)
+
+        controlRing.fillColor = nil
+        controlRing.strokeColor = NSColor.controlAccentColor.withAlphaComponent(0.85).cgColor
+        controlRing.lineWidth = 2
+        controlRing.opacity = 0
+        layer?.addSublayer(controlRing)
     }
     required init?(coder: NSCoder) { fatalError("not used") }
 
     override func layout() {
         super.layout()
         imageLayer.frame = bounds
+        controlRing.frame = bounds
+        controlRing.path = CGPath(rect: bounds.insetBy(dx: 1, dy: 1), transform: nil)
     }
 
     /// Displays a freshly decoded MJPEG frame. Main-thread only: the MJPEG
@@ -75,6 +94,14 @@ final class PreviewView: NSView {
         didSet {
             guard controlActive != oldValue else { return }
             window?.invalidateCursorRects(for: self)
+            let target: Float = controlActive ? 1 : 0
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = controlRing.presentation()?.opacity ?? controlRing.opacity
+            fade.toValue = target
+            fade.duration = controlActive ? 0.2 : 0.15
+            fade.timingFunction = controlActive ? iMirrorEaseOut : CAMediaTimingFunction(name: .easeIn)
+            controlRing.opacity = target
+            controlRing.add(fade, forKey: "ringFade")
         }
     }
 
@@ -96,14 +123,18 @@ final class PreviewView: NSView {
         ripple.opacity = 0
         layer?.addSublayer(ripple)
 
-        let scale = CABasicAnimation(keyPath: "transform.scale")
-        scale.fromValue = 0.35
-        scale.toValue = 1.0
         let fade = CABasicAnimation(keyPath: "opacity")
         fade.fromValue = 0.9
         fade.toValue = 0.0
         let group = CAAnimationGroup()
-        group.animations = [scale, fade]
+        if reduceMotion {
+            group.animations = [fade]
+        } else {
+            let scale = CABasicAnimation(keyPath: "transform.scale")
+            scale.fromValue = 0.35
+            scale.toValue = 1.0
+            group.animations = [scale, fade]
+        }
         group.duration = 0.35
         group.timingFunction = CAMediaTimingFunction(name: .easeOut)
         ripple.add(group, forKey: "tapFlash")
@@ -223,6 +254,18 @@ final class PassthroughEffectView: NSVisualEffectView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
+/// Multi-line label that wraps at its current width. Auto Layout needs the wrap
+/// width up front to compute the height, so keep it in sync on every resize.
+final class WrappingLabel: NSTextField {
+    override func layout() {
+        super.layout()
+        if preferredMaxLayoutWidth != bounds.width {
+            preferredMaxLayoutWidth = bounds.width
+            invalidateIntrinsicContentSize()
+        }
+    }
+}
+
 // MARK: - Toolbar item identifiers
 
 private extension NSToolbarItem.Identifier {
@@ -237,6 +280,7 @@ private extension NSToolbarItem.Identifier {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private var window: NSWindow!
+    private let screenshotThumbnail = ScreenshotThumbnail()
     private var previewView: PreviewView!
     private var emptyStateView: NSView!
     private var statusLabel: NSTextField!
@@ -475,10 +519,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         hud.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(hud)
 
-        statusLabel = NSTextField(labelWithString: "Looking for iPhone…")
+        statusLabel = WrappingLabel(wrappingLabelWithString: "Looking for iPhone…")
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.font = .systemFont(ofSize: 11)
-        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.maximumNumberOfLines = 0
+        statusLabel.wantsLayer = true   // for the text cross-fade in setStatus
+        // Long status lines wrap onto more lines (the HUD grows upward) instead
+        // of being cut off; low compression resistance keeps the text from
+        // widening the window.
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         hud.addSubview(statusLabel)
 
@@ -696,7 +745,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             }
             do {
                 try png.write(to: url)
-                DispatchQueue.main.async { self.setStatus("Saved \(url.lastPathComponent) → ~/Pictures") }
+                DispatchQueue.main.async {
+                    self.setStatus("Saved \(url.lastPathComponent) → ~/Pictures")
+                    self.screenshotThumbnail.show(image: cgImage, fileURL: url, over: self.window)
+                }
             } catch {
                 DispatchQueue.main.async { self.setStatus("Screenshot save failed: \(error.localizedDescription)") }
             }
@@ -1097,7 +1149,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             healthDotColor = color
         }
         let key = "connectingPulse"
-        if pulsing {
+        if pulsing && reduceMotion {
+            // No looping pulse: hold a dimmed dot so "in progress" still reads.
+            healthButton.layer?.removeAnimation(forKey: key)
+            healthButton.alphaValue = 0.6
+        } else if pulsing {
+            healthButton.alphaValue = 1.0
             if healthButton.layer?.animation(forKey: key) == nil {
                 let pulse = CABasicAnimation(keyPath: "opacity")
                 pulse.fromValue = 1.0
@@ -1109,6 +1166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             }
         } else {
             healthButton.layer?.removeAnimation(forKey: key)
+            healthButton.alphaValue = 1.0
         }
     }
 
@@ -1302,6 +1360,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
 
         simPicker.target = self
         simPicker.action = #selector(simPicked)
+        // Fixed to the column width so a long sim name truncates instead of
+        // widening the popup past the popover's side margins.
+        simPicker.translatesAutoresizingMaskIntoConstraints = false
+        simPicker.widthAnchor.constraint(equalToConstant: 268).isActive = true
+        (simPicker.cell as? NSPopUpButtonCell)?.lineBreakMode = .byTruncatingTail
         stack.addArrangedSubview(simPicker)
 
         simEnableButton.bezelStyle = .rounded
@@ -1447,8 +1510,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     }
 
     private func setStatus(_ text: String) {
-        statusLabel.stringValue = text
         NSLog("iMirror: \(text)")
+        guard statusLabel.stringValue != text else { return }
+        let fade = CATransition()
+        fade.type = .fade
+        fade.duration = 0.15
+        statusLabel.layer?.add(fade, forKey: "statusText")
+        statusLabel.stringValue = text
+        // The HUD grows or shrinks with the wrapped text; animate that height change.
+        guard let content = window.contentView else { return }
+        if reduceMotion {
+            content.layoutSubtreeIfNeeded()
+        } else {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.2
+                ctx.timingFunction = iMirrorEaseOut
+                ctx.allowsImplicitAnimation = true
+                content.layoutSubtreeIfNeeded()
+            }
+        }
     }
 
     /// Actionable, per-cause message for a failed runner install.
