@@ -47,8 +47,10 @@ Features:
   **WebDriverAgent app status**, and the app version/build.
 - **Auto-installs the runner** — on connect, the app checks whether the
   WebDriverAgent app is on the connected iPhone and installs the bundled build if
-  it's missing, with progress and actionable errors (e.g. "not signed for this
-  iPhone — re-sign for this device"). A pre-provisioned device just works.
+  it's missing or older than the bundled one, with progress and actionable errors
+  (e.g. "not signed for this iPhone — re-sign for this device"). It never
+  downgrades, and if an upgrade fails it keeps the runner already on the phone. A
+  pre-provisioned device just works.
 - **iOS Simulator support** — no physical phone required: **Settings (⚙) → iOS
   Simulator** picks a booted simulator, brings up WebDriverAgent on it, and
   registers a dedicated `imirror-sim` MCP server, so an agent can drive and test
@@ -176,9 +178,12 @@ On launch the app connects to the iPhone and brings up WebDriverAgent
 automatically (health dot green within ~30 s) — the phone stays unlocked and
 keeps its own audio, though iOS shows the "Automation Running" overlay while
 this runs. The mirror appears as soon as frames start arriving. **Screenshot**
-saves a PNG of the latest frame.
+saves a PNG of the latest frame to `~/Pictures` and shows a thumbnail in the
+window's lower-right corner: drag it into Finder, Slack or an editor to drop the
+file there, or click it to open it in Preview. It fades after a few seconds.
 
-Flip the **Control** switch to send taps / swipes / typing from the preview.
+Flip the **Control** switch to send taps / swipes / typing from the preview; an
+accent-colored outline around the mirror shows while Control is on.
 (On a narrow window, Control collapses into the toolbar's `»` overflow menu,
 where it still works.) The Settings (⚙) popover also holds a scroll-speed
 slider and the one-click **MCP server install** described below.
@@ -295,7 +300,8 @@ tunnel / runwda / forward chain and talks to WDA directly. Useful for driving
 the phone from an agent without launching the GUI.
 
 **iOS Simulator (optional).** No phone handy, or testing a simulator build?
-**Settings (⚙) → iOS Simulator** lists your simulators; pick one and **Enable** to
+**Settings (⚙) → iOS Simulator** lists your iOS simulators (iPhone and iPad; watchOS
+and tvOS can't run the simulator WebDriverAgent build); pick one and **Enable** to
 boot it and bring WebDriverAgent up on it (loopback `:8201`, so it coexists with a
 physical device on `:8100`), then **Install** the `imirror-sim` MCP server. You
 view and drive the sim through Apple's Simulator app and Claude — same `ios_*`
