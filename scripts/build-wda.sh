@@ -15,11 +15,11 @@ set -euo pipefail
 
 # Emits a single "IPHONEOS_DEPLOYMENT_TARGET=<v>" build-setting arg on stdout,
 # or nothing. Additive: only overrides when the active SDK's own minimum
-# deployment target is above WebDriverAgent's pinned 12.0 floor, so older
-# Xcode (whose floor is <= 12.0) is left exactly as before. Set
-# WDA_DEPLOYMENT_TARGET to force a specific value (e.g. 12.0 to opt out).
+# deployment target is above WebDriverAgent's pinned 15.0 floor, so older
+# Xcode (whose floor is <= 15.0) is left exactly as before. Set
+# WDA_DEPLOYMENT_TARGET to force a specific value (e.g. 15.0 to opt out).
 wda_deployment_setting() {  # $1 = sdk name: iphonesimulator | iphoneos
-    local sdk="$1" proj_floor="12.0" sdk_min sdkpath plist lowest
+    local sdk="$1" proj_floor="15.0" sdk_min sdkpath plist lowest
     if [[ -n "${WDA_DEPLOYMENT_TARGET:-}" ]]; then
         echo "IPHONEOS_DEPLOYMENT_TARGET=${WDA_DEPLOYMENT_TARGET}"; return 0
     fi
@@ -42,7 +42,7 @@ BUNDLE_ID="com.local.imirror.WebDriverAgentRunner"
 DISPLAY_NAME="iMirror"
 
 # Additive Xcode-27 accommodation: only set when the device SDK's own
-# minimum deployment target exceeds WDA's pinned 12.0 (see
+# minimum deployment target exceeds WDA's pinned 15.0 (see
 # wda_deployment_setting above). Empty on older Xcode, so nothing changes.
 depset=()
 dep_setting="$(wda_deployment_setting iphoneos)"
@@ -94,7 +94,7 @@ cat > "$ICONSET/Contents.json" <<'JSON'
   "info":{"author":"xcode","version":1} }
 JSON
 xcrun actool "$ROOT/build/AppIcon.xcassets" --compile "$ASSETS" \
-  --platform iphoneos --minimum-deployment-target 12.0 --app-icon AppIcon \
+  --platform iphoneos --minimum-deployment-target 15.0 --app-icon AppIcon \
   --output-partial-info-plist "$ASSETS/partial.plist" >/dev/null
 
 # Preserve the runner's entitlements (get-task-allow etc.) across the re-sign —
@@ -107,6 +107,11 @@ cp "$ASSETS/Assets.car" "$RUNNER/Assets.car"
 cp "$ASSETS"/AppIcon*.png "$RUNNER/" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $DISPLAY_NAME" "$RUNNER/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $DISPLAY_NAME" "$RUNNER/Info.plist"
+# Stamp the WDA release version; the app compares it with the phone's copy to decide on upgrades.
+WDA_VERSION="$(/usr/bin/plutil -extract version raw "$ROOT/tools/WebDriverAgent/package.json")"
+[ -n "$WDA_VERSION" ] || { echo "error: could not read WDA version from tools/WebDriverAgent/package.json" >&2; exit 1; }
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $WDA_VERSION" "$RUNNER/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $WDA_VERSION" "$RUNNER/Info.plist"
 /usr/libexec/PlistBuddy -c "Merge $ASSETS/partial.plist" "$RUNNER/Info.plist"
 
 # Re-sign with the same Apple Development identity + preserved entitlements.
@@ -121,4 +126,4 @@ mkdir -p "$ROOT/build/Payload"
 cp -R "$RUNNER" "$ROOT/build/Payload/"
 ( cd "$ROOT/build" && zip -qr WebDriverAgent.ipa Payload )
 rm -rf "$ROOT/build/Payload"
-echo "==> ipa: $ROOT/build/WebDriverAgent.ipa  (id ${BUNDLE_ID}.xctrunner, name '$DISPLAY_NAME', branded icon)"
+echo "==> ipa: $ROOT/build/WebDriverAgent.ipa  (id ${BUNDLE_ID}.xctrunner, name '$DISPLAY_NAME', branded icon, WDA $WDA_VERSION)"

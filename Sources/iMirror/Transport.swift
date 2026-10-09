@@ -368,6 +368,7 @@ final class Transport {
     private var wda: ManagedProcess?
     private var forward: ManagedProcess?
     private var mjpegForward: ManagedProcess?
+    private var bundledVersionCache: String?
 
     // F7: one shared session for the readiness poll, reused for the app's
     // whole lifetime, instead of a fresh `URLSession` (and its background
@@ -547,7 +548,7 @@ final class Transport {
             }
             guard self.chainGeneration == gen else { return }
             // Now that the tunnel is up, check/install the runner.
-            let installResult = self.installRunnerIfMissing(bin: bin)
+            let installResult = self.installOrUpgradeRunner(bin: bin)
             guard self.chainGeneration == gen else { return }
             // A failed install with the runner still absent → don't launch runwda;
             // it would only fail-loop. The UI already showed the failure reason.
@@ -589,29 +590,46 @@ final class Transport {
         }
     }
 
-    /// Check for the branded runner and install the bundled ipa if it's missing.
+    /// Check for the branded runner and install the bundled ipa if it's missing,
+    /// or reinstall it when the phone's copy is older than the bundled one.
     /// Runs on each bring-up (no once-per-launch guard) — the check is cheap and
-    /// only shells `install` when the runner is actually absent. Emits progress
+    /// only shells `install` when the runner is absent or outdated. Emits progress
     /// via onRunnerInstall and returns the outcome so the caller can decide
     /// whether launching runwda is worthwhile.
-    private func installRunnerIfMissing(bin: URL) -> RunnerInstall {
+    private func installOrUpgradeRunner(bin: URL) -> RunnerInstall {
         emitInstall(.checking)
         guard let ipa = Bundle.main.url(forResource: "WebDriverAgent", withExtension: "ipa") else {
             // dev builds ship no bundled ipa; runner installed via build-wda.sh/Xcode
             emitInstall(.done(.noBundle))
             return .noBundle
         }
-        if runnerIsInstalled(bin: bin) {
+        let installed = installedRunnerVersion(bin: bin)
+        let bundled = bundledRunnerVersion(ipa: ipa)
+        switch runnerAction(installed: installed, bundled: bundled) {
+        case .keep:
             emitInstall(.done(.alreadyPresent))
             return .alreadyPresent
+        case .install:
+            emitInstall(.installing)
+            let result = installWithRetry(bin: bin, ipaPath: ipa.path)
+            emitInstall(.done(result))
+            return result
+        case .upgrade:
+            NSLog("iMirror: upgrading WDA runner \(installed ?? "?") -> \(bundled ?? "?")")
+            emitInstall(.installing)
+            var result = installWithRetry(bin: bin, ipaPath: ipa.path)
+            if case .failed = result {
+                // The older runner is still on the device, so runwda can launch with it.
+                NSLog("iMirror: WDA runner upgrade failed (\(result)); keeping the installed runner")
+                result = .alreadyPresent
+            }
+            emitInstall(.done(result))
+            return result
         }
-        emitInstall(.installing)
-        // `install` routes through the RSD tunnel, which stays unusable for a few
-        // seconds after it first appears in /tunnels — an attempt in that window
-        // bails immediately (no zipconduit progress) rather than reaching the
-        // device. Retry through that warmup, but stop early once we've reached a
-        // real, classifiable failure (device-side ERROR) so we don't retry a
-        // provisioning/lock error that will never succeed.
+    }
+
+    /// Run `ios install` with retries; returns `.installed` or the final `.failed`.
+    private func installWithRetry(bin: URL, ipaPath: String) -> RunnerInstall {
         // `install` routes through the RSD tunnel, which is briefly unusable right
         // after it comes up — an attempt in that window bails without a recognized
         // error (classifies as .other). Retry those (transient) but break
@@ -622,7 +640,7 @@ final class Transport {
         let maxAttempts = 8
         var result: RunnerInstall = .failed(.other(raw: "install did not run"))
         for attempt in 0..<maxAttempts {
-            let (status, stderr) = runInstallOnce(bin: bin, ipaPath: ipa.path)
+            let (status, stderr) = runInstallOnce(bin: bin, ipaPath: ipaPath)
             if status == 0 { result = .installed; break }
             let cls = classifyInstallError(stderr)
             result = .failed(cls)
@@ -632,7 +650,6 @@ final class Transport {
                 break                                       // definitive → stop now
             }
         }
-        emitInstall(.done(result))
         return result
     }
 
@@ -657,8 +674,9 @@ final class Transport {
     }
 
 
-    /// True if the branded runner id already appears in `ios apps --list`.
-    private func runnerIsInstalled(bin: URL) -> Bool {
+    /// The branded runner's version as listed by `ios apps --list`: nil if it
+    /// isn't installed (or the listing failed), "" if installed without a version.
+    private func installedRunnerVersion(bin: URL) -> String? {
         let p = Process()
         p.executableURL = bin
         p.arguments = ["apps", "--list"]
@@ -666,11 +684,35 @@ final class Transport {
         p.standardOutput = pipe
         p.standardError = FileHandle.nullDevice
         do {
-            try p.run(); p.waitUntilExit()
+            try p.run()
+            // Drain stdout before waiting so a full pipe buffer can't deadlock.
             let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
                              encoding: .utf8) ?? ""
-            return out.contains("com.local.imirror.WebDriverAgentRunner")
-        } catch { return false }
+            p.waitUntilExit()
+            return runnerVersion(inAppsList: out, bundleId: WDAIdentity.runnerBundleId)
+        } catch { return nil }
+    }
+
+    /// CFBundleShortVersionString of the runner inside the bundled ipa, read via
+    /// `unzip -p`. Cached since the ipa can't change during an app launch.
+    private func bundledRunnerVersion(ipa: URL) -> String? {
+        if let cached = bundledVersionCache { return cached }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        p.arguments = ["-p", ipa.path, "Payload/*.app/Info.plist"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            guard let plist = try PropertyListSerialization.propertyList(from: data, format: nil)
+                    as? [String: Any],
+                  let v = plist["CFBundleShortVersionString"] as? String else { return nil }
+            bundledVersionCache = v
+            return v
+        } catch { return nil }
     }
 
     func stop() {

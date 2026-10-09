@@ -124,8 +124,8 @@ exact commits and scan results:
 
 ```bash
 mkdir -p tools && cd tools
-git clone --depth 1 --branch v1.1.0 https://github.com/danielpaulus/go-ios
-git clone --depth 1 --branch v9.9.0 https://github.com/appium/WebDriverAgent
+git clone --depth 1 --branch v1.3.2 https://github.com/danielpaulus/go-ios
+git clone --depth 1 --branch v16.14.2 https://github.com/appium/WebDriverAgent
 
 # (optional but recommended) scan before building:
 osv-scanner scan source -r --no-ignore --include-git-root go-ios

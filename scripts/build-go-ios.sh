@@ -14,8 +14,7 @@ SRC="$ROOT/tools/go-ios"
 cd "$SRC"
 
 # Same patched transitive deps the security audit records (SECURITY-AUDIT.md).
-GOWORK=off go get golang.org/x/crypto@v0.52.0 golang.org/x/net@v0.55.0 \
-                  github.com/quic-go/quic-go@v0.49.1
+GOWORK=off go get golang.org/x/crypto@v0.57.0 golang.org/x/net@v0.60.0
 GOWORK=off go mod tidy
 
 echo "==> building go-ios arm64 + amd64 (CGO off, root module only)"
