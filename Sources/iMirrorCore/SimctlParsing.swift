@@ -21,7 +21,10 @@ public enum SimctlParsing {
               let devices = root["devices"] as? [String: Any] else { return [] }
         var out: [SimDevice] = []
         for (runtimeKey, value) in devices {
-            guard let list = value as? [[String: Any]] else { continue }
+            // iOS only: the sim WDA build targets iphonesimulator, so watchOS /
+            // tvOS / visionOS sims can't be driven and would only fail on Enable.
+            guard runtimeKey.contains(".SimRuntime.iOS-"),
+                  let list = value as? [[String: Any]] else { continue }
             let runtime = humanizeRuntime(runtimeKey)
             for d in list {
                 guard let udid = d["udid"] as? String,

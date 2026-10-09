@@ -267,14 +267,19 @@ final class SimctlParsingTests: XCTestCase {
 
     func testParsesAndSortsBootedFirst() {
         let sims = SimctlParsing.parseSimulators(json)
-        XCTAssertEqual(sims.map(\.udid), ["AAA", "WWW", "BBB"])
+        XCTAssertEqual(sims.map(\.udid), ["AAA", "BBB"])
         XCTAssertEqual(sims[0], SimDevice(udid: "AAA", name: "iPhone 17 Pro",
                                           runtime: "iOS 26.5", isBooted: true))
     }
 
     func testRuntimeHumanized() {
         let sims = SimctlParsing.parseSimulators(json)
-        XCTAssertEqual(sims.first(where: { $0.udid == "WWW" })?.runtime, "watchOS 11.0")
+        XCTAssertEqual(sims.first(where: { $0.udid == "BBB" })?.runtime, "iOS 26.5")
+    }
+
+    func testSkipsNonIOSRuntimes() {
+        let sims = SimctlParsing.parseSimulators(json)
+        XCTAssertNil(sims.first(where: { $0.udid == "WWW" }))   // watchOS can't run the sim WDA
     }
 
     func testEmptyOnGarbage() {
