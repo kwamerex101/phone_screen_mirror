@@ -125,6 +125,37 @@ final class RunnerInstallTests: XCTestCase {
         XCTAssertFalse(shouldSpawnRunwda(after: .failed(.deviceLocked(raw: "x"))))
         XCTAssertFalse(shouldSpawnRunwda(after: .failed(.other(raw: "x"))))
     }
+
+    func testRunnerVersionParsing() {
+        let id = "com.local.imirror.WebDriverAgentRunner.xctrunner"
+        let list = """
+        com.apple.Preferences Settings 1.0
+        com.local.imirror.WebDriverAgentRunner iMirror Old 9.9.9
+        \(id) iMirror Runner 16.14.2
+        """
+        XCTAssertEqual(runnerVersion(inAppsList: list, bundleId: id), "16.14.2")
+        XCTAssertNil(runnerVersion(inAppsList: "com.apple.Preferences Settings 1.0", bundleId: id))
+        XCTAssertEqual(runnerVersion(inAppsList: id, bundleId: id), "")
+    }
+
+    func testRunnerAction() {
+        XCTAssertEqual(runnerAction(installed: nil, bundled: "16.14.2"), .install)
+        XCTAssertEqual(runnerAction(installed: "1.0", bundled: nil), .keep)
+        XCTAssertEqual(runnerAction(installed: "1.0", bundled: ""), .keep)
+        XCTAssertEqual(runnerAction(installed: "1.0", bundled: "16.14.2"), .upgrade)
+        XCTAssertEqual(runnerAction(installed: "16.14.2", bundled: "16.14.2"), .keep)
+        XCTAssertEqual(runnerAction(installed: "17.0.0", bundled: "16.14.2"), .keep)
+    }
+
+    func testIsVersionOlderThan() {
+        XCTAssertTrue(isVersion("1.0", olderThan: "16.14.2"))
+        XCTAssertFalse(isVersion("16.14.2", olderThan: "16.14.2.0"))
+        XCTAssertFalse(isVersion("16.14.2.0", olderThan: "16.14.2"))
+        XCTAssertTrue(isVersion("", olderThan: "1"))
+        XCTAssertFalse(isVersion("1", olderThan: ""))
+        XCTAssertTrue(isVersion("9.9", olderThan: "10.0"))
+        XCTAssertTrue(isVersion("1.x", olderThan: "1.1"))
+    }
 }
 
 final class MCPConfigTests: XCTestCase {

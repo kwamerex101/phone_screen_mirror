@@ -62,6 +62,46 @@ public func shouldSpawnRunwda(after result: RunnerInstall) -> Bool {
     }
 }
 
+/// Parse go-ios `ios apps --list` output (lines of `<bundleId> <name> <shortVersion>`)
+/// and return the version of the app whose id matches exactly. Returns "" when the
+/// matching line carries no version, and nil when no line matches.
+public func runnerVersion(inAppsList out: String, bundleId: String) -> String? {
+    for line in out.split(whereSeparator: \.isNewline) {
+        let tokens = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+        guard tokens.first.map(String.init) == bundleId else { continue }
+        return tokens.count >= 3 ? String(tokens[tokens.count - 1]) : ""
+    }
+    return nil
+}
+
+/// What to do about the runner given the phone's version and the bundled one.
+public enum RunnerAction: Equatable {
+    case install    // runner missing from the device
+    case upgrade    // device copy is older than the bundled ipa
+    case keep       // up to date, newer, or no bundled version to compare against
+}
+
+/// Decide install / upgrade / keep. Never downgrades: a newer on-device runner is
+/// kept, so two app builds with different bundled versions don't flip-flop the phone.
+public func runnerAction(installed: String?, bundled: String?) -> RunnerAction {
+    guard let installed else { return .install }
+    guard let bundled, !bundled.isEmpty else { return .keep }
+    return isVersion(installed, olderThan: bundled) ? .upgrade : .keep
+}
+
+/// Dotted numeric version compare. Missing or non-numeric components count as 0,
+/// so "16.14.2" equals "16.14.2.0" and "" is older than "1".
+public func isVersion(_ a: String, olderThan b: String) -> Bool {
+    let pa = a.split(separator: ".", omittingEmptySubsequences: false).map { Int($0) ?? 0 }
+    let pb = b.split(separator: ".", omittingEmptySubsequences: false).map { Int($0) ?? 0 }
+    for i in 0..<max(pa.count, pb.count) {
+        let x = i < pa.count ? pa[i] : 0
+        let y = i < pb.count ? pb[i] : 0
+        if x != y { return x < y }
+    }
+    return false
+}
+
 /// Trim whitespace and cap length so a runaway error string can't bloat the UI.
 private func trimmedRaw(_ s: String, cap: Int = 300) -> String {
     let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
