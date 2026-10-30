@@ -1433,6 +1433,8 @@ def test_finish_invalid_video(mod, wda, monkeypatch, tmp_path):
 
 
 def test_timelapse_embedded_when_ffmpeg_succeeds(mod, wda, monkeypatch, tmp_path):
+    # The encoder is stubbed below; availability must not depend on host PATH.
+    monkeypatch.setattr(mod.shutil, "which", lambda _: "/fake/ffmpeg")
     _start_with_two_shots(mod, wda, tmp_path, monkeypatch)
     run_dir = mod._run["dir"]
 
@@ -1451,6 +1453,8 @@ def test_timelapse_embedded_when_ffmpeg_succeeds(mod, wda, monkeypatch, tmp_path
 
 
 def test_timelapse_mp4_uses_video_tag(mod, wda, monkeypatch, tmp_path):
+    # The encoder is stubbed below; availability must not depend on host PATH.
+    monkeypatch.setattr(mod.shutil, "which", lambda _: "/fake/ffmpeg")
     _start_with_two_shots(mod, wda, tmp_path, monkeypatch)
     monkeypatch.setattr(mod, "_ffmpeg",
                         lambda args: open(args[-1], "wb").write(b"\x00mp4"))
@@ -1479,6 +1483,8 @@ def test_timelapse_skipped_when_ffmpeg_missing(mod, wda, monkeypatch, tmp_path):
 
 
 def test_timelapse_handles_ffmpeg_failure(mod, wda, monkeypatch, tmp_path):
+    # The encoder is stubbed below; availability must not depend on host PATH.
+    monkeypatch.setattr(mod.shutil, "which", lambda _: "/fake/ffmpeg")
     import subprocess
     _start_with_two_shots(mod, wda, tmp_path, monkeypatch)
 
