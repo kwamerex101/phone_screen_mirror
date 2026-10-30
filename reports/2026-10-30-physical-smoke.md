@@ -30,7 +30,7 @@ The installed app used go-ios 1.3.2, but the local tools cache and original revi
 
 The helper's Go build metadata identifies the audited 1.3.2 source revision `2fb34682ef12db97c9fafdf99f1dd1d3522604ad`. The local cached binary was corrected from the existing installed build, with the previous binary backed up. Existing dependency-file changes in the vendored checkout were preserved.
 
-Both assembly scripts now accept `IMIRROR_IOS_BIN`, consistent with the runtime override. Invalid overrides and an override pointing inside the app being rebuilt fail before changing the app. Four preflight checks passed. The go-ios build script now rejects an outdated source revision before changing dependency files. The local vendored source checkout itself still needs preparation at the audited revision before a future source rebuild.
+Both assembly scripts now accept `IMIRROR_IOS_BIN`, consistent with the runtime override. Invalid overrides and an override pointing at the current bundled helper fail before changing the app. Six preflight checks passed, covering missing files, directories, and the current bundled helper. The go-ios build script now rejects an outdated source revision before changing dependency files. The local vendored source checkout itself still needs preparation at the audited revision before a future source rebuild.
 
 Reproduce the verified local assembly with:
 

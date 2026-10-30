@@ -9,8 +9,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 GOIOS="${IMIRROR_IOS_BIN:-$ROOT/tools/go-ios/bin/ios}"
-if [[ -n "${IMIRROR_IOS_BIN:-}" && ! -x "$GOIOS" ]]; then
-    echo "IMIRROR_IOS_BIN is not executable: $GOIOS" >&2
+if [[ -n "${IMIRROR_IOS_BIN:-}" && ( ! -f "$GOIOS" || ! -x "$GOIOS" ) ]]; then
+    echo "IMIRROR_IOS_BIN is not an executable file: $GOIOS" >&2
     exit 1
 fi
 
@@ -36,7 +36,7 @@ cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 
 # Bundle the go-ios binary so the app can manage the USB forward itself
 # (no external relay script / terminal needed).
-if [[ -x "$GOIOS" ]]; then
+if [[ -f "$GOIOS" && -x "$GOIOS" ]]; then
     cp "$GOIOS" "$APP/Contents/Resources/ios"
     echo "    bundled go-ios from $GOIOS"
 else

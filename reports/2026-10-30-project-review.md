@@ -1,6 +1,6 @@
 # iMirror project review and implementation
 
-30 October 2026. Baseline: `501a15f` (v0.6.0). Review covers the native Mac app, physical-device transport, simulator lifecycle, MCP navigation, streaming, packaging, and automated checks.
+30 October 2026. Baseline: `501a15f` (v0.6.0). Hardware follow-up: [physical iPhone smoke test](2026-10-30-physical-smoke.md). Review covers the native Mac app, physical-device transport, simulator lifecycle, MCP navigation, streaming, packaging, and automated checks.
 
 ## Decision
 
@@ -68,7 +68,7 @@ Both app assembly scripts now include the required `wda_bringup.py` module. A bu
 - The first Linux CI run exposed three legacy timelapse tests that assumed ffmpeg was installed despite stubbing its execution. All three failed locally with a restricted PATH before the availability stubs were fixed. The complete 258-test Python suite then passed without Homebrew tools.
 - Swift: **157 tests passed** across both test bundles. Python: **258 tests passed**, with nine opt-in live tests skipped in the default full run. The separately enabled simulator suite passed all nine live checks. Bundled MCP protocol initialization and tool discovery passed.
 
-No physical iPhone was attached during this review. Real unplug/replug, signing/install behavior, and physical-device latency still require hardware verification. Injected absence/error/reattach sequences, cancellation windows, recovery deadlines, and bounded subprocess tests cover the new decision logic.
+The initial overnight review had no physical iPhone attached. The subsequent hardware follow-up verified one unplug/replug cycle, live navigation, session sharing, and bundle signature preservation. Fresh installation/provisioning and sustained physical-device latency remain unverified. See the linked smoke report for the tested scope.
 
 ## Further recommendations
 

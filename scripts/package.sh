@@ -22,8 +22,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 GOIOS="${IMIRROR_IOS_BIN:-$ROOT/tools/go-ios/bin/ios}"
-if [[ -n "${IMIRROR_IOS_BIN:-}" && ! -x "$GOIOS" ]]; then
-    echo "IMIRROR_IOS_BIN is not executable: $GOIOS" >&2
+if [[ -n "${IMIRROR_IOS_BIN:-}" && ( ! -f "$GOIOS" || ! -x "$GOIOS" ) ]]; then
+    echo "IMIRROR_IOS_BIN is not an executable file: $GOIOS" >&2
     exit 1
 fi
 
@@ -44,7 +44,7 @@ rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/iMirror"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 [[ -f "$ROOT/Resources/AppIcon.icns" ]] && cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-[[ -x "$GOIOS" ]] && cp "$GOIOS" "$APP/Contents/Resources/ios"
+[[ -f "$GOIOS" && -x "$GOIOS" ]] && cp "$GOIOS" "$APP/Contents/Resources/ios"
 
 # One-DMG-everywhere gate: every shipped native binary must be universal2, or
 # the DMG would silently fail to launch on one architecture. Fail loudly here,
