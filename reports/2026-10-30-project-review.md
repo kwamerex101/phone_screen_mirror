@@ -65,7 +65,7 @@ Both app assembly scripts now include the required `wda_bringup.py` module. A bu
 - The repeated-start real TCP test failed before the stream fix because the old connection never closed. It passes after the fix.
 - A 100-button repeated-field fixture shrank from **27,584 to 12,084 characters**, a **56.2% reduction**, retaining all 100 buttons. A one-million-character label shrank from **1,000,100 to 414 characters**, including an explicit truncation notice. These are output-size measurements, not token counts or device-latency benchmarks.
 - Live iOS 27 simulator checks passed: status, logical size, screenshot, source, orientation, session reuse, recorded report, tap, and Home. An additional agent-style flow launched Settings, waited for General, tapped it by selector, verified About, and returned Home. A missing-element lookup preserved its WDA session.
-- Swift: **156 tests passed** across both test bundles. Python: **247 tests passed**, with nine opt-in live tests skipped in the default full run. The separately enabled simulator suite passed all nine live checks. Bundled MCP protocol initialization and tool discovery passed.
+- Swift: **157 tests passed** across both test bundles. Python: **258 tests passed**, with nine opt-in live tests skipped in the default full run. The separately enabled simulator suite passed all nine live checks. Bundled MCP protocol initialization and tool discovery passed.
 
 No physical iPhone was attached during this review. Real unplug/replug, signing/install behavior, and physical-device latency still require hardware verification. Injected absence/error/reattach sequences, cancellation windows, recovery deadlines, and bounded subprocess tests cover the new decision logic.
 
@@ -78,3 +78,9 @@ No physical iPhone was attached during this review. Real unplug/replug, signing/
 5. **Add a repeatable hardware reconnect matrix.** Cover unplug during install, locked phone, trust prompt, sleep/wake, multiple attached phones, simulator termination, and process ownership contention. Keep destructive or privacy-sensitive actions outside unattended smoke tests.
 
 Large-file splitting and a broad visual redesign were deliberately left for later. The highest-value seams in this pass are the request transport, callback lifetime, readiness monitor, parser, and client adapter. Their interfaces now concentrate real behavior and support focused tests; cosmetic file splitting would add little leverage.
+
+## Independent review
+
+The standards and behavior passes found three additional defects: a device-profile Codex registration accepted simulator environment overrides as current; read-only POST selector lookups lost safe reconnect retries; and mutation timeouts did not consistently report an unknown outcome. These findings were addressed with regression coverage. Read-only selector retries remain separate from action replay.
+
+The review also checked generation ownership, fragmented stream parsing, simulator cancellation/shutdown, target ambiguity, and the report's claims against actual control flow. Hardware limitations and the remaining shared-owner risk above are retained explicitly.

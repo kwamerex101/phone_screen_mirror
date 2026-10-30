@@ -39,6 +39,16 @@ final class CodexAdapterTests: XCTestCase {
         XCTAssertEqual(unregistered.status(.device), .notInstalled)
     }
 
+    func testDeviceProfileRejectsSimulatorEnvironmentButAllowsDevicePinning() {
+        var adapter = CodexAdapter(resolveCLI: { "/test/codex" })
+        adapter.run = { _, _ in (0, self.entry(env: MCPProfile.simulator.env)) }
+        XCTAssertEqual(adapter.status(.device), .stale)
+        adapter.run = { _, _ in (0, self.entry(env: ["IMIRROR_WDA": "http://127.0.0.1:8201"])) }
+        XCTAssertEqual(adapter.status(.device), .stale)
+        adapter.run = { _, _ in (0, self.entry(env: ["IMIRROR_UDID": "selected-phone"])) }
+        XCTAssertEqual(adapter.status(.device), .installed)
+    }
+
     func testInstallUsesCodexEnvFlagsWithoutRemovingExistingEntry() throws {
         var calls: [[String]] = []
         let adapter = CodexAdapter(run: { _, args in calls.append(args); return (0, "") }, resolveCLI: { "/test/codex" })

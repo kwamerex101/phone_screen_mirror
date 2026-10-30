@@ -19,10 +19,17 @@ struct CodexAdapter: MCPClientAdapter {
               let transport = entry["transport"] as? [String: Any],
               let script = MCPPaths.scriptURL()?.path else { return .stale }
         let environment = transport["env"] as? [String: String] ?? [:]
+        // Device profiles have no required env entries. An empty subset check
+        // would otherwise accept a manually misrouted simulator registration.
+        let targetMatches = (environment["IMIRROR_TARGET"] ?? "device")
+            == (profile.env["IMIRROR_TARGET"] ?? "device")
+        let endpointMatches = (environment["IMIRROR_WDA"] ?? "http://127.0.0.1:8100")
+            == (profile.env["IMIRROR_WDA"] ?? "http://127.0.0.1:8100")
         let current = entry["enabled"] as? Bool != false
             && transport["type"] as? String == "stdio"
             && transport["command"] as? String == MCPPaths.venvPython.path
             && transport["args"] as? [String] == [script]
+            && targetMatches && endpointMatches
             && profile.env.allSatisfy { environment[$0.key] == $0.value }
         return current ? .installed : .stale
     }

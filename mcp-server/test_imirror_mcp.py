@@ -2972,3 +2972,78 @@ def test_alert_error_during_active_run_does_not_record_private_message(mod, wda,
         assert 'private' not in str(failure.value)
     finally:
         mod._run['active'] = False
+
+
+def test_wait_for_retries_read_only_element_post_on_stale_keepalive(mod, monkeypatch):
+    import http.client
+    mod._session['id'] = 'live'
+    calls = []
+    def stale_then_found(method, path, data, timeout):
+        calls.append((method, path, timeout))
+        if len(calls) == 1:
+            raise http.client.RemoteDisconnected('stale keepalive')
+        return 200, b'{"value":{"ELEMENT":"visible-button"}}'
+    monkeypatch.setattr(mod, '_http', stale_then_found)
+    assert 'Ready' in mod.ios_wait_for('Ready', timeout_s=1)
+    assert calls == [('POST', '/session/live/element', mod._TIMEOUT_PROBE)] * 2
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'oserror', 'reset'])
+def test_typing_ambiguous_transport_failures_are_unknown_without_replay(mod, monkeypatch, failure):
+    import socket
+    mod._session['id'] = 'live'
+    failures = {'timeout': socket.timeout('timed out'), 'oserror': OSError('socket write failed'),
+                'reset': ConnectionResetError('reset after typing')}
+    calls = []
+    def interrupted(method, path, data, timeout):
+        calls.append(path)
+        raise failures[failure]
+    monkeypatch.setattr(mod, '_http', interrupted)
+    with pytest.raises(mod.MCPToolError) as error:
+        mod.ios_type('hello')
+    assert error.value.error_kind == mod.ErrorKind.OUTCOME_UNKNOWN
+    assert error.value.__cause__ is failures[failure]
+    assert calls == ['/session/live/wda/keys']
+
+
+@pytest.mark.parametrize('method,path', [('GET', '/source'), ('POST', '/session/live/element'),
+                                        ('POST', '/session/live/elements')])
+def test_read_only_timeout_keeps_wedged_classification(mod, monkeypatch, method, path):
+    import socket
+    calls = []
+    def slow(*args):
+        calls.append(args)
+        raise socket.timeout('timed out')
+    monkeypatch.setattr(mod, '_http', slow)
+    with pytest.raises(mod.MCPToolError) as error:
+        mod._req(method, path, timeout=mod._TIMEOUT_PROBE)
+    assert error.value.error_kind == mod.ErrorKind.WEDGED
+    assert len(calls) == 1
+
+
+def test_typing_connection_refused_is_unreachable_without_replay(mod, monkeypatch):
+    mod._session['id'] = 'live'
+    calls = []
+    def refused(*args):
+        calls.append(args)
+        raise ConnectionRefusedError('connection refused before send')
+    monkeypatch.setattr(mod, '_http', refused)
+    with pytest.raises(mod.MCPToolError) as error:
+        mod.ios_type('hello')
+    assert error.value.error_kind == mod.ErrorKind.UNREACHABLE
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('path', ['/session/live/element/button/click',
+                                  '/session/live/elements/extra', '/session/live/elemental'])
+def test_element_read_allowlist_does_not_replay_adjacent_mutation_routes(mod, monkeypatch, path):
+    import http.client
+    calls = []
+    def lost(*args):
+        calls.append(args)
+        raise http.client.RemoteDisconnected('response lost')
+    monkeypatch.setattr(mod, '_http', lost)
+    with pytest.raises(mod.MCPToolError) as error:
+        mod._req('POST', path, {})
+    assert error.value.error_kind == mod.ErrorKind.OUTCOME_UNKNOWN
+    assert len(calls) == 1

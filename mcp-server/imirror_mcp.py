@@ -327,11 +327,20 @@ def _http(method: str, path: str, data: bytes | None,
         raise
 
 
+def _unknown_request_outcome(method: str, path: str, error: Exception) -> MCPToolError:
+    return MCPToolError(
+        f"Outcome unknown for {method} {path}: WDA request interrupted ({error}). "
+        "The action may already have applied. Inspect the screen before repeating "
+        "it; this request was not replayed.", kind=ErrorKind.OUTCOME_UNKNOWN)
+
+
 def _req(method: str, path: str, body: dict | None = None,
          timeout: float = _TIMEOUT_INTERACT) -> tuple[int, dict[str, Any]]:
     data = json.dumps(body).encode() if body is not None else None
-    # Read requests tolerate a dropped keep-alive connection. A failed POST may
-    # already have applied on the phone, so never replay it without a response.
+    # WDA uses POST for element searches even though those routes only read UI.
+    # Keep this allowlist exact: element clicks and other mutations must not replay.
+    read_only = method.upper() in ("GET", "HEAD", "OPTIONS") or (
+        method.upper() == "POST" and re.fullmatch(r"/session/[^/]+/elements?", path) is not None)
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
@@ -339,12 +348,8 @@ def _req(method: str, path: str, body: dict | None = None,
         except (http.client.RemoteDisconnected, ConnectionResetError,
                 http.client.BadStatusLine, http.client.IncompleteRead,
                 BrokenPipeError) as e:
-            if method.upper() not in ("GET", "HEAD", "OPTIONS"):
-                raise MCPToolError(
-                    f"Outcome unknown for {method} {path}: WDA lost the response "
-                    f"({e}). The action may already have applied. Inspect the "
-                    "screen before repeating it; this request was not replayed.",
-                    kind=ErrorKind.OUTCOME_UNKNOWN) from e
+            if not read_only:
+                raise _unknown_request_outcome(method, path, e) from e
             last_exc = e
             # A reused keep-alive socket the server already closed fails on the
             # first send — that's expected staleness, so reconnect and retry
@@ -354,10 +359,16 @@ def _req(method: str, path: str, body: dict | None = None,
                 time.sleep(0.3 * attempt)
             continue
         except (socket.timeout, TimeoutError) as e:
+            if not read_only:
+                raise _unknown_request_outcome(method, path, e) from e
             raise MCPToolError(
                 f"WDA timed out after {timeout}s on {path}. It may be busy or "
                 f"wedged — {_wedged_hint()}.", kind=ErrorKind.WEDGED) from e
         except OSError as e:
+            # A refused TCP connection could not deliver a request. Other socket
+            # errors may occur after a mutation reached WDA, so its result is unknown.
+            if not read_only and not isinstance(e, ConnectionRefusedError):
+                raise _unknown_request_outcome(method, path, e) from e
             raise MCPToolError(
                 f"Cannot reach WDA at {WDA} ({e}). {_unreachable_hint()}",
                 kind=ErrorKind.UNREACHABLE) from e
