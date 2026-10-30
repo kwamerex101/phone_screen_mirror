@@ -85,6 +85,11 @@ final class PreviewView: NSView {
         lastFrameSize = CGSize(width: image.width, height: image.height)
     }
 
+    func clearFrame() {
+        imageLayer.contents = nil
+        lastFrameSize = nil
+    }
+
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -278,11 +283,13 @@ private extension NSToolbarItem.Identifier {
 
 // MARK: - App delegate
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NSToolbarItemValidation {
     private var window: NSWindow!
     private let screenshotThumbnail = ScreenshotThumbnail()
     private var previewView: PreviewView!
     private var emptyStateView: NSView!
+    private let emptyStateTitle = NSTextField(wrappingLabelWithString: "No iPhone connected")
+    private let emptyStateHint = NSTextField(wrappingLabelWithString: "Plug in via USB, unlock, and tap “Trust.”")
     private var statusLabel: NSTextField!
 
     // Toolbar controls
@@ -299,6 +306,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private let simEnableButton = NSButton()
     private let simStatusLabel = NSTextField(labelWithString: "")
     private var simEnabled = false
+    private var simHasBeenReady = false
     private let iosRunnerLabel = NSTextField(labelWithString: "")
     private var lastRunnerInstall: RunnerInstall?
     private let healthButton = NSButton()
@@ -321,6 +329,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private var wda: WDAClient?
     private var controlEnabled = false
     private var automationEnabled = false
+    private let automationCallbacks = MainQueueCallbackScope()
+    private let videoCallbacks = MainQueueCallbackScope()
+    private var waitingForDevice = false
+    private lazy var devicePresence = DevicePresenceMonitor(
+        discover: { [weak self] completion in self?.transport.discoverDevicePresence(completion: completion) },
+        onChange: { [weak self] presence, reattached in self?.handleDevicePresence(presence, reattached: reattached) })
     private var health: Health = .down
     private var healthTimer: Timer?
     private var probing = false
@@ -344,8 +358,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     // .down (a hung-but-still-running runwda never triggers a fresh spawn,
     // so onRunwdaStarted alone would never catch it). Cleared once health
     // reconnects — see setHealth.
-    private var chainWedgeSince: TimeInterval?
-    private var chainRecoveryStage = 0
+    private var chainRecovery = ChainRecoveryClock()
     /// Set once a full chain restart still hasn't recovered WDA. While set,
     /// runWatchdog stops trying automatically — only the user tapping the WDA
     /// dot (forceProbe) re-arms it. Product decision: no silent background
@@ -379,12 +392,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
                          + "on the phone: Settings ▸ General ▸ VPN & Device Management.")
         }
         // Seed the chain-recovery ladder's clock at the point runwda actually
-        // starts, not at automation-on (see the chainWedgeSince comment).
+        // starts, not at automation-on (see the recovery clock comment).
         // Fires on every chain bring-up, including a restartChain() — that's
-        // fine, and load-bearing: it must NOT touch chainRecoveryStage, or
+        // fine, and load-bearing: it must NOT reset the recovery stage, or
         // the ladder would never advance past stage 0 and would never give up.
         transport.onRunwdaStarted = { [weak self] in
-            self?.chainWedgeSince = ProcessInfo.processInfo.systemUptime
+            self?.chainRecovery.runwdaStarted(at: ProcessInfo.processInfo.systemUptime)
         }
         // Reflect the runner check/install (progress + outcome) in the UI. Invoked
         // on the main thread by Transport.
@@ -429,6 +442,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         healthTimer?.invalidate()
         transport.stop()
         mjpeg?.stop()
+        simController.shutdown()
     }
 
     // MARK: UI
@@ -604,14 +618,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
 
         // Wrapping labels so longer copy (e.g. the camera-permission guidance)
         // wraps to multiple centered lines instead of clipping.
-        let title = NSTextField(wrappingLabelWithString: "No iPhone connected")
+        let title = emptyStateTitle
         title.font = .systemFont(ofSize: 15, weight: .medium)
         title.textColor = .secondaryLabelColor
         title.alignment = .center
         title.isSelectable = false
         title.preferredMaxLayoutWidth = 300
 
-        let hint = NSTextField(wrappingLabelWithString: "Plug in via USB, unlock, and tap “Trust.”")
+        let hint = emptyStateHint
         hint.font = .systemFont(ofSize: 12)
         hint.textColor = .tertiaryLabelColor
         hint.alignment = .center
@@ -839,13 +853,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     /// changes nothing. In that state, a tap is the user explicitly asking to
     /// retry, so re-arm the ladder and kick a chain restart directly.
     @objc private func forceProbe() {
+        if waitingForDevice {
+            devicePresence.sampleIfDue(force: true)
+            return
+        }
         guard wdaHardStopped else { probeNow(); return }
         wdaHardStopped = false
-        chainRecoveryStage = 0
-        // Transport.onRunwdaStarted reseeds chainWedgeSince once the fresh
-        // chain's runwda actually starts; seed it here too so runWatchdog
-        // doesn't sit on `.wait` with a nil clock in the meantime.
-        chainWedgeSince = ProcessInfo.processInfo.systemUptime
+        chainRecovery.reset()
+        chainRecovery.connectionLost(at: ProcessInfo.processInfo.systemUptime)
         mjpegEscalationCount = 0     // give the user's retry its own two-strike allowance
         mjpegBounced = false
         setStatus("Retrying WebDriverAgent…")
@@ -854,6 +869,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
 
     private func probeNow() {
         guard automationEnabled else { return }   // no WDA to probe when automation is off
+        if health == .down || waitingForDevice { devicePresence.sampleIfDue() }
+        guard !waitingForDevice else { return }
         guard !installingRunner else { return }   // WDA legitimately down mid-install
         guard !probing else { return }
         // Don't probe mid-gesture: a probe GET contends with the in-flight /actions
@@ -861,20 +878,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         // gestureInFlight is set/cleared only on DispatchQueue.main — main-thread safe.
         if wda?.isGestureInFlight == true { return }
         probing = true
-        wda?.probe { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.probing = false
-                switch result {
-                case .alive:
-                    self.setHealth(.connected)
-                case .down:
-                    self.setHealth(.down)
-                case .needsSession:
-                    self.createSession()
-                }
-                self.runWatchdog()
-                self.checkMjpegWatchdog()
+        wda?.probe(completion: automationCallbacks.delivering { [weak self] result in
+            guard let self else { return }
+            self.probing = false
+            switch result {
+            case .alive:
+                self.setHealth(.connected)
+            case .down:
+                self.setHealth(.down)
+            case .needsSession:
+                self.createSession()
+            }
+            self.runWatchdog()
+            self.checkMjpegWatchdog()
+        })
+    }
+
+    /// Rearm only after USB discovery has actually observed a detach and a
+    /// later attach. A still-present phone that exhausts recovery stays stopped.
+    private func handleDevicePresence(_ presence: DevicePresence, reattached: Bool) {
+        guard automationEnabled, health != .connected else { return }
+        switch presence {
+        case .absent:
+            if !waitingForDevice {
+                automationCallbacks.invalidate()
+                probing = false
+                creatingSession = false
+                installingRunner = false
+                transport.stopChain()
+                chainRecovery.reset()
+                hadSuccessfulConnection = false
+                wdaHardStopped = false
+                wda = WDAClient()
+                waitingForDevice = true
+                setHealth(.down)
+            }
+            downStatusWorkItem?.cancel(); downStatusWorkItem = nil
+            emptyStateTitle.stringValue = "No iPhone connected"
+            emptyStateHint.stringValue = "Plug in via USB, unlock, and tap “Trust.”"
+            setStatus("Waiting for iPhone. Plug in via USB and unlock it.")
+        case .present:
+            guard reattached else { return }
+            waitingForDevice = false
+            automationCallbacks.invalidate()
+            probing = false
+            creatingSession = false
+            installingRunner = false
+            wda = WDAClient()
+            wdaHardStopped = false
+            chainRecovery.reset()
+            hadSuccessfulConnection = false
+            mjpegEscalationCount = 0
+            mjpegBounced = false
+            emptyStateTitle.stringValue = "Connecting to iPhone"
+            emptyStateHint.stringValue = "Unlock your iPhone and tap Trust if prompted."
+            setStatus("iPhone connected. Starting WebDriverAgent…")
+            // The launch callback starts the boot clock once preparation ends.
+            transport.restartChain()
+            probeNow()
+        case .unavailable:
+            if waitingForDevice {
+                setStatus("Waiting for iPhone. Connection check unavailable; retrying automatically.")
             }
         }
     }
@@ -890,23 +954,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private func runWatchdog() {
         guard automationEnabled, transport.canSelfManage else { return }
         guard health == .down, !wdaHardStopped else { return }
-        guard let wedgeSince = chainWedgeSince else { return }
-        let downFor = ProcessInfo.processInfo.systemUptime - wedgeSince
-        // A mid-session wedge (WDA was up, then hung) escalates faster than
-        // initial boot or a fresh chain after a restart — see
-        // chainRecoveryGraceSec's doc comment in iMirrorCore.
-        let grace = chainRecoveryGraceSec(stage: chainRecoveryStage, postConnectionOutage: hadSuccessfulConnection)
-        switch nextChainRecoveryAction(downForSec: downFor, stage: chainRecoveryStage, graceSec: grace) {
+        let now = ProcessInfo.processInfo.systemUptime
+        switch chainRecovery.action(at: now, postConnectionOutage: hadSuccessfulConnection) {
         case .wait:
             break
         case .restartChain:
-            chainRecoveryStage = 1
-            // Don't reseed chainWedgeSince here: Transport.onRunwdaStarted
-            // reseeds it once the new chain's runwda actually starts, which
-            // is the point that matters. Leaving the old value in the
-            // meantime means a chain that never even gets to spawning
-            // runwda again (e.g. a repeated install failure) still ages
-            // toward the next grace instead of stalling forever on .wait.
+            // Preparation gets a fresh budget immediately. WDA launch will
+            // reseed its boot budget without resetting the ladder's stage.
+            chainRecovery.beginRestart(at: now)
             setStatus("WebDriverAgent is taking longer than usual, resetting the connection…")
             transport.restartChain()
         case .giveUp:
@@ -961,7 +1016,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             mjpegLastFrameAt = ProcessInfo.processInfo.systemUptime
             mjpegBounced = false
             setStatus("Video stalled — resetting the connection…")
-            chainRecoveryStage = 1
+            chainRecovery.beginRestart(at: ProcessInfo.processInfo.systemUptime)
             transport.restartChain()
         }
     }
@@ -970,14 +1025,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         guard !creatingSession else { return }
         creatingSession = true
         setHealth(.connecting)
-        wda?.connect { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.creatingSession = false
-                if case .success = result { self.setHealth(.connected) }
-                else { self.setHealth(.down) }
-            }
-        }
+        wda?.connect(completion: automationCallbacks.delivering { [weak self] result in
+            guard let self else { return }
+            self.creatingSession = false
+            if case .success = result { self.setHealth(.connected) }
+            else { self.setHealth(.down) }
+        })
     }
 
     private var downStatusWorkItem: DispatchWorkItem?
@@ -990,18 +1043,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
 
         switch new {
         case .connected:
+            devicePresence.markConnected()
+            waitingForDevice = false
             downSince = nil
             // Back to healthy — clear the chain-recovery ladder so the next
             // outage (if any) starts a fresh stage-0 grace window instead of
             // inheriting whatever was left over from this one.
-            chainWedgeSince = nil
-            chainRecoveryStage = 0
+            chainRecovery.reset()
             wdaHardStopped = false
             hadSuccessfulConnection = true
             downStatusWorkItem?.cancel(); downStatusWorkItem = nil
             controlSwitch.isEnabled = true
             homeItem?.isEnabled = true
-            screenshotItem?.isEnabled = true
+            screenshotItem?.isEnabled = lastFrame != nil
             if changed {
                 let s = wda?.deviceSize ?? .zero
                 // Lock resizing to the phone's proportions so the mirror fills the
@@ -1019,32 +1073,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             if mjpeg == nil {
                 // Host port 9110 forwards to the device's fixed WDA mjpegServerPort 9100, chosen to avoid colliding with other local services that commonly use 9100.
                 let client = MJPEGClient(port: 9110)
-                client.onFrame = { [weak self] cg in
-                    DispatchQueue.main.async {
-                        guard let self else { return }
-                        self.mjpegLastFrameAt = ProcessInfo.processInfo.systemUptime
-                        // A real frame arrived — the stream is actually
-                        // delivering, so any earlier escalations no longer
-                        // count toward the two-strike give-up.
-                        self.mjpegEscalationCount = 0
-                        self.lastFrame = cg
-                        self.previewView.setFrame(cg)
-                        if !self.mirroring {
-                            self.mirroring = true
-                            self.setEmptyState(hidden: true)
-                            self.setStatus("Mirroring — phone stays usable.")
-                        }
+                client.onFrame = videoCallbacks.delivering { [weak self] cg in
+                    guard let self else { return }
+                    self.mjpegLastFrameAt = ProcessInfo.processInfo.systemUptime
+                    // A real frame arrived — the stream is actually
+                    // delivering, so any earlier escalations no longer
+                    // count toward the two-strike give-up.
+                    self.mjpegEscalationCount = 0
+                    self.lastFrame = cg
+                    self.screenshotItem?.isEnabled = true
+                    self.previewView.setFrame(cg)
+                    if !self.mirroring {
+                        self.mirroring = true
+                        self.setEmptyState(hidden: true)
+                        self.setStatus("Mirroring — phone stays usable.")
                     }
                 }
-                client.onStateChange = { [weak self] connected in
-                    DispatchQueue.main.async {
-                        guard let self, !connected else { return }
-                        // MJPEG socket dropped independently of the WDA HTTP session — show
-                        // the waiting state until frames resume.
-                        self.mirroring = false
-                        self.setEmptyState(hidden: false)
-                        self.setStatus("Waiting for video from iPhone…")
-                    }
+                client.onStateChange = videoCallbacks.delivering { [weak self] connected in
+                    guard let self, !connected else { return }
+                    // MJPEG socket dropped independently of the WDA HTTP session — show
+                    // the waiting state until frames resume.
+                    self.mirroring = false
+                    self.lastFrame = nil
+                    self.previewView.clearFrame()
+                    self.screenshotItem?.isEnabled = false
+                    self.setEmptyState(hidden: false)
+                    self.setStatus("Waiting for video from iPhone…")
                 }
                 mjpeg = client
                 // Seed the no-frame clock at start so the watchdog measures
@@ -1069,8 +1123,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             // it here too would count tunnel/install time against WDA's own
             // boot grace, which is exactly what onRunwdaStarted exists to
             // avoid.
-            if hadSuccessfulConnection, chainWedgeSince == nil {
-                chainWedgeSince = ProcessInfo.processInfo.systemUptime
+            if hadSuccessfulConnection {
+                chainRecovery.connectionLost(at: ProcessInfo.processInfo.systemUptime)
             }
             // Lost the connection — disarm control so stray clicks can't fire.
             if controlEnabled {
@@ -1082,10 +1136,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             controlSwitch.isEnabled = false
             homeItem?.isEnabled = false
             screenshotItem?.isEnabled = false
+            videoCallbacks.invalidate()
             mjpeg?.stop()
             mjpeg = nil
+            lastFrame = nil
+            previewView.clearFrame()
             mirroring = false
             setEmptyState(hidden: false)
+            if !waitingForDevice {
+                emptyStateTitle.stringValue = "Connecting to iPhone"
+                emptyStateHint.stringValue = "Unlock your iPhone and tap Trust if prompted."
+            }
             // Debounce the *status text* by 6s: a brief probe blip during heavy
             // scrolling flips health to .down for one cycle, and flashing
             // "Starting WebDriverAgent…" on every scroll is alarming and wrong.
@@ -1194,12 +1255,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
 
     /// Enable/disable the WDA control channel and remember the choice across launches.
     private func setAutomation(_ on: Bool) {
+        automationCallbacks.invalidate()
+        videoCallbacks.invalidate()
+        devicePresence.reset()
+        waitingForDevice = false
+        hadSuccessfulConnection = false
+        probing = false
+        creatingSession = false
+        downStatusWorkItem?.cancel(); downStatusWorkItem = nil
         automationEnabled = on
         UserDefaults.standard.set(on, forKey: "imirror.automationEnabled")
         // Fresh run: the ladder and the MJPEG watchdog start clean either way,
         // whether we're arming automation or tearing it down.
-        chainWedgeSince = nil
-        chainRecoveryStage = 0
+        chainRecovery.reset()
         wdaHardStopped = false
         mjpegLastFrameAt = nil
         mjpegBounced = false
@@ -1207,7 +1275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         if on {
             setStatus("Automation ON — starting WebDriverAgent… "
                     + "(iOS shows an \"Automation Running\" overlay on the phone).")
-            // Don't seed chainWedgeSince here: Transport.onRunwdaStarted
+            // Don't seed the recovery clock here: Transport.onRunwdaStarted
             // seeds it once runwda actually starts, which is well after
             // tunnel bring-up and the runner install — seeding it now would
             // count that time against WDA's own boot grace.
@@ -1227,8 +1295,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             transport.stop()
             mjpeg?.stop()
             mjpeg = nil
+            lastFrame = nil
+            previewView.clearFrame()
             mirroring = false
             health = .down; downSince = nil
+            screenshotItem?.isEnabled = false
+            emptyStateTitle.stringValue = "Mirroring paused"
+            emptyStateHint.stringValue = "Enable Automation in settings to connect."
+            setEmptyState(hidden: false)
             updateHealthDot()        // grey — automation off
             setStatus("Automation off — mirror only (no control, no on-phone overlay).")
         }
@@ -1241,7 +1315,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         toggleControl()
     }
 
+    func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
+        if item.action == #selector(takeScreenshot) { return lastFrame != nil }
+        if item.action == #selector(pressHome) { return health == .connected }
+        return true
+    }
+
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(takeScreenshot) { return lastFrame != nil }
+        if menuItem.action == #selector(pressHome) { return health == .connected }
         if menuItem.action == #selector(toggleControlFromMenu) {
             menuItem.state = controlEnabled ? .on : .off
             return controlSwitch.isEnabled          // only armable once WDA is connected
@@ -1283,7 +1365,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         stack.addArrangedSubview(autoRow)
 
         let cap = NSTextField(wrappingLabelWithString:
-            "On starts the control channel; iOS shows an “Automation Running” overlay on the phone. Off = view-only mirroring.")
+            "On starts mirroring and control; iOS shows an “Automation Running” overlay. Off stops the connection.")
         cap.font = .systemFont(ofSize: 11)
         cap.textColor = .secondaryLabelColor
         cap.preferredMaxLayoutWidth = 260
@@ -1325,12 +1407,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         sep.widthAnchor.constraint(equalToConstant: 268).isActive = true
         stack.addArrangedSubview(sep)
 
-        let mcpTitle = NSTextField(labelWithString: "MCP server (drive from Claude)")
+        let mcpTitle = NSTextField(labelWithString: "MCP server (AI control)")
         mcpTitle.font = .boldSystemFont(ofSize: 12)
         stack.addArrangedSubview(mcpTitle)
 
         let mcpCap = NSTextField(wrappingLabelWithString:
-            "Register the iMirror MCP server with Claude Code and Claude Desktop so an "
+            "Register the iMirror MCP server with Codex, Claude Code, and Claude Desktop so an "
           + "agent can drive the phone. (Turn Automation on for it to connect.)")
         mcpCap.font = .systemFont(ofSize: 11)
         mcpCap.textColor = .secondaryLabelColor
@@ -1351,7 +1433,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
         stack.addArrangedSubview(simTitle)
 
         let simCap = NSTextField(wrappingLabelWithString:
-            "Boot a Simulator and drive it from Claude. Enable brings up WebDriverAgent "
+            "Boot a Simulator and drive it from an AI agent. Enable starts WebDriverAgent "
           + "on it (port 8201); view the sim in Apple's Simulator app. Requires Xcode.")
         simCap.font = .systemFont(ofSize: 11)
         simCap.textColor = .secondaryLabelColor
@@ -1454,7 +1536,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
             let hasXcode = self.simController.xcodeAvailable()
             let sims = hasXcode ? self.simController.listSimulators() : []
             DispatchQueue.main.async {
-                self.simPicker.isEnabled = hasXcode
+                self.simPicker.isEnabled = hasXcode && !self.simEnabled
                 self.simEnableButton.isEnabled = hasXcode
                 guard hasXcode else { self.simStatusLabel.stringValue = "Requires Xcode."; return }
                 self.simDevices = sims
@@ -1485,16 +1567,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate {
     private func renderSimState(_ state: SimState) {
         switch state {
         case .idle:
+            simHasBeenReady = false
             simEnabled = false; simEnableButton.title = "Enable"
             simStatusLabel.stringValue = "Off."
-        case .booting:  simEnabled = true; simEnableButton.title = "Disable"; simStatusLabel.stringValue = "Booting simulator…"
+        case .booting:
+            simHasBeenReady = false
+            simEnabled = true; simEnableButton.title = "Disable"; simStatusLabel.stringValue = "Booting simulator…"
         case .building: simStatusLabel.stringValue = "Building WebDriverAgent (first run ~2–3 min)…"
-        case .starting: simStatusLabel.stringValue = "Starting WebDriverAgent…"
-        case .ready:    simStatusLabel.stringValue = "WebDriverAgent ready on :8201 ✓"
+        case .starting:
+            simStatusLabel.stringValue = simHasBeenReady ? "Reconnecting to simulator…" : "Starting WebDriverAgent…"
+        case .ready:
+            simHasBeenReady = true
+            simStatusLabel.stringValue = "WebDriverAgent ready on :8201 ✓"
         case .failed(let m):
+            simHasBeenReady = false
             simEnabled = false; simEnableButton.title = "Enable"
             simStatusLabel.stringValue = "Failed: \(m)"
         }
+        simPicker.isEnabled = !simEnabled && simEnableButton.isEnabled
     }
 
     @objc private func pressHome() {

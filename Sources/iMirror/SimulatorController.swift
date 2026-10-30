@@ -17,15 +17,41 @@ final class SimulatorController {
     static let port = 8201
     var onState: ((SimState) -> Void)?
 
-    private var wda: ManagedProcess?
+    private var storedWDA: ManagedProcess?
+    private var wda: ManagedProcess? {
+        get { lifecycleLock.lock(); defer { lifecycleLock.unlock() }; return storedWDA }
+        set { lifecycleLock.lock(); storedWDA = newValue; lifecycleLock.unlock() }
+    }
     private let queue = DispatchQueue(label: "com.imirror.sim", qos: .userInitiated)
-    private var polling = false
+    private let lifecycleLock = NSLock()
+    private var generation = UUID()
+    private var healthMonitor: SimulatorHealthMonitor?
+
+    private func beginGeneration() -> UUID {
+        lifecycleLock.lock(); defer { lifecycleLock.unlock() }
+        generation = UUID()
+        return generation
+    }
+
+    private func isCurrent(_ token: UUID) -> Bool {
+        lifecycleLock.lock(); defer { lifecycleLock.unlock() }
+        return generation == token
+    }
     private let workDir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("iMirror/sim", isDirectory: true)
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         return base
     }()
+
+    private let runCommand: (String, [String]) -> (code: Int32, out: String)
+
+    init(runCommand: @escaping (String, [String]) -> (code: Int32, out: String) = { launch, args in
+        let result = BoundedProcessRunner.run(launch, args, timeout: 15)
+        return (result.code, result.out)
+    }) {
+        self.runCommand = runCommand
+    }
 
     // MARK: Discovery
 
@@ -45,14 +71,7 @@ final class SimulatorController {
 
     @discardableResult
     private func run(_ launch: String, _ args: [String]) -> (code: Int32, out: String) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: launch)
-        p.arguments = args
-        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
-        do { try p.run() } catch { return (-1, "\(error)") }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+        runCommand(launch, args)
     }
 
     // MARK: Bring-up (Phase 1: delegate to scripts/sim-wda-up.sh)
@@ -110,57 +129,92 @@ final class SimulatorController {
     /// all blocking work (shell-outs, readiness polling) runs on a background queue;
     /// state is reported back via `onState` on the main thread.
     func enable(udid: String) {
-        emit(.booting)
+        let token = beginGeneration()
+        emit(.booting, generation: token)
         queue.async { [weak self] in
-            guard let self else { return }
-            guard self.xcodeAvailable() else { return self.emit(.failed("Requires Xcode.")) }
+            guard let self, self.isCurrent(token) else { return }
+            self.healthMonitor?.stop()
+            self.wda?.stop(); self.wda = nil
+            guard self.xcodeAvailable() else { return self.emit(.failed("Requires Xcode."), generation: token) }
             guard let root = self.resolvedRoot() else {
-                return self.emit(.failed("Simulator support isn't available in this build."))
+                return self.emit(.failed("Simulator support isn't available in this build."), generation: token)
             }
+            guard self.isCurrent(token) else { return }
             let script = root.appendingPathComponent("scripts/sim-wda-up.sh")
             let proj = root.appendingPathComponent("tools/WebDriverAgent/WebDriverAgent.xcodeproj")
             _ = self.run("/usr/bin/xcrun", ["simctl", "boot", udid])   // no-op if already booted
+            guard self.isCurrent(token) else { return }
             _ = self.run("/usr/bin/open", ["-a", "Simulator"])
 
             // The script builds (branding/sign) then execs `xcodebuild test-without-building`,
             // so the child stays alive as long as WDA runs; ManagedProcess restarts it if it dies.
-            self.emit(.building)
+            guard self.isCurrent(token) else { return }
+            self.emit(.building, generation: token)
             let cmd = "PORT=\(Self.port)"
                 + " WDA_PROJECT='\(self.shellEscape(proj.path))'"
                 + " '\(self.shellEscape(script.path))' '\(self.shellEscape(udid))'"
             let proc = ManagedProcess(binary: URL(fileURLWithPath: "/bin/bash"),
                                       args: ["-lc", cmd],
                                       label: "sim-wda", restartDelay: 6, workDir: self.workDir)
-            self.wda?.stop()   // never leak a prior runner on a repeated enable
-            self.wda = proc
+            guard self.isCurrent(token) else { return }
+            proc.onGaveUp = { [weak self] _ in
+                self?.queue.async { [weak self] in
+                    guard let self, self.isCurrent(token) else { return }
+                    self.healthMonitor?.stop()
+                    self.wda?.stop(); self.wda = nil
+                    self.emit(.failed("WebDriverAgent stopped repeatedly. Check the simulator and try again."), generation: token)
+                }
+            }
+            self.lifecycleLock.lock()
+            guard self.generation == token else { self.lifecycleLock.unlock(); return }
+            self.storedWDA = proc
             proc.start()
-            self.startPolling()
+            self.lifecycleLock.unlock()
+            self.startPolling(generation: token)
         }
     }
 
     func disable() {
+        let token = beginGeneration()
         queue.async { [weak self] in
             guard let self else { return }
-            self.polling = false
+            self.healthMonitor?.stop(); self.healthMonitor = nil
             self.wda?.stop(); self.wda = nil
-            self.emit(.idle)
+            self.emit(.idle, generation: token)
+        }
+    }
+
+    /// Invalidate startup and send termination before the app's main loop exits.
+    /// Unlike disable(), this cannot depend on a queued block running after quit.
+    func shutdown() {
+        lifecycleLock.lock()
+        generation = UUID()
+        let process = storedWDA
+        storedWDA = nil
+        lifecycleLock.unlock()
+        process?.stop()
+        queue.async { [weak self] in
+            self?.healthMonitor?.stop()
+            self?.healthMonitor = nil
         }
     }
 
     // MARK: Readiness
 
-    // Poll on the background queue so the ~4s readiness check never blocks the UI.
-    private func startPolling() {
-        guard !polling else { return }
-        emit(.starting)
-        polling = true
-        pollTick()
-    }
-
-    private func pollTick() {
-        guard polling else { return }
-        if wdaReady() { polling = false; emit(.ready); return }
-        queue.asyncAfter(deadline: .now() + 2) { [weak self] in self?.pollTick() }
+    private func startPolling(generation token: UUID) {
+        let monitor = SimulatorHealthMonitor(queue: queue,
+            check: { [weak self] in
+                guard let self, self.isCurrent(token) else { return false }
+                return self.wdaReady()
+            }, onState: { [weak self] state in
+                guard let self, self.isCurrent(token) else { return }
+                if case .failed = state {
+                    self.wda?.stop(); self.wda = nil
+                }
+                self.emit(state, generation: token)
+            })
+        healthMonitor = monitor
+        monitor.start()
     }
 
     /// Escape a string for safe embedding inside single quotes in a `bash -lc` command.
@@ -173,12 +227,20 @@ final class SimulatorController {
         var req = URLRequest(url: url); req.timeoutInterval = 3
         let sem = DispatchSemaphore(value: 0); var ok = false
         URLSession.shared.dataTask(with: req) { data, _, _ in
-            if let data, let s = String(data: data, encoding: .utf8) { ok = s.contains("\"ready\" : true") || s.contains("\"ready\":true") }
+            if let data,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                ok = WDAParse.ready(json)
+            }
             sem.signal()
         }.resume()
         _ = sem.wait(timeout: .now() + 4)
         return ok
     }
 
-    private func emit(_ s: SimState) { DispatchQueue.main.async { self.onState?(s) } }
+    private func emit(_ state: SimState, generation token: UUID) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isCurrent(token) else { return }
+            self.onState?(state)
+        }
+    }
 }

@@ -17,9 +17,8 @@ enum MCPInstaller {
     struct Result { let ok: Bool; let message: String }
 
     /// Every MCP client iMirror knows how to register itself with, in the
-    /// order install/uninstall act on them (Claude Code, then Claude
-    /// Desktop — unchanged from before the adapter split).
-    static let allAdapters: [MCPClientAdapter] = [ClaudeCodeAdapter(), ClaudeDesktopAdapter()]
+    /// order install/uninstall act on them (Claude Code, Claude Desktop, Codex).
+    static let allAdapters: [MCPClientAdapter] = [ClaudeCodeAdapter(), ClaudeDesktopAdapter(), CodexAdapter()]
 
     // MARK: Python interpreter discovery (the GUI app's PATH is minimal)
 
@@ -68,10 +67,7 @@ enum MCPInstaller {
     static func status(profile: MCPProfile = .device) -> Status {
         var clients: [String] = []
         var stale = false
-        // `allAdapters.reversed()` preserves the pre-adapter check order
-        // (Claude Desktop, then Claude Code) so status lines read exactly as
-        // they did before the split, even though install/uninstall act on
-        // them in the opposite order.
+        // Show newer clients first while retaining Desktop before Claude Code.
         for adapter in allAdapters.reversed() {
             switch adapter.status(profile) {
             case .notInstalled:
@@ -158,7 +154,7 @@ enum MCPInstaller {
         }
 
         guard !registered.isEmpty else {
-            return Result(ok: false, message: "No MCP client found (Claude Code CLI or Claude Desktop).")
+            return Result(ok: false, message: "No MCP client found (Codex CLI, Claude Code CLI, or Claude Desktop).")
         }
         return Result(ok: true, message: "Installed ✓ — " + registered.joined(separator: ", "))
     }

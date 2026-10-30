@@ -59,7 +59,7 @@ fi
 
 # Bundle the MCP server so the in-app one-click MCP install works from a DMG.
 mkdir -p "$APP/Contents/Resources/mcp-server"
-cp "$ROOT/mcp-server/imirror_mcp.py" "$APP/Contents/Resources/mcp-server/" 2>/dev/null || true
+cp "$ROOT/mcp-server/imirror_mcp.py" "$ROOT/mcp-server/wda_bringup.py" "$APP/Contents/Resources/mcp-server/"
 [[ -f "$ROOT/mcp-server/requirements.txt" ]] && \
     cp "$ROOT/mcp-server/requirements.txt" "$APP/Contents/Resources/mcp-server/" || true
 

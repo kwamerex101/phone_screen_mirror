@@ -363,6 +363,8 @@ final class LocalRelay {
 final class Transport {
     private let relay = LocalRelay(listen: 8100, backend: 8101)
     private let goios: URL?
+    private let startupQueue: DispatchQueue
+    private let discoveryQueue = DispatchQueue(label: "imirror.device-discovery", qos: .utility)
     private let workDir: URL
     private var tunnel: ManagedProcess?
     private var wda: ManagedProcess?
@@ -396,13 +398,18 @@ final class Transport {
     /// each `restartChain()`).
     var onRunwdaStarted: (() -> Void)?
 
-    private func emitInstall(_ event: RunnerInstallEvent) {
+    private func emitInstall(_ event: RunnerInstallEvent, generation: Int) {
         guard let cb = onRunnerInstall else { return }
-        DispatchQueue.main.async { cb(event) }
+        DispatchQueue.main.async { [weak self] in
+            guard self?.chainGeneration == generation else { return }
+            cb(event)
+        }
     }
 
-    init() {
-        goios = locateGoIOS()
+    init(goios: URL? = locateGoIOS(),
+         startupQueue: DispatchQueue = DispatchQueue(label: "imirror.transport.startup", qos: .userInitiated)) {
+        self.goios = goios
+        self.startupQueue = startupQueue
         // Writable working dir for go-ios (selfIdentity.plist, pair records).
         let support = FileManager.default.urls(for: .applicationSupportDirectory,
                                                in: .userDomainMask).first!
@@ -414,6 +421,23 @@ final class Transport {
     /// True if the go-ios binary was found, so the app can run WDA headless. If
     /// false, the user must bring up WDA themselves (Xcode or scripts/wda-up.sh).
     var canSelfManage: Bool { goios != nil }
+
+    /// Introspection for lifecycle regressions, including children that already exited.
+    var hasChildHandlesForTesting: Bool {
+        tunnel != nil || wda != nil || forward != nil || mjpegForward != nil
+    }
+
+    /// A bounded, read-only USB check. It runs independently of tunnel/install
+    /// work so a wedged bring-up cannot block detecting a reattached phone.
+    func discoverDevicePresence(completion: @escaping (DevicePresence) -> Void) {
+        guard let goios else { completion(.unavailable); return }
+        discoveryQueue.async {
+            // go-ios writes diagnostics to stderr even on success. JSON stdout
+            // alone is the discovery record; warnings must not hide a detach.
+            let result = BoundedProcessRunner.run(goios.path, ["list", "--details"], captureStandardError: false)
+            completion(DevicePresence.parse(result.out, exitCode: result.code))
+        }
+    }
 
     func start() {
         chainGeneration += 1   // F5: a fresh bring-up supersedes any prior one
@@ -431,9 +455,14 @@ final class Transport {
         // them before bringing up a clean chain — off the main thread, since it
         // fork/exec/waits three `pkill`s and start() is called from the UI (app
         // launch / Automation toggle).
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.sweepStrayProcesses()
-            DispatchQueue.main.async { self?.startChildren() }
+        let gen = chainGeneration
+        startupQueue.async { [weak self] in
+            guard let self, self.chainGeneration == gen else { return }
+            self.sweepStrayProcesses()
+            DispatchQueue.main.async {
+                guard self.chainGeneration == gen else { return }
+                self.startChildren()
+            }
         }
     }
 
@@ -548,7 +577,7 @@ final class Transport {
             }
             guard self.chainGeneration == gen else { return }
             // Now that the tunnel is up, check/install the runner.
-            let installResult = self.installOrUpgradeRunner(bin: bin)
+            let installResult = self.installOrUpgradeRunner(bin: bin, generation: gen)
             guard self.chainGeneration == gen else { return }
             // A failed install with the runner still absent → don't launch runwda;
             // it would only fail-loop. The UI already showed the failure reason.
@@ -572,7 +601,10 @@ final class Transport {
                     readinessCheck: { [weak self] in self?.wdaReadyThroughRelay() ?? false },
                     readyWithin: 40, readinessPollInterval: 2)
                 wda.onGaveUp = { [weak self] _ in
-                    DispatchQueue.main.async { self?.onWDAUnrecoverable?() }
+                    DispatchQueue.main.async {
+                        guard let self, self.chainGeneration == gen else { return }
+                        self.onWDAUnrecoverable?()
+                    }
                 }
                 self.wda = wda
                 wda.start()
@@ -596,34 +628,34 @@ final class Transport {
     /// only shells `install` when the runner is absent or outdated. Emits progress
     /// via onRunnerInstall and returns the outcome so the caller can decide
     /// whether launching runwda is worthwhile.
-    private func installOrUpgradeRunner(bin: URL) -> RunnerInstall {
-        emitInstall(.checking)
+    private func installOrUpgradeRunner(bin: URL, generation: Int) -> RunnerInstall {
+        emitInstall(.checking, generation: generation)
         guard let ipa = Bundle.main.url(forResource: "WebDriverAgent", withExtension: "ipa") else {
             // dev builds ship no bundled ipa; runner installed via build-wda.sh/Xcode
-            emitInstall(.done(.noBundle))
+            emitInstall(.done(.noBundle), generation: generation)
             return .noBundle
         }
         let installed = installedRunnerVersion(bin: bin)
         let bundled = bundledRunnerVersion(ipa: ipa)
         switch runnerAction(installed: installed, bundled: bundled) {
         case .keep:
-            emitInstall(.done(.alreadyPresent))
+            emitInstall(.done(.alreadyPresent), generation: generation)
             return .alreadyPresent
         case .install:
-            emitInstall(.installing)
+            emitInstall(.installing, generation: generation)
             let result = installWithRetry(bin: bin, ipaPath: ipa.path)
-            emitInstall(.done(result))
+            emitInstall(.done(result), generation: generation)
             return result
         case .upgrade:
             NSLog("iMirror: upgrading WDA runner \(installed ?? "?") -> \(bundled ?? "?")")
-            emitInstall(.installing)
+            emitInstall(.installing, generation: generation)
             var result = installWithRetry(bin: bin, ipaPath: ipa.path)
             if case .failed = result {
                 // The older runner is still on the device, so runwda can launch with it.
                 NSLog("iMirror: WDA runner upgrade failed (\(result)); keeping the installed runner")
                 result = .alreadyPresent
             }
-            emitInstall(.done(result))
+            emitInstall(.done(result), generation: generation)
             return result
         }
     }
@@ -760,7 +792,7 @@ final class Transport {
         let gen = chainGeneration
         forward?.stop(); mjpegForward?.stop(); wda?.stop(); tunnel?.stop()
         forward = nil; mjpegForward = nil; wda = nil; tunnel = nil
-        DispatchQueue.global().asyncAfter(deadline: .now() + 4) { [weak self] in
+        startupQueue.asyncAfter(deadline: .now() + 4) { [weak self] in
             guard let self, self.chainGeneration == gen else { return }
             // Our handles are stopped; reap any child that outlived its handle
             // (e.g. a tunnel reparented to launchd) so the fresh chain owns a

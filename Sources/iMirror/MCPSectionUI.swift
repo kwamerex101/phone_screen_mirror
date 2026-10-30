@@ -84,7 +84,7 @@ final class MCPSectionUI: NSObject {
         statusLabel.stringValue = updating
             ? "Updating…" : "Installing… (first run sets up Python — up to ~30s)"
         MCPInstaller.install(profile: profile, update: updating, progress: { [weak self] msg in
-            self?.statusLabel.stringValue = msg
+            DispatchQueue.main.async { self?.statusLabel.stringValue = msg }
         }, completion: { [weak self] r in
             guard let self else { return }
             self.spinner.stopAnimation(nil)

@@ -76,6 +76,7 @@ def sim_mod(monkeypatch):
     """A fresh module imported in simulator mode (IMIRROR_TARGET=simulator)."""
     monkeypatch.setenv("IMIRROR_WDA", "http://127.0.0.1:8100")
     monkeypatch.setenv("IMIRROR_TARGET", "simulator")
+    monkeypatch.setenv("IMIRROR_SIM_UDID", "sim-test-udid")
     sys.modules.pop("imirror_mcp", None)
     m = importlib.import_module("imirror_mcp")
     m._session["id"] = None
@@ -296,6 +297,99 @@ def test_http_reconnects_after_failure(mod, monkeypatch):
 
 # ---- session lifecycle ---------------------------------------------------------
 
+def test_http_updates_reused_socket_timeout(mod):
+    """A short probe followed by a tree read must change the actual socket budget."""
+    import socket
+
+    left, right = socket.socketpair()
+
+    class Connection:
+        sock = left
+        timeout = 5
+
+        def request(self, *args, **kwargs):
+            pass
+
+        def getresponse(self):
+            class Response:
+                status = 200
+
+                def read(self):
+                    return b"{}"
+            return Response()
+
+    mod._conn_local.c = Connection()
+    try:
+        left.settimeout(5)
+        mod._http("GET", "/source", None, 60)
+        assert left.gettimeout() == 60
+        mod._http("GET", "/status", None, 5)
+        assert left.gettimeout() == 5
+    finally:
+        mod._conn_local.c = None
+        left.close()
+        right.close()
+
+
+@pytest.mark.parametrize("failure", ["disconnect", "incomplete", "reset"])
+def test_mutation_connection_loss_is_not_replayed(mod, monkeypatch, failure):
+    """The action can already have applied when its response is lost."""
+    import http.client
+
+    failures = {
+        "disconnect": http.client.RemoteDisconnected("response lost"),
+        "incomplete": http.client.IncompleteRead(b"partial"),
+        "reset": ConnectionResetError("reset after action"),
+    }
+    applied = []
+
+    def respond(method, path, data, timeout):
+        applied.append(path)
+        if len(applied) == 1:
+            raise failures[failure]
+        return 200, b'{"value": {}}'
+
+    monkeypatch.setattr(mod, "_http", respond)
+    with pytest.raises(mod.MCPToolError, match="[Oo]utcome.*unknown"):
+        mod._req("POST", "/session/s/wda/keys", {"value": ["x"]})
+    assert applied == ["/session/s/wda/keys"]
+
+
+def test_missing_element_does_not_replace_session(mod, wda):
+    mod._session["id"] = "live"
+    wda.script("/element", (404, {"value": {"error": "no such element"}}))
+    assert mod._find_element("Loading") is None
+    assert mod._session["id"] == "live"
+    assert len(wda.calls) == 1
+
+
+def test_invalid_session_find_recreates_once(mod, wda):
+    mod._session["id"] = "expired"
+    wda.script("/session", (200, {"value": {"sessionId": "new"}}))
+    wda.script("/element", (404, {"value": {"error": "invalid session id"}}),
+               (200, {"value": {"ELEMENT": "button"}}))
+    assert mod._find_element("Login") == "button"
+    assert mod._session["id"] == "new"
+
+
+@pytest.mark.parametrize("code,error", [(500, "unknown error"), (400, "invalid selector"),
+                                       (404, "unknown command")])
+def test_find_errors_cannot_pass_absence_assertion(mod, wda, code, error):
+    mod._session["id"] = "live"
+    wda.script("/element", (code, {"value": {"error": error}}))
+    with pytest.raises(mod.MCPToolError, match=f"HTTP {code}"):
+        mod.ios_assert_not_visible("Spinner", timeout_s=0)
+    assert mod._session["id"] == "live"
+
+
+def test_stale_element_click_does_not_recreate_session(mod, wda):
+    mod._session["id"] = "live"
+    wda.script("/element/button/click", (404, {"value": {"error": "stale element reference"}}))
+    with pytest.raises(mod.MCPToolError, match="stale element reference"):
+        mod._session_post("/element/button/click", {})
+    assert mod._session["id"] == "live"
+    assert len(wda.calls) == 1
+
 def test_ensure_session_creates_once(mod, wda):
     wda.script("/session", (200, {"value": {"sessionId": "abc"}}))
     assert mod._ensure_session() == "abc"
@@ -328,7 +422,8 @@ def test_status_summarizes(mod, wda):
         "os": {"version": "17.4"}, "device": "iPhone"}}))
     out = json.loads(mod.ios_status())
     assert out == {"ready": True, "message": "ok", "ios": "17.4", "device": "iPhone",
-                   "server_version": mod.__version__}
+                   "server_version": mod.__version__, "target": "device",
+                   "wda_endpoint": mod.WDA, "selected_udid": os.environ.get("IMIRROR_UDID")}
 
 
 def test_source_xml_format_truncates_large_output(mod, wda):
@@ -438,6 +533,7 @@ def test_source_text_caps_by_element_count(mod, wda, monkeypatch):
     """Output is capped by ELEMENT COUNT (400), with a trailing line reporting
     exactly how many elements were dropped — after parsing the FULL tree."""
     monkeypatch.setattr(mod, "_win_size", lambda: (400.0, 800.0))
+    monkeypatch.setattr(mod, "_SOURCE_MAX_TEXT_CHARS", 100000)
     n = mod._SOURCE_MAX_ELEMENTS + 50
     tree = {
         "type": "Application",
@@ -452,7 +548,7 @@ def test_source_text_caps_by_element_count(mod, wda, monkeypatch):
     lines = out.splitlines()
     element_lines = [l for l in lines if l.strip().startswith("Button")]
     assert len(element_lines) == mod._SOURCE_MAX_ELEMENTS
-    assert lines[-1] == "… (50 elements dropped; refine with a more specific screen)"
+    assert lines[-1] == "… (50 elements dropped; use ios_source(format='xml') for more detail.)"
 
 
 # ---- ios_await_idle (settle detection) ------------------------------------------
@@ -731,7 +827,7 @@ def test_screenshot_sim_calls_simctl_with_correct_args(sim_mod, monkeypatch):
     seen = _fake_simctl(sim_mod, monkeypatch)
     with pytest.raises(sim_mod.MCPToolError):
         sim_mod.ios_screenshot()  # empty temp file -> not a recognizable image
-    assert seen["args"][:5] == ["xcrun", "simctl", "io", "booted", "screenshot"]
+    assert seen["args"][:5] == ["xcrun", "simctl", "io", "sim-test-udid", "screenshot"]
     assert seen["args"][5].endswith(".png")
 
 
@@ -1926,7 +2022,7 @@ def test_clipboard_get_sim_uses_simctl_fast_path(sim_mod, monkeypatch):
     """On the simulator, a working simctl reads the clipboard without ever
     touching WDA."""
     def fake_simctl(*args, **kwargs):
-        if args == ("pbpaste", "booted"):
+        if args == ("pbpaste", "sim-test-udid"):
             return "clip text"
         pytest.fail(f"unexpected simctl args {args} kwargs {kwargs}")
     monkeypatch.setattr(sim_mod, "_simctl", fake_simctl)
@@ -1945,7 +2041,7 @@ def test_clipboard_get_sim_preserves_whitespace_e3(sim_mod, monkeypatch):
     raw = "  hi there \n"
 
     def fake_simctl(*args, **kwargs):
-        assert args == ("pbpaste", "booted")
+        assert args == ("pbpaste", "sim-test-udid")
         seen_kwargs.update(kwargs)
         return raw
     monkeypatch.setattr(sim_mod, "_simctl", fake_simctl)
@@ -2077,7 +2173,7 @@ def test_install_app_uses_simctl_on_simulator(sim_mod, monkeypatch, tmp_path):
         return R()
     monkeypatch.setattr(sim_mod.subprocess, "run", fake_run)
     out = sim_mod.ios_install_app(str(app))
-    assert seen["args"] == ["xcrun", "simctl", "install", "booted", str(app)]
+    assert seen["args"] == ["xcrun", "simctl", "install", "sim-test-udid", str(app)]
     assert "installed" in out
 
 
@@ -2137,7 +2233,7 @@ def test_simctl_strip_false_preserves_whitespace(sim_mod, monkeypatch):
         class R: returncode = 0; stdout = raw; stderr = ""
         return R()
     monkeypatch.setattr(sim_mod.subprocess, "run", fake_run)
-    assert sim_mod._simctl("pbpaste", "booted", strip=False) == raw
+    assert sim_mod._simctl("pbpaste", "sim-test-udid", strip=False) == raw
 
 
 def _fake_simctl(mod, monkeypatch):
@@ -2154,7 +2250,7 @@ def test_sim_push_writes_payload_and_calls_simctl(sim_mod, monkeypatch):
     seen = _fake_simctl(sim_mod, monkeypatch)
     out = sim_mod.sim_push("com.acme.app", '{"aps": {"alert": "hi"}}')
     args = seen["args"]
-    assert args[:4] == ["xcrun", "simctl", "push", "booted"]
+    assert args[:4] == ["xcrun", "simctl", "push", "sim-test-udid"]
     assert args[4] == "com.acme.app" and args[5].endswith(".apns")
     assert "pushed to com.acme.app" in out
 
@@ -2181,14 +2277,14 @@ def test_sim_push_cleans_up_temp_file(sim_mod, monkeypatch):
 def test_sim_privacy_builds_args(sim_mod, monkeypatch):
     seen = _fake_simctl(sim_mod, monkeypatch)
     sim_mod.sim_privacy("grant", "photos", "com.acme.app")
-    assert seen["args"] == ["xcrun", "simctl", "privacy", "booted",
+    assert seen["args"] == ["xcrun", "simctl", "privacy", "sim-test-udid",
                             "grant", "photos", "com.acme.app"]
 
 
 def test_sim_privacy_omits_bundle_when_absent(sim_mod, monkeypatch):
     seen = _fake_simctl(sim_mod, monkeypatch)
     sim_mod.sim_privacy("reset", "all")
-    assert seen["args"] == ["xcrun", "simctl", "privacy", "booted", "reset", "all"]
+    assert seen["args"] == ["xcrun", "simctl", "privacy", "sim-test-udid", "reset", "all"]
 
 
 def test_sim_privacy_rejects_bad_action(sim_mod, monkeypatch):
@@ -2201,10 +2297,10 @@ def test_sim_privacy_rejects_bad_action(sim_mod, monkeypatch):
 def test_sim_status_bar_override_and_clear(sim_mod, monkeypatch):
     seen = _fake_simctl(sim_mod, monkeypatch)
     sim_mod.sim_status_bar(time="12:34")
-    assert seen["args"][:5] == ["xcrun", "simctl", "status_bar", "booted", "override"]
+    assert seen["args"][:5] == ["xcrun", "simctl", "status_bar", "sim-test-udid", "override"]
     assert "12:34" in seen["args"]
     sim_mod.sim_status_bar(clear=True)
-    assert seen["args"] == ["xcrun", "simctl", "status_bar", "booted", "clear"]
+    assert seen["args"] == ["xcrun", "simctl", "status_bar", "sim-test-udid", "clear"]
 
 
 def test_sim_tools_require_simulator_mode(mod, monkeypatch):
@@ -2701,3 +2797,178 @@ def test_not_found_scroll_to_raises_mcp_tool_error(mod, monkeypatch):
     with pytest.raises(mod.MCPToolError, match="not found after 3 swipes") as exc_info:
         mod.ios_scroll_to("Ghost", max_swipes=3)
     assert exc_info.value.error_kind == "not_found"
+
+
+def test_device_install_honors_selected_udid(mod, monkeypatch, tmp_path):
+    ipa = tmp_path / 'selected.ipa'
+    ipa.touch()
+    calls = []
+    monkeypatch.setenv('IMIRROR_UDID', 'phone-B')
+    monkeypatch.setattr(mod.subprocess, 'run', lambda args, **kw: calls.append(args))
+    mod.ios_install_app(str(ipa))
+    assert '--udid=phone-B' in calls[0]
+
+
+def test_simulator_resolves_only_booted_ios_and_keeps_pin(sim_mod, monkeypatch):
+    calls = []
+    class Reply:
+        stdout = json.dumps({'devices': {
+            'com.apple.CoreSimulator.SimRuntime.iOS-26-0': [
+                {'udid': 'ios-B', 'state': 'Booted', 'isAvailable': True},
+                {'udid': 'ios-off', 'state': 'Shutdown', 'isAvailable': True}],
+            'com.apple.CoreSimulator.SimRuntime.watchOS-26-0': [
+                {'udid': 'watch', 'state': 'Booted', 'isAvailable': True}]}})
+    monkeypatch.delenv('IMIRROR_SIM_UDID', raising=False)
+    monkeypatch.setattr(sim_mod.subprocess, 'run', lambda args, **kw: calls.append(args) or Reply())
+    assert sim_mod._sim_udid() == 'ios-B'
+    assert sim_mod._sim_udid() == 'ios-B'
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('devices', [[], [
+    {'udid': 'A', 'state': 'Booted'}, {'udid': 'B', 'state': 'Booted'}]])
+def test_simulator_ambiguous_or_missing_target_rejected(sim_mod, monkeypatch, devices):
+    class Reply:
+        stdout = json.dumps({'devices': {'com.apple.CoreSimulator.SimRuntime.iOS-26-0': devices}})
+    monkeypatch.delenv('IMIRROR_SIM_UDID', raising=False)
+    monkeypatch.setattr(sim_mod.subprocess, 'run', lambda *a, **kw: Reply())
+    with pytest.raises(sim_mod.MCPToolError, match='IMIRROR_SIM_UDID'):
+        sim_mod._sim_udid()
+
+
+def test_explicit_simulator_pin_does_not_discover(sim_mod, monkeypatch):
+    monkeypatch.setenv('IMIRROR_SIM_UDID', 'chosen-simulator')
+    monkeypatch.setattr(sim_mod.subprocess, 'run', lambda *a, **kw: pytest.fail('unexpected discovery'))
+    assert sim_mod._sim_udid() == 'chosen-simulator'
+
+
+def test_ambiguous_simulator_screenshot_does_not_fall_back_to_another_target(sim_mod, monkeypatch):
+    monkeypatch.delenv('IMIRROR_SIM_UDID', raising=False)
+    listing = json.dumps({'devices': {'com.apple.CoreSimulator.SimRuntime.iOS-26-0': [
+        {'udid': 'A', 'state': 'Booted'}, {'udid': 'B', 'state': 'Booted'}]}})
+    monkeypatch.setattr(sim_mod, '_simctl', lambda *args, **kw: listing)
+    monkeypatch.setattr(sim_mod, '_screenshot_bytes_wda', lambda: pytest.fail('unsafe fallback'))
+    with pytest.raises(sim_mod.MCPToolError, match='2 booted'):
+        sim_mod.ios_screenshot()
+
+
+@pytest.mark.parametrize('alias', ['booted', 'all'])
+def test_explicit_simulator_alias_cannot_bypass_unique_selection(sim_mod, monkeypatch, alias):
+    monkeypatch.setenv('IMIRROR_SIM_UDID', alias)
+    with pytest.raises(sim_mod.MCPToolError, match='one simulator by UDID'):
+        sim_mod._sim_udid()
+
+
+def test_source_text_deduplicates_identical_fields_preserving_distinct_values(mod, monkeypatch):
+    monkeypatch.setattr(mod, '_win_size', lambda: (400, 800))
+    node = dict(type='Button', label='Submit', name='Submit', value='Send form',
+                identifier='submit-button', enabled=True, visible=True, hittable=True,
+                rect=(40, 80, 100, 40), children=[])
+    text = mod._render_source_text(node)
+    assert text.count('Submit') == 1
+    assert 'value="Send form"' in text
+    assert 'id="submit-button"' in text
+    assert '[enabled,visible,hittable]' in text
+    assert 'norm=(0.100,0.100,0.250,0.050)' in text
+
+
+def test_source_text_huge_label_has_explicit_bounded_truncation(mod, monkeypatch):
+    monkeypatch.setattr(mod, '_win_size', lambda: (400, 800))
+    text = mod._render_source_text(dict(type='Button', label='x' * 1000000,
+                                      visible=True, hittable=True, rect=(0, 0, 100, 100)))
+    assert len(text) < 2000
+    assert 'truncated' in text
+    assert "ios_source(format='xml')" in text
+    assert '[visible,hittable]' in text
+    assert 'norm=' in text
+
+
+def test_source_text_total_budget_preserves_complete_element_lines(mod, monkeypatch):
+    monkeypatch.setattr(mod, '_win_size', lambda: (400, 800))
+    children = [dict(type='Button', label=f'{i}:' + 'x' * 230,
+                     name='distinct-name', value='distinct-value', identifier='distinct-id',
+                     visible=True, hittable=True, rect=(0, 0, 100, 100), children=[])
+                for i in range(500)]
+    text = mod._render_source_text(dict(type='Other', children=children))
+    assert len(text) <= 20000
+    assert 'elements dropped' in text
+    assert "ios_source(format='xml')" in text
+    for line in text.splitlines()[1:-1]:
+        assert '[visible,hittable]' in line
+        assert line.endswith('norm=(0.000,0.000,0.250,0.125)')
+
+
+def test_alert_reads_text_buttons_without_recording(mod, wda, monkeypatch):
+    mod._session['id'] = 'live'
+    monkeypatch.setattr(mod, '_record', lambda *a, **kw: pytest.fail('alert content must not be recorded'))
+    wda.script('/alert/text', (200, {'value': 'Example verification prompt'}))
+    wda.script('/wda/alert/buttons', (200, {'value': ['Not Now', 'Continue']}))
+    assert json.loads(mod.ios_alert()) == {
+        'present': True, 'text': 'Example verification prompt', 'buttons': ['Not Now', 'Continue']}
+
+
+@pytest.mark.parametrize('action', ['get', 'accept', 'dismiss'])
+def test_alert_missing_is_normal_result(mod, wda, action):
+    mod._session['id'] = 'live'
+    route = '/alert/text' if action == 'get' else '/alert/' + action
+    wda.script(route, (404, {'value': {'error': 'no such alert'}}))
+    assert json.loads(mod.ios_alert(action=action))['present'] is False
+    assert mod._session['id'] == 'live'
+    assert len(wda.calls) == 1
+
+
+@pytest.mark.parametrize('action,label', [('bogus', ''), ('get', 'Continue')])
+def test_alert_validates_before_http(mod, monkeypatch, action, label):
+    monkeypatch.setattr(mod, '_req', lambda *a, **kw: pytest.fail('validation must precede HTTP'))
+    with pytest.raises(mod.MCPToolError, match='action|button_label'):
+        mod.ios_alert(action=action, button_label=label)
+
+
+def test_alert_named_dismiss_uses_exact_button_without_reading_account_text(mod, wda):
+    mod._session['id'] = 'live'
+    wda.script('/alert/dismiss', (200, {'value': {}}))
+    assert json.loads(mod.ios_alert(action='dismiss', button_label='Not Now')) == {
+        'present': True, 'action': 'dismiss', 'button_label': 'Not Now'}
+    assert wda.calls == [('POST', '/session/live/alert/dismiss', {'name': 'Not Now'})]
+
+
+def test_alert_failure_is_not_reported_as_absent(mod, wda):
+    mod._session['id'] = 'live'
+    wda.script('/alert/text', (500, {'value': {'error': 'unknown error', 'message': 'private'}}))
+    with pytest.raises(mod.MCPToolError, match='HTTP 500') as failure:
+        mod.ios_alert()
+    assert 'private' not in str(failure.value)
+
+
+def test_alert_mutation_response_loss_is_not_replayed(mod, monkeypatch):
+    import http.client
+    mod._session['id'] = 'live'
+    calls = []
+    def lost(method, path, body, timeout):
+        calls.append(path)
+        raise http.client.RemoteDisconnected('response lost')
+    monkeypatch.setattr(mod, '_http', lost)
+    with pytest.raises(mod.MCPToolError, match='Outcome unknown'):
+        mod.ios_alert(action='dismiss', button_label='Not Now')
+    assert calls == ['/session/live/alert/dismiss']
+
+
+def test_alert_default_accept_payload_is_empty(mod, wda):
+    mod._session['id'] = 'live'
+    wda.script('/alert/accept', (200, {'value': {}}))
+    assert json.loads(mod.ios_alert(action='accept'))['action'] == 'accept'
+    assert wda.calls == [('POST', '/session/live/alert/accept', {})]
+
+
+def test_alert_error_during_active_run_does_not_record_private_message(mod, wda, monkeypatch):
+    mod._session['id'] = 'live'
+    mod._run['active'] = True
+    monkeypatch.setattr(mod, '_record', lambda *a, **kw: pytest.fail('must not record alert errors'))
+    wda.script('/alert/dismiss', (400, {'value': {'error': 'invalid element state',
+                                               'message': 'private alert contents'}}))
+    try:
+        with pytest.raises(mod.MCPToolError, match='HTTP 400') as failure:
+            mod.ios_alert(action='dismiss', button_label='Missing')
+        assert 'private' not in str(failure.value)
+    finally:
+        mod._run['active'] = False
