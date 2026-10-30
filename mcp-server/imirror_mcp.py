@@ -18,7 +18,7 @@ Override target:  IMIRROR_WDA=http://127.0.0.1:8100
 """
 from __future__ import annotations
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 import atexit
 import base64
@@ -46,7 +46,14 @@ from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import FastMCP, Image
 
-import wda_bringup
+# The sibling helper lives inside the signed app when bundled. Importing it
+# must not create __pycache__ there and invalidate the app's resource seal.
+_previous_bytecode_setting = sys.dont_write_bytecode
+try:
+    sys.dont_write_bytecode = True
+    import wda_bringup
+finally:
+    sys.dont_write_bytecode = _previous_bytecode_setting
 
 
 class ErrorKind:
@@ -61,11 +68,12 @@ class ErrorKind:
     WEDGED = "wedged"
     TIMEOUT = "timeout"
     UNSUPPORTED = "unsupported"
+    OUTCOME_UNKNOWN = "outcome_unknown"
 
 
 _ERROR_KINDS = {ErrorKind.VALIDATION, ErrorKind.NOT_FOUND, ErrorKind.WDA_HTTP,
                 ErrorKind.UNREACHABLE, ErrorKind.WEDGED, ErrorKind.TIMEOUT,
-                ErrorKind.UNSUPPORTED}
+                ErrorKind.UNSUPPORTED, ErrorKind.OUTCOME_UNKNOWN}
 
 
 class MCPToolError(RuntimeError):
@@ -169,7 +177,16 @@ _TIMEOUT_PROBE = 5
 _TIMEOUT_INTERACT = 15
 _TIMEOUT_TREE = 60
 
-mcp = FastMCP("imirror")
+mcp = FastMCP("imirror", instructions=(
+    "Start with ios_status to check the configured target. Use ios_source's compact "
+    "text tree and label/name selectors to navigate; use ios_screenshot when the "
+    "hierarchy misses an element or visual appearance matters. Group known actions "
+    "with ios_run_sequence. If the hierarchy does not match the screenshot, inspect "
+    "ios_alert before navigating: a system alert can cover the application. "
+    "Wait for expected UI with ios_wait_for or "
+    "ios_assert_visible instead of fixed sleeps. After a transport failure during an action, its outcome "
+    "may be unknown: inspect the screen before deciding whether to repeat it."
+))
 
 _session: dict[str, str | None] = {"id": None}
 
@@ -304,6 +321,10 @@ def _http(method: str, path: str, data: bytes | None,
         _conn_local.c = c
     try:
         c.timeout = timeout
+        # HTTPConnection.timeout only affects sockets created by connect(). A
+        # reused connection retains its previous socket timeout until updated.
+        if getattr(c, "sock", None) is not None:
+            c.sock.settimeout(timeout)
         c.request(method, path, body=data,
                   headers={"Content-Type": "application/json"})
         r = c.getresponse()
@@ -313,12 +334,20 @@ def _http(method: str, path: str, data: bytes | None,
         raise
 
 
+def _unknown_request_outcome(method: str, path: str, error: Exception) -> MCPToolError:
+    return MCPToolError(
+        f"Outcome unknown for {method} {path}: WDA request interrupted ({error}). "
+        "The action may already have applied. Inspect the screen before repeating "
+        "it; this request was not replayed.", kind=ErrorKind.OUTCOME_UNKNOWN)
+
+
 def _req(method: str, path: str, body: dict | None = None,
          timeout: float = _TIMEOUT_INTERACT) -> tuple[int, dict[str, Any]]:
     data = json.dumps(body).encode() if body is not None else None
-    # WDA's CocoaHTTPServer occasionally drops a connection mid-exchange
-    # (RemoteDisconnected / reset), and keep-alive means we may hand back a
-    # server-closed socket — retry such transient failures a couple times.
+    # WDA uses POST for element searches even though those routes only read UI.
+    # Keep this allowlist exact: element clicks and other mutations must not replay.
+    read_only = method.upper() in ("GET", "HEAD", "OPTIONS") or (
+        method.upper() == "POST" and re.fullmatch(r"/session/[^/]+/elements?", path) is not None)
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
@@ -326,6 +355,8 @@ def _req(method: str, path: str, body: dict | None = None,
         except (http.client.RemoteDisconnected, ConnectionResetError,
                 http.client.BadStatusLine, http.client.IncompleteRead,
                 BrokenPipeError) as e:
+            if not read_only:
+                raise _unknown_request_outcome(method, path, e) from e
             last_exc = e
             # A reused keep-alive socket the server already closed fails on the
             # first send — that's expected staleness, so reconnect and retry
@@ -335,10 +366,16 @@ def _req(method: str, path: str, body: dict | None = None,
                 time.sleep(0.3 * attempt)
             continue
         except (socket.timeout, TimeoutError) as e:
+            if not read_only:
+                raise _unknown_request_outcome(method, path, e) from e
             raise MCPToolError(
                 f"WDA timed out after {timeout}s on {path}. It may be busy or "
                 f"wedged — {_wedged_hint()}.", kind=ErrorKind.WEDGED) from e
         except OSError as e:
+            # A refused TCP connection could not deliver a request. Other socket
+            # errors may occur after a mutation reached WDA, so its result is unknown.
+            if not read_only and not isinstance(e, ConnectionRefusedError):
+                raise _unknown_request_outcome(method, path, e) from e
             raise MCPToolError(
                 f"Cannot reach WDA at {WDA} ({e}). {_unreachable_hint()}",
                 kind=ErrorKind.UNREACHABLE) from e
@@ -406,16 +443,29 @@ def _screenshot_quality() -> int:
 def _ensure_session() -> str:
     if _session["id"]:
         return _session["id"]  # type: ignore[return-value]
+    # WDA owns one active session. Creating an independent agent session makes
+    # the mirror's health monitor replace it, and both clients keep invalidating
+    # one another. Join the current session before considering a new one.
+    code, status = _req("GET", "/status", timeout=_TIMEOUT_PROBE)
+    if code >= 400:
+        raise MCPToolError(f"WDA session discovery failed (HTTP {code}).",
+                           kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
+    value = status.get("value")
+    sid = status.get("sessionId") or (value.get("sessionId") if isinstance(value, dict) else None)
+    if sid is not None and not isinstance(sid, str):
+        raise MCPToolError("WDA returned an invalid active session identifier.",
+                           kind=ErrorKind.WDA_HTTP, code="WDA_BAD_RESPONSE")
     # shouldWaitForQuiescence:false slashes gesture latency — measured on-device, a
     # swipe's /actions drops from ~1300ms to ~10-200ms (XCUITest otherwise blocks each
     # gesture until the UI settles). Use settle_ms on scroll/swipe when a following
     # screenshot/source needs a stable, post-animation frame.
-    code, j = _req("POST", "/session",
-                   {"capabilities": {"alwaysMatch": {"shouldWaitForQuiescence": False},
-                                     "firstMatch": [{}]}})
-    sid = (j.get("value") or {}).get("sessionId") or j.get("sessionId")
     if not sid:
-        raise RuntimeError(f"WDA session create failed (HTTP {code}): {j}")
+        code, j = _req("POST", "/session",
+                       {"capabilities": {"alwaysMatch": {"shouldWaitForQuiescence": False},
+                                         "firstMatch": [{}]}})
+        sid = (j.get("value") or {}).get("sessionId") or j.get("sessionId")
+        if not sid:
+            raise RuntimeError(f"WDA session create failed (HTTP {code}): {j}")
     _session["id"] = sid
     # Disable XCUITest's idle/animation wait — the big latency win (a swipe over
     # animating content drops ~13s -> ~1s, static lists ~1.3s -> near-instant).
@@ -437,11 +487,20 @@ def _ensure_session() -> str:
     return sid
 
 
+def _invalid_session(code: int, j: dict[str, Any]) -> bool:
+    """404 also represents missing/stale elements and unsupported commands."""
+    value = j.get("value")
+    return code == 404 and (
+        (isinstance(value, dict) and value.get("error") == "invalid session id")
+        or value == "no session"  # compatibility with older WDA builds
+    )
+
+
 def _session_post(subpath: str, body: dict, _retry: bool = True) -> dict[str, Any]:
-    """POST to /session/<id><subpath>; recreate the session once on 404."""
+    """POST to /session/<id><subpath>; recreate only an invalid session once."""
     sid = _ensure_session()
     code, j = _req("POST", f"/session/{sid}{subpath}", body)
-    if code == 404 and _retry:               # stale session (WDA restarted)
+    if _invalid_session(code, j) and _retry:
         _session["id"] = None
         return _session_post(subpath, body, _retry=False)
     if code >= 400:
@@ -451,10 +510,10 @@ def _session_post(subpath: str, body: dict, _retry: bool = True) -> dict[str, An
 
 
 def _session_get(subpath: str, _retry: bool = True) -> dict[str, Any]:
-    """GET /session/<id><subpath>; recreate the session once on 404."""
+    """GET /session/<id><subpath>; recreate only an invalid session once."""
     sid = _ensure_session()
     code, j = _req("GET", f"/session/{sid}{subpath}")
-    if code == 404 and _retry:               # stale session (WDA restarted)
+    if _invalid_session(code, j) and _retry:
         _session["id"] = None
         return _session_get(subpath, _retry=False)
     if code >= 400:
@@ -568,9 +627,15 @@ def _find_element(text: str, visible_only: bool = False, _retry: bool = True) ->
     code, j = _req("POST", f"/session/{sid}/element",
                    {"using": "predicate string", "value": predicate},
                    timeout=_TIMEOUT_PROBE)
-    if code == 404 and _retry:
+    if _invalid_session(code, j) and _retry:
         _session["id"] = None
         return _find_element(text, visible_only=visible_only, _retry=False)
+    value = j.get("value")
+    if code == 404 and isinstance(value, dict) and value.get("error") == "no such element":
+        return None
+    if code >= 400:
+        raise MCPToolError(f"WDA error (HTTP {code}) finding {text!r}: {j}",
+                           kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
     return (j.get("value") or {}).get("ELEMENT") or \
            (j.get("value") or {}).get("element-6066-11e4-a52e-4f735466cecf")
 
@@ -614,6 +679,10 @@ def _find_element_or_timeout(text: str, visible_only: bool = False) -> tuple[str
 # but info-dense tree, and a byte cap would truncate mid-element. The full
 # payload is always parsed first; only the rendered output is capped.
 _SOURCE_MAX_ELEMENTS = 400
+_SOURCE_MAX_FIELD_CHARS = 240
+_SOURCE_MAX_TEXT_CHARS = 20000
+_SOURCE_TEXT_FIELDS = (("label", "label"), ("name", "name"),
+                       ("value", "value"), ("identifier", "id"))
 
 # "Content" roles are always rendered, even with an empty label, because they're
 # the elements an agent actually taps/reads. Pure containers (Other, Window,
@@ -753,11 +822,18 @@ def _render_source_line(depth: int, node: dict[str, Any],
                         win_w: float, win_h: float) -> str:
     short = _source_short_type(node.get("type"))
     parts = [("  " * depth) + short]
-    for field, tag in (("label", "label"), ("name", "name"),
-                       ("value", "value"), ("identifier", "id")):
+    seen: set[str] = set()
+    for field, tag in _SOURCE_TEXT_FIELDS:
         v = node.get(field)
         if v:
-            parts.append(f'{tag}="{v}"')
+            value = str(v)
+            if value in seen:
+                continue
+            seen.add(value)
+            if len(value) > _SOURCE_MAX_FIELD_CHARS:
+                value = value[:_SOURCE_MAX_FIELD_CHARS - 1] + "…"
+            # Keep each element on one line even when its label has newlines.
+            parts.append(f'{tag}={json.dumps(value, ensure_ascii=False)}')
     flags = [name for name, v in (("enabled", node.get("enabled")),
                                   ("visible", node.get("visible")),
                                   ("hittable", node.get("hittable"))) if v is True]
@@ -783,11 +859,27 @@ def _render_source_text(root: dict[str, Any]) -> str:
     lines = ["# tap point = (x + w/2, y + h/2) in normalized [0,1] coords, "
              "multiply by window size"]
     total = len(elements)
+    notice = (f"… ({total} elements dropped; field values truncated; "
+              "use ios_source(format='xml') for more detail.)")
+    used = len(lines[0])
+    emitted = 0
+    fields_truncated = False
     for depth, node in elements[:_SOURCE_MAX_ELEMENTS]:
-        lines.append(_render_source_line(depth, node, win_w, win_h))
-    dropped = total - _SOURCE_MAX_ELEMENTS
-    if dropped > 0:
-        lines.append(f"… ({dropped} elements dropped; refine with a more specific screen)")
+        line = _render_source_line(depth, node, win_w, win_h)
+        if used + 1 + len(line) + 1 + len(notice) > _SOURCE_MAX_TEXT_CHARS:
+            break
+        lines.append(line)
+        used += 1 + len(line)
+        emitted += 1
+        fields_truncated |= any(len(str(node.get(field) or "")) > _SOURCE_MAX_FIELD_CHARS
+                                for field, _ in _SOURCE_TEXT_FIELDS)
+    dropped = total - emitted
+    if dropped or fields_truncated:
+        details = [f"{dropped} elements dropped"] if dropped else []
+        if fields_truncated:
+            details.append("field values truncated")
+        lines.append("… (" + "; ".join(details) +
+                     "; use ios_source(format='xml') for more detail.)")
     return "\n".join(lines)
 
 
@@ -810,7 +902,62 @@ def ios_status() -> str:
         "ios": v.get("os", {}).get("version"),
         "device": v.get("device"),
         "server_version": __version__,
+        "target": TARGET,
+        "wda_endpoint": WDA,
+        "selected_udid": ((_selected_sim_udid or os.environ.get("IMIRROR_SIM_UDID"))
+                          if _IS_SIM else os.environ.get("IMIRROR_UDID")),
     })
+
+
+def _alert_request(method: str, route: str, body: dict | None = None) -> tuple[bool, Any]:
+    """Read WDA's alert result without putting potentially private text in errors."""
+    sid = _ensure_session()
+    code, response = _req(method, f"/session/{sid}{route}", body)
+    if method == "GET" and _invalid_session(code, response):
+        _session["id"] = None
+        sid = _ensure_session()
+        code, response = _req(method, f"/session/{sid}{route}", body)
+    value = response.get("value")
+    if code == 404 and isinstance(value, dict) and value.get("error") == "no such alert":
+        return False, None
+    if code >= 400:
+        raise MCPToolError(f"WDA alert request failed (HTTP {code}) on {route}.",
+                           kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
+    return True, value
+
+
+@mcp.tool()
+def ios_alert(action: str = "get", button_label: str = "") -> str:
+    """Inspect a blocking system alert, or explicitly accept/dismiss it.
+
+    `get` returns present, text and button labels; no alert returns present=false.
+    `accept` and `dismiss` use WDA's default button unless `button_label` names
+    an exact alert button. Read first and choose deliberately. Alert contents
+    are not added to run recordings. Mutations are never automatically replayed.
+    """
+    if action not in ("get", "accept", "dismiss"):
+        raise MCPToolError("action must be 'get', 'accept', or 'dismiss'.",
+                           kind=ErrorKind.VALIDATION)
+    if not isinstance(button_label, str) or (action == "get" and button_label):
+        raise MCPToolError("button_label must be text and is only valid for accept/dismiss.",
+                           kind=ErrorKind.VALIDATION)
+    if action == "get":
+        present, text = _alert_request("GET", "/alert/text")
+        if not present:
+            return json.dumps({"present": False})
+        present, buttons = _alert_request("GET", "/wda/alert/buttons")
+        if not present:
+            return json.dumps({"present": False})
+        if not isinstance(text, str) or not isinstance(buttons, list) or not all(
+                isinstance(button, str) for button in buttons):
+            raise MCPToolError("WDA returned an unexpected alert response.",
+                               kind=ErrorKind.WDA_HTTP, code="WDA_BAD_RESPONSE")
+        return json.dumps({"present": True, "text": text, "buttons": buttons})
+    present, _ = _alert_request("POST", f"/alert/{action}",
+                                {"name": button_label} if button_label else {})
+    if not present:
+        return json.dumps({"present": False})
+    return json.dumps({"present": True, "action": action, "button_label": button_label})
 
 
 @mcp.tool()
@@ -879,7 +1026,7 @@ def _screenshot_bytes_simctl() -> bytes:
     fd, path = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     try:
-        _simctl("io", "booted", "screenshot", path)
+        _simctl("io", _sim_udid(), "screenshot", path)
         with open(path, "rb") as f:
             return f.read()
     finally:
@@ -904,6 +1051,7 @@ def ios_screenshot() -> Image:
     Use it to see the device state before/after an action.
     """
     if _IS_SIM:
+        _sim_udid()
         try:
             data = _screenshot_bytes_simctl()
         except (RuntimeError, OSError):
@@ -950,9 +1098,11 @@ def ios_source(format: str = "text") -> str:
     be briefly stale. Pure containers (Other/Window/Group/...) are collapsed
     unless they carry their own label/value/identifier or are interactive;
     content elements (buttons, text, fields, images, cells, ...) always
-    appear, even with an empty label. Output is capped at 400 elements (by
-    count, not bytes — the full tree is always parsed first); a trailing line
-    reports how many were dropped, if any. This is far cheaper for an agent to
+    appear, even with an empty label. Identical field values appear once.
+    Output is capped at 400 elements and 20,000 characters, with each field
+    value limited to 240 characters. The full tree is parsed first. A trailing
+    notice reports omitted elements or shortened fields and points to XML
+    for more detail. This is far cheaper for an agent to
     read than the raw XML — prefer it unless you need the exact raw markup.
 
     `format="xml"` returns the raw WDA source string unchanged (today's
@@ -1424,7 +1574,7 @@ def _simctl_pbcopy(text: str) -> None:
     if not _IS_SIM:
         raise RuntimeError("simctl tools require IMIRROR_TARGET=simulator.")
     try:
-        r = subprocess.run(["xcrun", "simctl", "pbcopy", "booted"],
+        r = subprocess.run(["xcrun", "simctl", "pbcopy", _sim_udid()],
                            input=text.encode(), capture_output=True, text=False)
     except FileNotFoundError as e:
         raise RuntimeError("`xcrun` not found — install the Xcode command-line tools.") from e
@@ -1444,6 +1594,7 @@ def ios_clipboard_set(text: str) -> str:
     ignored — call after a WDA-owned screen or expect a no-op.
     """
     if _IS_SIM:
+        _sim_udid()
         try:
             _simctl_pbcopy(text)
             _record("clipboard_set", repr(text))
@@ -1469,12 +1620,13 @@ def ios_clipboard_get() -> str:
     ios_clipboard_set applies.
     """
     if _IS_SIM:
+        _sim_udid()
         try:
             # strip=False: pbpaste's stdout IS the clipboard content verbatim —
             # trailing newlines, indentation, and other meaningful whitespace
             # must round-trip unchanged (unlike UDID/device-list callers, where
             # _simctl's default strip=True is correct).
-            text = _simctl("pbpaste", "booted", strip=False)
+            text = _simctl("pbpaste", _sim_udid(), strip=False)
             _record("clipboard_get", f"{len(text)} chars")
             return text
         except (RuntimeError, OSError):
@@ -1529,7 +1681,8 @@ def ios_install_app(path: str) -> str:
 def _install_on_device(path: str) -> None:
     """Install `path` on the connected device via go-ios (resolved by _ios_bin)."""
     try:
-        subprocess.run([_ios_bin(), "install", f"--path={path}"],
+        subprocess.run([_ios_bin(), "install", f"--path={path}"] +
+                       ([f"--udid={os.environ['IMIRROR_UDID']}"] if os.environ.get("IMIRROR_UDID") else []),
                        check=True, capture_output=True, text=True)
     except FileNotFoundError as e:
         raise RuntimeError("go-ios 'ios' binary not found (set IMIRROR_IOS_BIN).") from e
@@ -1540,7 +1693,7 @@ def _install_on_device(path: str) -> None:
 def _install_on_simulator(path: str) -> None:
     """Install `path` on the booted simulator via `xcrun simctl install booted`."""
     try:
-        subprocess.run(["xcrun", "simctl", "install", "booted", path],
+        subprocess.run(["xcrun", "simctl", "install", _sim_udid(), path],
                        check=True, capture_output=True, text=True)
     except FileNotFoundError as e:
         raise RuntimeError("`xcrun` not found — install the Xcode command-line tools.") from e
@@ -1558,6 +1711,46 @@ def _install_on_simulator(path: str) -> None:
 # deliver push payloads, flip privacy permissions without tapping the system
 # dialog, and freeze the status bar for clean screenshots. simctl only ever talks
 # to simulators, so they require IMIRROR_TARGET=simulator and target `booted`.
+
+_selected_sim_udid: str | None = None
+_sim_target_lock = threading.Lock()
+
+
+def _sim_udid() -> str:
+    """Pin simulator helpers once; never let `booted` choose another device."""
+    global _selected_sim_udid
+    if not _IS_SIM:
+        raise MCPToolError("Simulator tools require IMIRROR_TARGET=simulator.",
+                           kind=ErrorKind.UNSUPPORTED)
+    with _sim_target_lock:
+        if _selected_sim_udid:
+            return _selected_sim_udid
+        explicit = os.environ.get("IMIRROR_SIM_UDID", "").strip()
+        if explicit:
+            if explicit.lower() in ("booted", "all"):
+                raise MCPToolError("IMIRROR_SIM_UDID must identify one simulator by UDID.",
+                                   kind=ErrorKind.VALIDATION)
+            _selected_sim_udid = explicit
+            return explicit
+        try:
+            raw = _simctl("list", "devices", "booted", "--json")
+            runtimes = json.loads(raw)["devices"]
+            candidates = [d["udid"] for runtime, devices in runtimes.items()
+                          if ".iOS-" in runtime for d in devices
+                          if d.get("state") == "Booted" and d.get("isAvailable", True)]
+        except (RuntimeError, OSError, ValueError, KeyError, TypeError) as e:
+            raise MCPToolError(
+                "Cannot discover the simulator target. Set IMIRROR_SIM_UDID to the "
+                "UDID used to start WDA, or check `xcrun simctl list devices booted`.",
+                kind=ErrorKind.VALIDATION) from e
+        if len(candidates) != 1:
+            raise MCPToolError(
+                f"Found {len(candidates)} booted iOS simulators. Set IMIRROR_SIM_UDID "
+                "to the UDID used to start WDA; a unique target is required.",
+                kind=ErrorKind.VALIDATION)
+        _selected_sim_udid = candidates[0]
+        return _selected_sim_udid
+
 
 def _simctl(*args: str, strip: bool = True) -> str:
     """Run `xcrun simctl <args>` and return stdout. Simulator-only.
@@ -1597,7 +1790,7 @@ def _start_sim_recording(run_dir: str) -> None:
     with _recorder_lock:
         try:
             proc = subprocess.Popen(
-                ["xcrun", "simctl", "io", "booted", "recordVideo",
+                ["xcrun", "simctl", "io", _sim_udid(), "recordVideo",
                  "--codec=h264", "--force", path],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 # DEVNULL, not PIPE: nothing ever reads this pipe, and a long
@@ -1674,7 +1867,7 @@ def sim_push(bundle_id: str, payload_json: str) -> str:
         f.write(payload_json)
         tmp = f.name
     try:
-        _simctl("push", "booted", bundle_id, tmp)
+        _simctl("push", _sim_udid(), bundle_id, tmp)
     finally:
         try:
             os.unlink(tmp)
@@ -1696,7 +1889,7 @@ def sim_privacy(action: str, service: str, bundle_id: str = "") -> str:
     """
     if action not in ("grant", "revoke", "reset"):
         raise RuntimeError("action must be one of ['grant', 'revoke', 'reset'].")
-    args = ["privacy", "booted", action, service]
+    args = ["privacy", _sim_udid(), action, service]
     if bundle_id:
         args.append(bundle_id)
     _simctl(*args)
@@ -1713,10 +1906,10 @@ def sim_status_bar(time: str = "9:41", clear: bool = False) -> str:
     IMIRROR_TARGET=simulator.
     """
     if clear:
-        _simctl("status_bar", "booted", "clear")
+        _simctl("status_bar", _sim_udid(), "clear")
         _record("sim_status_bar", "clear")
         return "status bar restored"
-    _simctl("status_bar", "booted", "override",
+    _simctl("status_bar", _sim_udid(), "override",
             "--time", time, "--batteryState", "charged", "--batteryLevel", "100",
             "--cellularBars", "4", "--wifiBars", "3", "--dataNetwork", "wifi")
     _record("sim_status_bar", f"override time={time}")

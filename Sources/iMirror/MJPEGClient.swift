@@ -37,18 +37,13 @@ final class MJPEGClient {
     private let port: UInt16
     private let queue = DispatchQueue(label: "imirror.mjpeg")
 
-    private let boundaryMarker = "--BoundaryString"
-    private let headerTerminator = "\r\n\r\n"
-
     private var connection: NWConnection?
-    private var buffer = Data()
+    private var parser = MJPEGStreamParser()
+    private var generation: UInt64 = 0
+    private var reconnectWork: DispatchWorkItem?
     private var stopped = true
     private var reconnectDelay: TimeInterval = 0.5
     private let reconnectDelayCap: TimeInterval = 5.0
-
-    // Parse state for the current response: have we consumed the initial
-    // HTTP response headers yet (steps before the first boundary)?
-    private var consumedResponseHeaders = false
 
     /// Called per decoded frame, on the internal `imirror.mjpeg` queue. Do not
     /// assume main thread; hop yourself if you touch UI from here.
@@ -62,6 +57,12 @@ final class MJPEGClient {
         self.port = port
     }
 
+    deinit {
+        reconnectWork?.cancel()
+        connection?.stateUpdateHandler = nil
+        connection?.cancel()
+    }
+
     /// Starts (or restarts) the stream. Calling start() again while already
     /// running tears down the old connection and opens a fresh one: simplest
     /// to reason about, and callers never need to check "is it already
@@ -69,6 +70,8 @@ final class MJPEGClient {
     func start() {
         queue.async { [weak self] in
             guard let self else { return }
+            self.generation &+= 1
+            self.closeConnection()
             self.stopped = false
             self.reconnectDelay = 0.5
             self.openConnection()
@@ -78,12 +81,9 @@ final class MJPEGClient {
     func stop() {
         queue.async { [weak self] in
             guard let self else { return }
+            self.generation &+= 1
             self.stopped = true
-            self.connection?.stateUpdateHandler = nil
-            self.connection?.cancel()
-            self.connection = nil
-            self.buffer.removeAll()
-            self.consumedResponseHeaders = false
+            self.closeConnection()
         }
     }
 
@@ -91,8 +91,7 @@ final class MJPEGClient {
 
     private func openConnection() {
         guard !stopped else { return }
-        buffer.removeAll()
-        consumedResponseHeaders = false
+        closeConnection()
         let conn = NWConnection(host: NWEndpoint.Host(host),
                                 port: NWEndpoint.Port(rawValue: port)!,
                                 using: .tcp)
@@ -114,23 +113,40 @@ final class MJPEGClient {
             onStateChange?(true)
             receiveMore(on: conn)
         case .failed, .cancelled:
-            onStateChange?(false)
-            conn.cancel()
-            if connection === conn { connection = nil }
-            scheduleReconnect()
+            disconnect(conn)
         default:
             break
         }
     }
 
+    private func closeConnection() {
+        reconnectWork?.cancel()
+        reconnectWork = nil
+        connection?.stateUpdateHandler = nil
+        connection?.cancel()
+        connection = nil
+        parser = MJPEGStreamParser()
+    }
+
+    private func disconnect(_ conn: NWConnection) {
+        guard connection === conn else { return }
+        closeConnection()
+        onStateChange?(false)
+        scheduleReconnect()
+    }
+
     private func scheduleReconnect() {
         guard !stopped else { return }
         let delay = reconnectDelay
+        let expectedGeneration = generation
         reconnectDelay = min(reconnectDelay * 2, reconnectDelayCap)
-        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, !self.stopped else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.stopped, self.generation == expectedGeneration,
+                  self.connection == nil else { return }
             self.openConnection()
         }
+        reconnectWork = work
+        queue.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func sendRequest(on conn: NWConnection) {
@@ -149,11 +165,20 @@ final class MJPEGClient {
             self?.queue.async {
                 guard let self, self.connection === conn else { return }
                 if let data, !data.isEmpty {
-                    self.buffer.append(data)
-                    self.drainBuffer()
+                    do {
+                        if let payload = try self.parser.append(data),
+                           let source = CGImageSourceCreateWithData(payload as CFData, nil),
+                           let image = CGImageSourceCreateImageAtIndex(source, 0, nil) {
+                            self.onFrame?(image)
+                        }
+                    } catch {
+                        NSLog("iMirror: invalid MJPEG stream: \(error)")
+                        self.disconnect(conn)
+                        return
+                    }
                 }
                 if isComplete || error != nil {
-                    conn.cancel()
+                    self.disconnect(conn)
                     return
                 }
                 self.receiveMore(on: conn)
@@ -161,90 +186,4 @@ final class MJPEGClient {
         }
     }
 
-    // MARK: Multipart parsing (runs on `queue` only)
-
-    /// Consumes as many complete JPEG parts as the buffer currently holds,
-    /// leaving any trailing partial data in place for the next receive.
-    private func drainBuffer() {
-        if !consumedResponseHeaders {
-            guard let headerEnd = range(of: headerTerminator, in: buffer, from: 0) else { return }
-            buffer.removeSubrange(buffer.startIndex..<headerEnd.upperBound)
-            consumedResponseHeaders = true
-        }
-
-        while true {
-            guard let boundaryRange = range(of: boundaryMarker, in: buffer, from: buffer.startIndex) else {
-                return   // no boundary buffered yet; wait for more data
-            }
-            guard let partHeaderEnd = range(of: headerTerminator, in: buffer, from: boundaryRange.upperBound) else {
-                return   // boundary seen but part headers not fully buffered yet
-            }
-            let partHeaders = buffer[boundaryRange.upperBound..<partHeaderEnd.lowerBound]
-            guard let contentLength = parseContentLength(partHeaders) else {
-                // Malformed/unparseable part headers: resync on the next boundary
-                // rather than getting stuck, and never trust attacker-controlled
-                // bytes enough to force-unwrap them.
-                resyncPastBoundary(after: boundaryRange.upperBound)
-                continue
-            }
-
-            let payloadStart = partHeaderEnd.upperBound
-            let payloadEnd = buffer.index(payloadStart, offsetBy: contentLength, limitedBy: buffer.endIndex)
-            guard let payloadEnd else {
-                return   // full JPEG payload not buffered yet; wait for more data
-            }
-
-            let payload = buffer[payloadStart..<payloadEnd]
-            if let source = CGImageSourceCreateWithData(payload as CFData, nil),
-               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) {
-                onFrame?(image)
-            }
-
-            // Advance past the payload, tolerating an optional trailing \r\n
-            // before the next boundary.
-            var next = payloadEnd
-            if buffer.distance(from: next, to: buffer.endIndex) >= 2,
-               buffer[next] == 0x0D, buffer[buffer.index(after: next)] == 0x0A {
-                next = buffer.index(next, offsetBy: 2)
-            }
-            buffer.removeSubrange(buffer.startIndex..<next)
-        }
-    }
-
-    /// Drops everything up to and including the next boundary marker found
-    /// at or after `from`, so a malformed part can't wedge the parser. If no
-    /// further boundary is buffered yet, leaves the buffer as-is (from the
-    /// search start onward) to wait for more data.
-    private func resyncPastBoundary(after from: Data.Index) {
-        guard let next = range(of: boundaryMarker, in: buffer, from: from) else {
-            // Nothing to resync to yet; keep whatever's unread so a boundary
-            // split across receives still gets found once more data arrives.
-            if from > buffer.startIndex { buffer.removeSubrange(buffer.startIndex..<from) }
-            return
-        }
-        buffer.removeSubrange(buffer.startIndex..<next.upperBound)
-    }
-
-    /// Case-insensitive, tolerant scan for "Content-Length: <N>" within a
-    /// part-header slice. No general HTTP parser needed: these are a couple
-    /// of short, known-shape lines.
-    private func parseContentLength(_ headerBytes: Data.SubSequence) -> Int? {
-        guard let text = String(data: Data(headerBytes), encoding: .utf8) else { return nil }
-        for line in text.split(separator: "\r\n") {
-            let parts = line.split(separator: ":", maxSplits: 1)
-            guard parts.count == 2 else { continue }
-            if parts[0].trimmingCharacters(in: .whitespaces).lowercased() == "content-length" {
-                return Int(parts[1].trimmingCharacters(in: .whitespaces))
-            }
-        }
-        return nil
-    }
-
-    /// Finds the first occurrence of `needle` in `haystack` at or after
-    /// `start`. Small helper since Data has no built-in substring search.
-    private func range(of needle: String, in haystack: Data, from start: Data.Index) -> Range<Data.Index>? {
-        guard let needleData = needle.data(using: .utf8), !needleData.isEmpty else { return nil }
-        guard start < haystack.endIndex else { return nil }
-        return haystack.range(of: needleData, options: [], in: start..<haystack.endIndex)
-    }
 }

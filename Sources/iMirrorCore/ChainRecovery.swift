@@ -67,3 +67,29 @@ public func nextMjpegRecoveryAction(noFrameForSec: TimeInterval, alreadyBounced:
     guard noFrameForSec >= thresholdSec else { return .wait }
     return alreadyBounced ? .escalate : .bounceForward
 }
+
+/// Owns the recovery ladder's clock across outage, restart preparation and WDA
+/// launch. Each full restart gets a fresh preparation budget; an actual runwda
+/// launch then gets its own boot budget without resetting the recovery stage.
+public struct ChainRecoveryClock {
+    public private(set) var stage = 0
+    private var startedAt: TimeInterval?
+
+    public init() {}
+
+    public mutating func reset() { stage = 0; startedAt = nil }
+    public mutating func runwdaStarted(at now: TimeInterval) { startedAt = now }
+    public mutating func connectionLost(at now: TimeInterval) {
+        if startedAt == nil { startedAt = now }
+    }
+    public mutating func beginRestart(at now: TimeInterval) {
+        stage = 1
+        startedAt = now
+    }
+    public func action(at now: TimeInterval, postConnectionOutage: Bool) -> ChainRecoveryAction {
+        guard let startedAt else { return .wait }
+        return nextChainRecoveryAction(downForSec: now - startedAt, stage: stage,
+                                       graceSec: chainRecoveryGraceSec(stage: stage,
+                                                                      postConnectionOutage: postConnectionOutage))
+    }
+}

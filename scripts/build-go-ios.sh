@@ -13,6 +13,15 @@ SRC="$ROOT/tools/go-ios"
 [[ -d "$SRC" ]] || { echo "tools/go-ios not found — clone it first (see README)" >&2; exit 1; }
 cd "$SRC"
 
+# Refuse stale clones before editing dependency files or producing a helper.
+# Local dependency patches are expected; the audited source revision is fixed.
+EXPECTED_GOIOS_REV="2fb34682ef12db97c9fafdf99f1dd1d3522604ad"
+if [[ "$(git rev-parse HEAD)" != "$EXPECTED_GOIOS_REV" ]]; then
+    echo "go-ios source must be v1.3.2 ($EXPECTED_GOIOS_REV), as recorded in SECURITY-AUDIT.md." >&2
+    echo "Preserve local changes and prepare that revision before rebuilding." >&2
+    exit 1
+fi
+
 # Same patched transitive deps the security audit records (SECURITY-AUDIT.md).
 GOWORK=off go get golang.org/x/crypto@v0.57.0 golang.org/x/net@v0.60.0
 GOWORK=off go mod tidy
