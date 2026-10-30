@@ -46,7 +46,14 @@ from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import FastMCP, Image
 
-import wda_bringup
+# The sibling helper lives inside the signed app when bundled. Importing it
+# must not create __pycache__ there and invalidate the app's resource seal.
+_previous_bytecode_setting = sys.dont_write_bytecode
+try:
+    sys.dont_write_bytecode = True
+    import wda_bringup
+finally:
+    sys.dont_write_bytecode = _previous_bytecode_setting
 
 
 class ErrorKind:

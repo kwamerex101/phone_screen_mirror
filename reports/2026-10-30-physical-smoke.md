@@ -52,3 +52,9 @@ A stale connection from the earlier app restart also produced an explicit unknow
 This verifies one unlocked, trusted, already-provisioned phone and one manual unplug/replug cycle. Fresh WDA installation, provisioning failures, locked-device recovery, multiple attached phones, sleep/wake, and sustained latency are not established by this pass. The legacy physical install subprocess timeout recommendation remains open.
 
 The native review build is in `build/iMirror.app`; the installed `/Applications` app was not replaced. Reconnect the MCP client or start a fresh client process to load the session-sharing fix. The Mac app was left mirroring with local Control off.
+
+## Bundle integrity follow-up
+
+The post-startup signature check found that Python created `__pycache__/wda_bringup.cpython-313.pyc` inside the signed bundle. The bundle smoke checker now compares its MCP resource files before and after protocol initialization. That check failed on the original import path. Suppressing bytecode writes only while importing the bundled sibling helper fixed the failure; the Python process's prior bytecode setting is restored afterward.
+
+Fresh initialization still exposes 33 tools, the resource snapshot remains unchanged, and `codesign --verify --strict` passes after startup. The Mac CI job now runs this bundle-startup and signature check to retain coverage.

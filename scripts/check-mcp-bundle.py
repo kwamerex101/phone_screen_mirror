@@ -5,6 +5,7 @@ Run with the project's MCP venv Python and a built .app path. No WDA or device
 is needed: initialization and tool discovery do not issue device commands.
 """
 import asyncio
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -16,6 +17,11 @@ from mcp.client.stdio import stdio_client
 
 async def check(app: Path) -> None:
     server = app.resolve() / "Contents/Resources/mcp-server/imirror_mcp.py"
+    def snapshot() -> dict[str, str]:
+        return {str(path.relative_to(server.parent)): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in server.parent.rglob("*") if path.is_file()}
+
+    before = snapshot()
     with tempfile.TemporaryDirectory(prefix="imirror-bundle-check-") as cwd:
         parameters = StdioServerParameters(command=sys.executable, args=[str(server)], cwd=cwd,
             env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -28,6 +34,7 @@ async def check(app: Path) -> None:
                 assert {"ios_status", "ios_source", "ios_screenshot", "ios_run_sequence"} <= names
                 assert initialized.instructions and "inspect the screen" in initialized.instructions
                 print(f"Bundled MCP initialized: {len(names)} tools, agent instructions present.")
+    assert snapshot() == before, "MCP startup modified signed bundle resources"
 
 
 if __name__ == "__main__":
