@@ -436,16 +436,29 @@ def _screenshot_quality() -> int:
 def _ensure_session() -> str:
     if _session["id"]:
         return _session["id"]  # type: ignore[return-value]
+    # WDA owns one active session. Creating an independent agent session makes
+    # the mirror's health monitor replace it, and both clients keep invalidating
+    # one another. Join the current session before considering a new one.
+    code, status = _req("GET", "/status", timeout=_TIMEOUT_PROBE)
+    if code >= 400:
+        raise MCPToolError(f"WDA session discovery failed (HTTP {code}).",
+                           kind=ErrorKind.WDA_HTTP, code=f"WDA_HTTP_{code}")
+    value = status.get("value")
+    sid = status.get("sessionId") or (value.get("sessionId") if isinstance(value, dict) else None)
+    if sid is not None and not isinstance(sid, str):
+        raise MCPToolError("WDA returned an invalid active session identifier.",
+                           kind=ErrorKind.WDA_HTTP, code="WDA_BAD_RESPONSE")
     # shouldWaitForQuiescence:false slashes gesture latency — measured on-device, a
     # swipe's /actions drops from ~1300ms to ~10-200ms (XCUITest otherwise blocks each
     # gesture until the UI settles). Use settle_ms on scroll/swipe when a following
     # screenshot/source needs a stable, post-animation frame.
-    code, j = _req("POST", "/session",
-                   {"capabilities": {"alwaysMatch": {"shouldWaitForQuiescence": False},
-                                     "firstMatch": [{}]}})
-    sid = (j.get("value") or {}).get("sessionId") or j.get("sessionId")
     if not sid:
-        raise RuntimeError(f"WDA session create failed (HTTP {code}): {j}")
+        code, j = _req("POST", "/session",
+                       {"capabilities": {"alwaysMatch": {"shouldWaitForQuiescence": False},
+                                         "firstMatch": [{}]}})
+        sid = (j.get("value") or {}).get("sessionId") or j.get("sessionId")
+        if not sid:
+            raise RuntimeError(f"WDA session create failed (HTTP {code}): {j}")
     _session["id"] = sid
     # Disable XCUITest's idle/animation wait — the big latency win (a swipe over
     # animating content drops ~13s -> ~1s, static lists ~1.3s -> near-instant).

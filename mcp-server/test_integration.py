@@ -78,6 +78,19 @@ def test_session_is_reused(m):
     assert m._session["id"] == first
 
 
+def test_existing_app_session_is_adopted(m):
+    """An agent must not invalidate the mirror's already active session."""
+    _, status = m._req("GET", "/status")
+    sid = status.get("sessionId") or status.get("value", {}).get("sessionId")
+    if not sid:
+        pytest.skip("This WDA does not report an existing active session")
+    m._session["id"] = None
+    m.ios_window_size()
+    _, after = m._req("GET", "/status")
+    assert m._session["id"] == sid
+    assert (after.get("sessionId") or after.get("value", {}).get("sessionId")) == sid
+
+
 def test_full_recorded_run(m, tmp_path, monkeypatch):
     """End-to-end: record a couple of real screenshots and render the report
     (and a timelapse if ffmpeg is present)."""

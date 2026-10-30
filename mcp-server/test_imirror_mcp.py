@@ -57,6 +57,9 @@ class FakeWDA:
         # _ensure_session always fires this boilerplate; succeed it by default.
         if path.endswith("/appium/settings"):
             return 200, {"value": {}}
+        # Session setup first discovers whether the mirror already owns one.
+        if method == "GET" and path == "/status":
+            return 200, {"value": {"ready": True}, "sessionId": None}
         if any(path.endswith(s) for s in self.allowed):
             return 200, {"value": {}}
         # Anything else unscripted is a test bug or a silently renamed route —
@@ -395,6 +398,35 @@ def test_ensure_session_creates_once(mod, wda):
     assert mod._ensure_session() == "abc"
     assert mod._ensure_session() == "abc"  # cached, no second create
     assert sum(1 for m, p, _ in wda.calls if p == "/session") == 1
+
+
+@pytest.mark.parametrize("status", [
+    {"sessionId": "app-session", "value": {"ready": True}},
+    {"value": {"ready": True, "sessionId": "app-session"}},
+])
+def test_ensure_session_adopts_live_app_session(mod, wda, status):
+    wda.script("/status", (200, status))
+    assert mod._ensure_session() == "app-session"
+    assert mod._ensure_session() == "app-session"
+    assert not any(method == "POST" and path == "/session" for method, path, _ in wda.calls)
+    assert sum(path == "/status" for _, path, _ in wda.calls) == 1
+
+
+def test_session_get_recovers_into_live_app_session(mod, wda):
+    mod._session["id"] = "expired"
+    wda.script("/status", (200, {"sessionId": "app-session", "value": {"ready": True}}))
+    wda.script("/session/expired/window/size", (404, {"value": {"error": "invalid session id"}}))
+    wda.script("/session/app-session/window/size", (200, {"value": {"width": 420, "height": 912}}))
+    assert mod._session_get("/window/size")["value"]["width"] == 420
+    assert mod._session["id"] == "app-session"
+    assert not any(method == "POST" and path == "/session" for method, path, _ in wda.calls)
+
+
+def test_session_probe_error_cannot_create_replacement_session(mod, wda):
+    wda.script("/status", (500, {"value": {"error": "unknown error"}}))
+    with pytest.raises(mod.MCPToolError, match="HTTP 500"):
+        mod._ensure_session()
+    assert not any(method == "POST" and path == "/session" for method, path, _ in wda.calls)
 
 
 def test_session_post_recreates_on_stale_404(mod, wda):
@@ -1857,6 +1889,8 @@ def test_gesture_timeout_does_not_retry(mod, monkeypatch):
     action_calls = []
 
     def fake_http(method, path, data, timeout):
+        if path == "/status":
+            return 200, b'{"value": {"ready": true}, "sessionId": null}'
         if path.endswith("/session"):
             return 200, b'{"value": {"sessionId": "s1"}}'
         if path.endswith("/appium/settings"):
