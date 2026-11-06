@@ -112,7 +112,10 @@ final class MJPEGClient {
             sendRequest(on: conn)
             onStateChange?(true)
             receiveMore(on: conn)
-        case .failed, .cancelled:
+        case .waiting, .failed, .cancelled:
+            // A refused loopback connection enters .waiting rather than
+            // .failed. Opening the forward later does not wake that socket,
+            // so use our bounded reconnect backoff for this state too.
             disconnect(conn)
         default:
             break

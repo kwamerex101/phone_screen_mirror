@@ -3,6 +3,30 @@ import XCTest
 @testable import iMirrorCore
 
 final class GeometryTests: XCTestCase {
+    func testDisplayChangesFitWithoutDeviceProfiles() {
+        // Synthetic surfaces cover a normal phone, wider opened surface,
+        // rotation and closing again. These are not device specifications.
+        var current = CGSize(width: 430, height: 880)
+        let available = CGSize(width: 1200, height: 800)
+        for frame in [CGSize(width: 1170, height: 2532), CGSize(width: 2100, height: 1800),
+                      CGSize(width: 1800, height: 2100), CGSize(width: 2532, height: 1170),
+                      CGSize(width: 1170, height: 2532)] {
+            current = adaptedPreviewSize(current: current, frame: frame, available: available)
+            XCTAssertEqual(current.width / current.height, frame.width / frame.height, accuracy: 0.0001)
+            XCTAssertLessThanOrEqual(current.width, available.width)
+            XCTAssertLessThanOrEqual(current.height, available.height)
+        }
+    }
+
+    func testStaleTouchGeometryIsRejectedDuringRotationAndOpening() {
+        let portrait = CGSize(width: 390, height: 844)
+        XCTAssertTrue(displayShapesMatch(frame: CGSize(width: 1170, height: 2532), logical: portrait))
+        XCTAssertFalse(displayShapesMatch(frame: CGSize(width: 2532, height: 1170), logical: portrait))
+        XCTAssertFalse(displayShapesMatch(frame: CGSize(width: 2100, height: 1800), logical: portrait))
+        XCTAssertTrue(displayShapesMatch(frame: CGSize(width: 2100, height: 1800), logical: CGSize(width: 700, height: 600)))
+        XCTAssertFalse(displayShapesMatch(frame: .zero, logical: portrait))
+    }
+
     func testMapCenter() {
         let rect = CGRect(x: 0, y: 0, width: 100, height: 200)
         let p = mapToDevice(viewPoint: CGPoint(x: 50, y: 100),
@@ -83,6 +107,16 @@ final class WDAParseTests: XCTestCase {
 }
 
 final class RunnerInstallTests: XCTestCase {
+    func testClassifiesFailureAfterVerboseInstallProgress() {
+        let progress = String(repeating: "uploading WebDriverAgent.ipa\n", count: 30)
+        guard case .notProvisioned = classifyInstallError(progress + "ApplicationVerificationFailed: no valid provisioning profile") else {
+            return XCTFail("Progress must not hide the actual install failure")
+        }
+        guard case .deviceLocked = classifyInstallError(progress + "Please unlock the device") else {
+            return XCTFail("Progress must not hide the unlock instruction")
+        }
+    }
+
     func testClassifyNotProvisioned() {
         // go-ios surfaces the underlying MobileInstallation / signing text.
         for s in [

@@ -27,22 +27,24 @@ tools in one:
 
 Features:
 
-- **The phone keeps its own audio.** iMirror renders the mirror from
-  WebDriverAgent's MJPEG stream instead of grabbing the screen as a capture
-  device, so iOS never reroutes audio to the Mac (the old CoreMediaIO/QuickTime
-  behavior). The phone stays unlocked, usable, and audible while you watch and
-  drive it, plus full-resolution PNG screenshots.
+- **Fast USB video.** The native capture preview reached about 55 FPS on one
+  tested phone, with an isolated probe reaching 59.4 FPS. These are observed
+  capture rates, not a guarantee for every device or workload. See the
+  [measurement summary](docs/performance/usb-capture-2026-11-06.json).
+  The preview follows screen-size and orientation changes and saves PNG screenshots.
+- **Audio routing.** Fast USB capture may route iPhone audio to the Mac. WDA's
+  slower MJPEG video remains the fallback when USB capture is unavailable.
 - **Toolbar** — Screenshot, a WDA health dot, Control, Settings, and Home.
 - **Control** — tap, drag, two-finger trackpad scroll (with flick detection),
   type, Home, driven from the preview.
 - **Agent control + test reports** — a full set of `ios_*` MCP tools, opt-in run
   recording, cover/TOC/infographics HTML reports (see
   [MCP server](#mcp-server-drive-the-phone-from-claude)).
-- **Automation starts on launch.** Mirroring is built on WebDriverAgent, so the
-  app brings it up automatically when it connects to the phone (no Xcode, no
-  sudo, no terminal) — a toolbar health dot + auto-reconnect. iOS shows the
-  "Automation Running" overlay while this runs; the phone stays unlocked and
-  keeps its own audio the whole time. The Settings (⚙) popover has a
+- **Automation starts on launch.** The app starts WebDriverAgent for control
+  automatically when it connects to the phone, with a toolbar
+  health dot and automatic recovery. iOS shows the "Automation Running" overlay
+  while this runs; the phone stays unlocked. Control requires a runner signed
+  for the connected device. The Settings (⚙) popover has a
   scroll-speed control, a one-click **MCP server install**, the on-device
   **WebDriverAgent app status**, and the app version/build.
 - **Auto-installs the runner** — on connect, the app checks whether the
@@ -56,7 +58,8 @@ Features:
   registers a dedicated `imirror-sim` MCP server, so an agent can drive and test
   simulator builds too. You view the sim in Apple's Simulator app; requires Xcode.
 
-The app code is dependency-free Swift (AppKit, Network, CoreGraphics/ImageIO).
+The app code uses Apple frameworks: AppKit, AVFoundation, CoreMediaIO, Network,
+CoreGraphics and ImageIO.
 Control rides on two vetted, source-built tools —
 [`go-ios`](https://github.com/danielpaulus/go-ios) and
 [`WebDriverAgent`](https://github.com/appium/WebDriverAgent) — that live under
@@ -88,10 +91,10 @@ needs — the `go-ios` helper and the WebDriverAgent runner — so there's no Xc
 no Go, and no `tools/` setup.
 
 1. Connect your iPhone by USB, unlock it, and tap **Trust**.
-2. Open iMirror. It installs the WebDriverAgent runner on the phone if it's
-   missing and brings it up automatically — the phone stays unlocked and keeps
-   its own audio, though iOS shows the "Automation Running" overlay while this
-   runs. The health dot goes green once the mirror is live.
+2. Open iMirror and allow Camera access if prompted. macOS uses this permission
+   for the phone's USB screen video. The phone stays unlocked; fast capture may
+   route its audio to the Mac. iMirror also starts WebDriverAgent for control.
+   The health dot goes green when control is ready; video can appear earlier.
 3. To control the phone, flip **Control** in the toolbar.
 
 > **One Apple caveat:** the bundled runner is dev-signed for registered devices.
@@ -174,10 +177,10 @@ Then install WebDriverAgent on the device once (Xcode):
 ./scripts/run.sh release    # optimized build
 ```
 
-On launch the app connects to the iPhone and brings up WebDriverAgent
-automatically (health dot green within ~30 s) — the phone stays unlocked and
-keeps its own audio, though iOS shows the "Automation Running" overlay while
-this runs. The mirror appears as soon as frames start arriving. **Screenshot**
+On launch the app starts USB video and WebDriverAgent control independently.
+The phone stays unlocked. Fast USB capture may move its audio to the Mac;
+iOS shows the "Automation Running" overlay while WebDriverAgent runs.
+The mirror appears as soon as frames start arriving. **Screenshot**
 saves a PNG of the latest frame to `~/Pictures` and shows a thumbnail in the
 window's lower-right corner: drag it into Finder, Slack or an editor to drop the
 file there, or click it to open it in Preview. It fades after a few seconds.
@@ -190,15 +193,20 @@ slider and the one-click **MCP server install** described below.
 
 ## How it works
 
-**Video.** WebDriverAgent serves an MJPEG stream on the device (port 9100): a
-multipart/x-mixed-replace sequence of JPEG frames. iMirror forwards that port
-over USB, reads the stream on a raw socket, decodes each frame to a `CGImage`,
-and draws it in the window — roughly 10–20 fps, tuned for glance-and-control
-rather than smooth capture. Screenshots save the latest decoded frame as a PNG.
-Frame rate and quality are tunable through WDA's session settings
-(`mjpegServerFramerate`, `mjpegServerScreenshotQuality`). Since this isn't a
-capture device, iOS never reroutes the phone's audio to the Mac, and the phone
-is never locked.
+**Video.** CoreMediaIO exposes the connected phone as a USB capture device.
+AVFoundation displays its video directly in an `AVCaptureVideoPreviewLayer`.
+The normal preview does not convert each frame to an image or JPEG. Screenshot
+conversion runs only when requested. Frame dimensions drive the window shape;
+touch mapping uses the capture layer's displayed rectangle.
+
+If USB capture is unavailable, the app uses WDA's MJPEG stream on device port
+9100, forwarded to localhost:9110. This fallback captures individual screenshots
+and can be much slower. Pending frame updates keep only the newest image so a
+busy UI does not replay a backlog. To force this backend for diagnostics:
+
+```bash
+IMIRROR_VIDEO_MODE=mjpeg /Applications/iMirror.app/Contents/MacOS/iMirror
+```
 
 **Control.** Clicks/keys on the preview are transformed to device points and sent
 to WebDriverAgent (XCUITest) as W3C pointer/key actions. Control is off by
@@ -218,6 +226,8 @@ first swipe of a session.
 and runs an in-process loopback relay:
 
 ```
+iMirror (AVFoundation preview) <---------------------- USB screen video
+
 iMirror (CFNetwork)  → 127.0.0.1:8100 (relay) → :8101 (ios forward) --USB--> WDA HTTP  :8100
 iMirror (raw socket) -------------------------→ :9110 (ios forward) --USB--> WDA MJPEG :9100
    ios tunnel start --userspace   iOS 17+ RSD tunnel (userspace = no root)
@@ -336,18 +346,15 @@ distribute the notarized DMG directly.
 
 - **Working:** video mirror, screenshot, and control (tap, drag, two-finger
   trackpad scroll with flick detection, type incl. backspace/return/tab, Home).
-  The phone keeps its own audio throughout, since mirroring no longer opens a
-  capture device.
-- **Not currently available:** recording to mp4. It depended on the old
-  capture pipeline and was removed with it; it could be rebuilt from MJPEG
-  frames later.
+  Fast USB video may route phone audio to the Mac. iMirror does not currently
+  add audio playback.
+- **Not currently available:** recording to mp4.
 - **macOS only** by design. Cross-platform would mean the libusb /
   `quicktime_video_hack` path — a different architecture.
-- **Latency:** video is an MJPEG frame stream at roughly 10–20 fps, not a
-  frame-tight capture — the mirror trades smoothness for letting the phone keep
-  its own audio. Control adds a WDA round-trip on top (tens–hundreds of ms per
-  action). Scrolling is not frame-tight and has no inertial coast (a WDA
-  limitation, not a tuning knob).
+- **Performance:** fast USB video averaged about 55 FPS on the tested phone.
+  Rates vary with hardware, screen transitions and workload. The MJPEG fallback
+  was around 5 FPS on that phone. These measurements do not establish end-to-end
+  latency. Control still adds a WDA round-trip and has no inertial coast.
 - **Not reachable** (XCUITest limitation): App Switcher, Control Center, Siri.
 - **One physical device at a time** — the transport assumes a single phone and
   fixed loopback ports (8100/8101 for WDA HTTP, 9110/9100 for the MJPEG
@@ -358,8 +365,9 @@ distribute the notarized DMG directly.
   Apple's private wire protocols, so a new iOS major version can break the chain
   until those projects catch up. Pinned versions in
   [SECURITY-AUDIT.md](SECURITY-AUDIT.md) are what's actually tested.
-- **Landscape** adapts via WDA `window/size` (refreshed each poll) but hasn't been
-  physically rotation-tested.
+- **Display changes:** portrait, landscape and open/closed screen changes were
+  checked on the test phone. Exhaustive gesture-coordinate testing across all
+  display states remains incomplete.
 - Relaunching the app in quick succession can still briefly wedge the device's
   `testmanagerd`. Recovery now escalates in stages: a readiness-deadline
   auto-restart of the runner, then a full chain restart, then (if the chain

@@ -29,13 +29,14 @@ wda_deployment_setting() {  # $1 = sdk name: iphonesimulator | iphoneos
     sdk_min="$(/usr/libexec/PlistBuddy -c "Print :SupportedTargets:$sdk:MinimumDeploymentTarget" "$plist" 2>/dev/null)" || return 0
     [[ -n "$sdk_min" ]] || return 0
     lowest="$(printf '%s\n%s\n' "$proj_floor" "$sdk_min" | sort -V | head -1)"
-    if [[ "$sdk_min" != "$proj_floor" && "$lowest" == "$proj_floor" ]]; then
+    if [[ "$lowest" == "$proj_floor" ]]; then
         echo "IPHONEOS_DEPLOYMENT_TARGET=$sdk_min"
     fi
     return 0
 }
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROJ="$ROOT/tools/WebDriverAgent/WebDriverAgent.xcodeproj"
+WDA_SOURCE="${WDA_SOURCE:-$ROOT/tools/WebDriverAgent}"
+PROJ="$WDA_SOURCE/WebDriverAgent.xcodeproj"
 : "${DEVELOPMENT_TEAM:?set DEVELOPMENT_TEAM to your paid Apple Team id}"
 DERIVED="$ROOT/build/wda-derived"
 BUNDLE_ID="com.local.imirror.WebDriverAgentRunner"
@@ -68,6 +69,7 @@ xcodebuild build-for-testing \
     -destination "${WDA_DESTINATION:-generic/platform=iOS}" \
     -derivedDataPath "$DERIVED" \
     -allowProvisioningUpdates \
+    -allowProvisioningDeviceRegistration \
     PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
     DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
     CODE_SIGN_STYLE=Automatic \
@@ -108,15 +110,16 @@ cp "$ASSETS"/AppIcon*.png "$RUNNER/" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $DISPLAY_NAME" "$RUNNER/Info.plist" 2>/dev/null \
   || /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $DISPLAY_NAME" "$RUNNER/Info.plist"
 # Stamp the WDA release version; the app compares it with the phone's copy to decide on upgrades.
-WDA_VERSION="$(/usr/bin/plutil -extract version raw "$ROOT/tools/WebDriverAgent/package.json")"
+WDA_VERSION="$(/usr/bin/plutil -extract version raw "$WDA_SOURCE/package.json")"
 [ -n "$WDA_VERSION" ] || { echo "error: could not read WDA version from tools/WebDriverAgent/package.json" >&2; exit 1; }
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $WDA_VERSION" "$RUNNER/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $WDA_VERSION" "$RUNNER/Info.plist"
 /usr/libexec/PlistBuddy -c "Merge $ASSETS/partial.plist" "$RUNNER/Info.plist"
 
 # Re-sign with the same Apple Development identity + preserved entitlements.
-SIGNID="$(security find-identity -v -p codesigning | grep -m1 'Apple Development' | grep -oE '[0-9A-F]{40}')"
-[[ -n "$SIGNID" ]] || { echo "no 'Apple Development' signing identity found" >&2; exit 1; }
+codesign -d --extract-certificates="$ASSETS/signer-" "$RUNNER"
+SIGNID="$(shasum -a 1 "$ASSETS/signer-0" | awk '{print $1}')"
+[[ -n "$SIGNID" ]] || { echo "runner signing identity not found" >&2; exit 1; }
 codesign --force --sign "$SIGNID" --entitlements "$ASSETS/ent.plist" "$RUNNER"
 codesign --verify --deep --strict "$RUNNER"
 

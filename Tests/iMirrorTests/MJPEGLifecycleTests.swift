@@ -3,6 +3,37 @@ import Network
 @testable import iMirror
 
 final class MJPEGLifecycleTests: XCTestCase {
+    func testReconnectsWhenForwardingPortOpensAfterClientStarts() throws {
+        let queue = DispatchQueue(label: "test.mjpeg.late-port")
+        let reserved = try NWListener(using: .tcp, on: .any)
+        let ready = expectation(description: "port reserved")
+        let released = expectation(description: "port released")
+        reserved.stateUpdateHandler = { state in
+            if case .ready = state { ready.fulfill() }
+            if case .cancelled = state { released.fulfill() }
+        }
+        reserved.newConnectionHandler = { $0.cancel() }
+        reserved.start(queue: queue)
+        wait(for: [ready], timeout: 2)
+        let port = try XCTUnwrap(reserved.port)
+        reserved.cancel()
+        wait(for: [released], timeout: 2)
+
+        let connected = expectation(description: "client retries once forward opens")
+        let listener = try NWListener(using: .tcp, on: port)
+        listener.newConnectionHandler = { socket in
+            socket.start(queue: queue)
+            connected.fulfill()
+            socket.cancel()
+        }
+        let client = MJPEGClient(port: port.rawValue)
+        defer { client.stop(); listener.cancel() }
+        client.start()
+        // Reproduce app startup: the video client precedes go-ios forwarding.
+        queue.asyncAfter(deadline: .now() + 0.2) { listener.start(queue: queue) }
+        wait(for: [connected], timeout: 2)
+    }
+
     func testRepeatedStartClosesPreviousSocket() throws {
         let listener = try NWListener(using: .tcp, on: .any)
         let queue = DispatchQueue(label: "test.mjpeg.server")
