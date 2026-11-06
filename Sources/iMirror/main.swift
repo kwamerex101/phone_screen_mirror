@@ -2,8 +2,7 @@
 // and control it from the Mac via WebDriverAgent — while the phone stays
 // physically usable (unlike Apple's "iPhone Mirroring").
 //
-// Dependency-free: AppKit + Foundation. The mirror itself is decoded WDA-MJPEG
-// frames (plain CGImages), not a local capture session.
+// USB capture supplies the fast preview; WDA-MJPEG is the video fallback.
 //
 // UI: a native unified NSToolbar (Liquid Glass on macOS 26) with SF Symbol
 // controls and an NSSwitch for control; status shown in the window subtitle.
@@ -12,6 +11,7 @@
 // is OFF by default — you must explicitly connect and flip the Control switch.
 
 import AppKit
+import AVFoundation
 import iMirrorCore
 import os
 
@@ -31,6 +31,7 @@ var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMoti
 final class PreviewView: NSView {
     /// Displays decoded WDA-MJPEG frames (plain CGImages).
     private let imageLayer = CALayer()
+    private let captureLayer = AVCaptureVideoPreviewLayer()
 
     /// Accent ring shown while Control is armed. Non-interactive, sits above
     /// the image and below tap ripples (added later as sublayers).
@@ -61,6 +62,10 @@ final class PreviewView: NSView {
         imageLayer.backgroundColor = NSColor.black.cgColor
         imageLayer.frame = bounds
         layer?.addSublayer(imageLayer)
+        captureLayer.videoGravity = .resizeAspect
+        captureLayer.frame = bounds
+        captureLayer.isHidden = true
+        layer?.addSublayer(captureLayer)
 
         controlRing.fillColor = nil
         controlRing.strokeColor = NSColor.controlAccentColor.withAlphaComponent(0.85).cgColor
@@ -72,20 +77,46 @@ final class PreviewView: NSView {
 
     override func layout() {
         super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         imageLayer.frame = bounds
+        captureLayer.frame = bounds
         controlRing.frame = bounds
         controlRing.path = CGPath(rect: bounds.insetBy(dx: 1, dy: 1), transform: nil)
+        CATransaction.commit()
     }
 
     /// Displays a freshly decoded MJPEG frame. Main-thread only: the MJPEG
     /// client delivers frames on its own queue, so callers must hop to main
     /// before calling this.
     func setFrame(_ image: CGImage) {
+        captureLayer.isHidden = true
+        imageLayer.isHidden = false
         imageLayer.contents = image
         lastFrameSize = CGSize(width: image.width, height: image.height)
     }
 
+    func setCaptureSession(_ session: AVCaptureSession?) { captureLayer.session = session }
+
+    var captureVideoRect: CGRect? {
+        guard !captureLayer.isHidden else { return nil }
+        return captureLayer.layerRectConverted(fromMetadataOutputRect: CGRect(x: 0, y: 0, width: 1, height: 1))
+    }
+
+    func showCaptureFrame(size: CGSize) {
+        captureLayer.isHidden = false
+        imageLayer.isHidden = true
+        imageLayer.contents = nil
+        if lastFrameSize != size {
+            downPoint = nil
+            dragSamples = []
+            resetScroll()
+        }
+        lastFrameSize = size
+    }
+
     func clearFrame() {
+        captureLayer.isHidden = true
         imageLayer.contents = nil
         lastFrameSize = nil
     }
@@ -315,6 +346,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     private var homeItem: NSToolbarItem!
 
     private var mjpeg: MJPEGClient?
+    private var usbCapture: USBVideoCapture?
+    private var hasVideoFrame: Bool { lastFrame != nil || usbCapture?.hasFrame == true }
     /// True once WDA-MJPEG frames are actually flowing. Distinct from `health`,
     /// which only reflects the WDA HTTP session — the MJPEG socket can connect,
     /// drop, and reconnect independently of that session.
@@ -369,7 +402,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     // iMirrorCore): WDA's /status can stay healthy while the MJPEG stream has
     // silently died, so `health == .connected` alone isn't proof frames are
     // still arriving.
-    private var mjpegLastFrameAt: TimeInterval?
+    private var videoClock = VideoRecoveryClock()
     private var mjpegBounced = false
     private let mjpegNoFrameThresholdSec: TimeInterval = 20
     /// Counts `.escalate` outcomes for the current connected session, reset
@@ -397,7 +430,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         // fine, and load-bearing: it must NOT reset the recovery stage, or
         // the ladder would never advance past stage 0 and would never give up.
         transport.onRunwdaStarted = { [weak self] in
-            self?.chainRecovery.runwdaStarted(at: ProcessInfo.processInfo.systemUptime)
+            guard let self else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            self.chainRecovery.runwdaStarted(at: now)
+            self.videoClock.beginStartup(at: now)
         }
         // Reflect the runner check/install (progress + outcome) in the UI. Invoked
         // on the main thread by Transport.
@@ -420,6 +456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
                 case .alreadyPresent, .noBundle:
                     break                       // normal boot; health monitor takes over
                 case .failed(let err):
+                    self.wdaHardStopped = true // make the WDA button retry installation
                     self.setHealth(.down)
                     // Cancel the generic 6s "Starting WebDriverAgent…" text so our
                     // specific, actionable failure message isn't overwritten.
@@ -439,9 +476,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
+        automationEnabled = false
+        automationCallbacks.invalidate()
+        videoCallbacks.invalidate()
+        devicePresence.reset()
+        downStatusWorkItem?.cancel()
+        downStatusWorkItem = nil
         healthTimer?.invalidate()
         transport.stop()
         mjpeg?.stop()
+        usbCapture?.stop()
         simController.shutdown()
     }
 
@@ -495,17 +539,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     }
 
     private func buildWindow() {
-        window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 430, height: 880),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered, defer: false)
+        window = makeMainWindow()
         window.title = "iMirror"
         window.titleVisibility = .hidden   // free the unified toolbar for the controls
         window.center()
         window.setFrameAutosaveName("iMirrorMain")
         // Stop the window shrinking into a degenerate size that clips the toolbar;
         // the content aspect ratio is locked to the phone once its size is known.
-        window.contentMinSize = NSSize(width: 260, height: 480)
+        window.contentMinSize = NSSize(width: 260, height: 200)
 
         // Container: preview fills it; a click-through glass HUD shows status at
         // the bottom so the toolbar stays clean.
@@ -739,7 +780,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     // MARK: Screenshot
 
     @objc private func takeScreenshot() {
-        guard let cgImage = lastFrame else {
+        guard hasVideoFrame else {
             setStatus("No frame yet — wait for the mirror to start.")
             return
         }
@@ -747,11 +788,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         let url = FileManager.default
             .urls(for: .picturesDirectory, in: .userDomainMask).first!
             .appendingPathComponent(name)
+        let capture = usbCapture
+        let fallback = lastFrame
         // PNG-encode + write off the main thread: a blocking file write (to a possibly
         // iCloud-synced ~/Pictures) would otherwise hitch the UI on a click that should
         // feel instant. Only the status update hops back to main.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
+            guard let cgImage = capture?.screenshot() ?? fallback else { return }
             let rep = NSBitmapImageRep(cgImage: cgImage)
             guard let png = rep.representation(using: .png, properties: [:]) else {
                 DispatchQueue.main.async { self.setStatus("Screenshot failed (could not encode PNG).") }
@@ -789,7 +833,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
                   let size = self.wda?.deviceSize,
                   let start = self.devicePoint(fromViewPoint: viewPoint) else { return }
             guard let frameSize = self.previewView.lastFrameSize else { return }
-            let videoRect = self.displayedImageRect(in: self.previewView.bounds, imageSize: frameSize)
+            let videoRect = self.previewView.captureVideoRect
+                ?? self.displayedImageRect(in: self.previewView.bounds, imageSize: frameSize)
             guard videoRect.width > 1, videoRect.height > 1 else { return }
             // Scale view-space scroll distance into device points and send one fast
             // swipe. Since the phone can't add inertia, `gain` amplifies the swipe
@@ -832,7 +877,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     /// mapToDevice (in iMirrorCore) does the normalize + y-flip and is unit-tested.
     private func devicePoint(fromViewPoint p: CGPoint) -> CGPoint? {
         guard let size = wda?.deviceSize, let frameSize = previewView.lastFrameSize else { return nil }
-        let videoRect = displayedImageRect(in: previewView.bounds, imageSize: frameSize)
+        let videoRect: CGRect
+        if let captureRect = previewView.captureVideoRect {
+            // USB video can contain padding and non-square pixel metadata. Let
+            // AVFoundation account for that instead of comparing encoded pixels
+            // to WDA points. Still reject an out-of-date rotation.
+            guard (frameSize.width > frameSize.height) == (size.width > size.height) else { return nil }
+            videoRect = captureRect
+        } else {
+            guard displayShapesMatch(frame: frameSize, logical: size) else { return nil }
+            videoRect = displayedImageRect(in: previewView.bounds, imageSize: frameSize)
+        }
         return mapToDevice(viewPoint: p, videoRect: videoRect, deviceSize: size)
     }
 
@@ -857,14 +912,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             devicePresence.sampleIfDue(force: true)
             return
         }
-        guard wdaHardStopped else { probeNow(); return }
+        guard wdaHardStopped || (usbCapture?.hasFrame == true && health == .down) else { probeNow(); return }
         wdaHardStopped = false
         chainRecovery.reset()
         chainRecovery.connectionLost(at: ProcessInfo.processInfo.systemUptime)
         mjpegEscalationCount = 0     // give the user's retry its own two-strike allowance
         mjpegBounced = false
         setStatus("Retrying WebDriverAgent…")
-        transport.restartChain()
+        restartWDAChain()
     }
 
     private func probeNow() {
@@ -920,6 +975,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         case .present:
             guard reattached else { return }
             waitingForDevice = false
+            videoClock.beginStartup(at: ProcessInfo.processInfo.systemUptime)
             automationCallbacks.invalidate()
             probing = false
             creatingSession = false
@@ -934,7 +990,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             emptyStateHint.stringValue = "Unlock your iPhone and tap Trust if prompted."
             setStatus("iPhone connected. Starting WebDriverAgent…")
             // The launch callback starts the boot clock once preparation ends.
-            transport.restartChain()
+            restartWDAChain()
             probeNow()
         case .unavailable:
             if waitingForDevice {
@@ -954,7 +1010,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     private func runWatchdog() {
         guard automationEnabled, transport.canSelfManage else { return }
         guard health == .down, !wdaHardStopped else { return }
+        // Restarting a healthy video service because XCTest is busy interrupts
+        // the mirror and the foreground app's debugging session.
         let now = ProcessInfo.processInfo.systemUptime
+        if usbCapture?.hasFrame != true, mirroring,
+           videoClock.hasFreshFrame(at: now, threshold: mjpegNoFrameThresholdSec) { return }
         switch chainRecovery.action(at: now, postConnectionOutage: hadSuccessfulConnection) {
         case .wait:
             break
@@ -963,7 +1023,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             // reseed its boot budget without resetting the ladder's stage.
             chainRecovery.beginRestart(at: now)
             setStatus("WebDriverAgent is taking longer than usual, resetting the connection…")
-            transport.restartChain()
+            restartWDAChain()
         case .giveUp:
             wdaHardStopped = true
             // F1: stop the chain outright — otherwise runwda keeps
@@ -982,13 +1042,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     /// (bounce just the `forward` child carrying the MJPEG port); only
     /// escalate to a full chain restart if that didn't bring frames back.
     private func checkMjpegWatchdog() {
-        guard health == .connected, mjpeg != nil, let lastFrame = mjpegLastFrameAt else { return }
+        guard automationEnabled, !waitingForDevice, mjpeg != nil,
+              let noFrameFor = videoClock.noFrameDuration(at: ProcessInfo.processInfo.systemUptime,
+                                                         controlConnected: health == .connected) else { return }
         // With an external WDA (canSelfManage == false) there's no chain to
         // bounce or restart — bouncing/escalating would be a no-op at best
         // and a misleading status flash at worst. Once hard-stopped, this
         // watchdog goes quiet too until the user retries via forceProbe().
         guard transport.canSelfManage, !wdaHardStopped else { return }
-        let noFrameFor = ProcessInfo.processInfo.systemUptime - lastFrame
         switch nextMjpegRecoveryAction(noFrameForSec: noFrameFor, alreadyBounced: mjpegBounced, thresholdSec: mjpegNoFrameThresholdSec) {
         case .wait:
             break
@@ -1013,12 +1074,123 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             // Restart the no-frame clock so this doesn't fire again on the next
             // tick before health actually flips to .down (which is what really
             // resets this state, below).
-            mjpegLastFrameAt = ProcessInfo.processInfo.systemUptime
             mjpegBounced = false
             setStatus("Video stalled — resetting the connection…")
             chainRecovery.beginRestart(at: ProcessInfo.processInfo.systemUptime)
-            transport.restartChain()
+            restartWDAChain()
         }
+    }
+
+    private func restartWDAChain() {
+        videoClock.beginStartup(at: ProcessInfo.processInfo.systemUptime)
+        mjpegBounced = false
+        transport.restartChain()
+    }
+
+    /// Video uses WDA's independent MJPEG service, not its XCTest session.
+    /// A foreground app can block window-size and input requests while video
+    /// keeps flowing, so control health must never tear down this stream.
+    private func startVideo() {
+        guard automationEnabled, usbCapture == nil else { return }
+        if ProcessInfo.processInfo.environment["IMIRROR_VIDEO_MODE"] == "mjpeg" {
+            startMJPEGVideo()
+            return
+        }
+        let capture = USBVideoCapture()
+        usbCapture = capture
+        previewView.setCaptureSession(capture.session)
+        let deliverUSB = videoCallbacks.deliveringLatest { [weak self] (update: USBVideoUpdate) in
+            guard let self else { return }
+            guard case .frame(let size) = update else {
+                guard case .unavailable(let reason) = update else { return }
+                self.previewView.clearFrame()
+                self.mirroring = false
+                self.screenshotItem?.isEnabled = false
+                self.setStatus(reason)
+                self.startMJPEGVideo()
+                return
+            }
+            self.videoClock.receivedFrame(at: ProcessInfo.processInfo.systemUptime)
+            self.mjpeg?.stop()
+            self.mjpeg = nil
+            self.lastFrame = nil
+            let previous = self.previewView.lastFrameSize
+            self.previewView.showCaptureFrame(size: size)
+            self.screenshotItem?.isEnabled = true
+            self.mjpegEscalationCount = 0
+            if previous != size {
+                self.wda?.refreshDisplayGeometry()
+                adaptPreviewWindow(self.window, to: size)
+            }
+            if !self.mirroring {
+                self.mirroring = true
+                self.setEmptyState(hidden: true)
+                self.updateHealthDot()
+                self.setStatus("Mirroring via USB video — phone stays usable.")
+            }
+        }
+        capture.onFrame = { deliverUSB(.frame($0)) }
+        capture.onUnavailable = { deliverUSB(.unavailable($0)) }
+        capture.start()
+        startMJPEGVideo() // keeps a preview available during USB discovery
+    }
+
+    private func startMJPEGVideo() {
+        guard automationEnabled, mjpeg == nil else { return }
+        // Host port 9110 forwards to the device's fixed WDA mjpegServerPort 9100, chosen to avoid colliding with other local services that commonly use 9100.
+        let client = MJPEGClient(port: 9110)
+        let deliverVideo = videoCallbacks.deliveringLatest { [weak self] (cg: CGImage?) in
+            guard let self else { return }
+            guard self.usbCapture?.hasFrame != true else { return }
+            guard let cg else {
+                self.mirroring = false
+                self.updateHealthDot()
+                self.lastFrame = nil
+                self.previewView.clearFrame()
+                self.screenshotItem?.isEnabled = false
+                self.setEmptyState(hidden: false)
+                // Keep installation progress and errors visible during retries.
+                if self.installingRunner { return }
+                if case .failed = self.lastRunnerInstall { return }
+                self.setStatus("Waiting for video from iPhone…")
+                return
+            }
+            self.videoClock.receivedFrame(at: ProcessInfo.processInfo.systemUptime)
+            // A real frame arrived — the stream is actually
+            // delivering, so any earlier escalations no longer
+            // count toward the two-strike give-up.
+            self.mjpegEscalationCount = 0
+            self.chainRecovery.reset()
+            self.lastFrame = cg
+            self.screenshotItem?.isEnabled = true
+            let previousSize = self.previewView.lastFrameSize
+            self.previewView.setFrame(cg)
+            // Frame dimensions establish the preview's aspect ratio even when
+            // XCTest cannot obtain a logical window size. Never use pixels as
+            // touch coordinates; control still requires WDA's point dimensions.
+            let aspect = NSSize(width: cg.width, height: cg.height)
+            if previousSize != aspect {
+                self.wda?.refreshDisplayGeometry()
+                adaptPreviewWindow(self.window, to: aspect)
+            }
+            if !self.mirroring {
+                self.mirroring = true
+                self.setEmptyState(hidden: true)
+                self.updateHealthDot()
+                self.setStatus("Mirroring — phone stays usable.")
+            }
+        }
+        // Frames and disconnects share one slot so a queued old disconnect can
+        // never clear a newer frame after the UI thread catches up.
+        client.onFrame = { deliverVideo($0) }
+        client.onStateChange = { connected in if !connected { deliverVideo(nil) } }
+        mjpeg = client
+        // Seed the no-frame clock at start so the watchdog measures
+        // from "stream just opened," not from a nil baseline that
+        // would otherwise read as an already-ancient last frame.
+        videoClock.beginStartup(at: ProcessInfo.processInfo.systemUptime)
+        mjpegBounced = false
+        client.start()
     }
 
     private func createSession() {
@@ -1029,7 +1201,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             guard let self else { return }
             self.creatingSession = false
             if case .success = result { self.setHealth(.connected) }
-            else { self.setHealth(.down) }
+            else {
+                self.setHealth(.down)
+                // /status can answer while XCTest session commands are stuck.
+                // Run recovery here: the next probe can start another session
+                // and change health to .connecting before its watchdog runs.
+                self.runWatchdog()
+            }
         })
     }
 
@@ -1043,6 +1221,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
 
         switch new {
         case .connected:
+            if changed, !videoClock.hasReceivedFrame {
+                videoClock.beginStartup(at: ProcessInfo.processInfo.systemUptime)
+            }
             devicePresence.markConnected()
             waitingForDevice = false
             downSince = nil
@@ -1055,62 +1236,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             downStatusWorkItem?.cancel(); downStatusWorkItem = nil
             controlSwitch.isEnabled = true
             homeItem?.isEnabled = true
-            screenshotItem?.isEnabled = lastFrame != nil
+            screenshotItem?.isEnabled = hasVideoFrame
             if changed {
                 let s = wda?.deviceSize ?? .zero
-                // Lock resizing to the phone's proportions so the mirror fills the
-                // window without letterboxing (portrait points; landscape just
-                // shows bars until the next connect).
-                if s.width > 0, s.height > 0 {
-                    window.contentAspectRatio = NSSize(width: s.width, height: s.height)
+                // Video is authoritative for preview shape. WDA supplies points
+                // for input and can lag behind a rotation or display change.
+                if !mirroring {
+                    setStatus("WDA connected — \(Int(s.width))×\(Int(s.height)) pts. Flip Control to drive.")
                 }
-                setStatus("WDA connected — \(Int(s.width))×\(Int(s.height)) pts. Flip Control to drive.")
             }
-            // Start the MJPEG mirror the moment WDA is healthy. Guarded against
-            // double-start: setHealth(.connected) can fire on every probe tick
-            // once connected, and MJPEGClient.start() would otherwise tear down
-            // and reopen a perfectly good stream each time.
-            if mjpeg == nil {
-                // Host port 9110 forwards to the device's fixed WDA mjpegServerPort 9100, chosen to avoid colliding with other local services that commonly use 9100.
-                let client = MJPEGClient(port: 9110)
-                client.onFrame = videoCallbacks.delivering { [weak self] cg in
-                    guard let self else { return }
-                    self.mjpegLastFrameAt = ProcessInfo.processInfo.systemUptime
-                    // A real frame arrived — the stream is actually
-                    // delivering, so any earlier escalations no longer
-                    // count toward the two-strike give-up.
-                    self.mjpegEscalationCount = 0
-                    self.lastFrame = cg
-                    self.screenshotItem?.isEnabled = true
-                    self.previewView.setFrame(cg)
-                    if !self.mirroring {
-                        self.mirroring = true
-                        self.setEmptyState(hidden: true)
-                        self.setStatus("Mirroring — phone stays usable.")
-                    }
-                }
-                client.onStateChange = videoCallbacks.delivering { [weak self] connected in
-                    guard let self, !connected else { return }
-                    // MJPEG socket dropped independently of the WDA HTTP session — show
-                    // the waiting state until frames resume.
-                    self.mirroring = false
-                    self.lastFrame = nil
-                    self.previewView.clearFrame()
-                    self.screenshotItem?.isEnabled = false
-                    self.setEmptyState(hidden: false)
-                    self.setStatus("Waiting for video from iPhone…")
-                }
-                mjpeg = client
-                // Seed the no-frame clock at start so the watchdog measures
-                // from "stream just opened," not from a nil baseline that
-                // would otherwise read as an already-ancient last frame.
-                mjpegLastFrameAt = ProcessInfo.processInfo.systemUptime
-                mjpegBounced = false
-                client.start()
-            }
+            startVideo()
         case .connecting:
             downStatusWorkItem?.cancel(); downStatusWorkItem = nil
-            if changed { setStatus("Connecting to WDA…") }
+            if changed, !mirroring { setStatus("Connecting to WDA…") }
         case .down:
             if downSince == nil { downSince = Date() }
             // Seed the ladder's monotonic clock right here ONLY for a
@@ -1135,14 +1273,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             }
             controlSwitch.isEnabled = false
             homeItem?.isEnabled = false
-            screenshotItem?.isEnabled = false
-            videoCallbacks.invalidate()
-            mjpeg?.stop()
-            mjpeg = nil
-            lastFrame = nil
-            previewView.clearFrame()
-            mirroring = false
-            setEmptyState(hidden: false)
+            // Control failure does not imply video failure. The stream's own
+            // disconnect callback clears the preview when video actually drops.
+            screenshotItem?.isEnabled = hasVideoFrame
+            if !mirroring { setEmptyState(hidden: false) }
             if !waitingForDevice {
                 emptyStateTitle.stringValue = "Connecting to iPhone"
                 emptyStateHint.stringValue = "Unlock your iPhone and tap Trust if prompted."
@@ -1156,7 +1290,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
                 let canManage = transport.canSelfManage
                 let reconnecting = hadSuccessfulConnection
                 let item = DispatchWorkItem { [weak self] in
-                    guard let self, self.health == .down else { return }
+                    guard let self, self.health == .down, !self.mirroring else { return }
                     self.setStatus(reconnecting ? "WDA reconnecting…"
                         : (canManage ? "Starting WebDriverAgent… (first launch can take ~20s)"
                                      : "WDA unreachable — run ./scripts/wda-up.sh"))
@@ -1188,8 +1322,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             setHealthDot(.systemYellow, tip: "Connecting to WDA…",
                          a11y: "connecting", pulsing: true)
         case .down:
-            setHealthDot(.systemRed, tip: "WDA unreachable — click to re-check",
-                         a11y: "unreachable", pulsing: false)
+            if mirroring {
+                setHealthDot(.systemYellow, tip: "Video connected. Controls unavailable. Click to re-check.",
+                             a11y: "mirroring, controls unavailable", pulsing: false)
+            } else {
+                setHealthDot(.systemRed, tip: "WDA unreachable — click to re-check",
+                             a11y: "unreachable", pulsing: false)
+            }
         }
     }
 
@@ -1269,7 +1408,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         // whether we're arming automation or tearing it down.
         chainRecovery.reset()
         wdaHardStopped = false
-        mjpegLastFrameAt = nil
+        videoClock.clear()
         mjpegBounced = false
         mjpegEscalationCount = 0
         if on {
@@ -1280,6 +1419,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             // tunnel bring-up and the runner install — seeding it now would
             // count that time against WDA's own boot grace.
             transport.start()        // spawn tunnel + runwda + forward + relay
+            startVideo()             // video can work before XCTest is ready
             startHealthMonitor()     // begin probing; dot goes yellow → green
         } else {
             // Tear everything down so nothing runs on the phone (the overlay clears).
@@ -1295,6 +1435,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             transport.stop()
             mjpeg?.stop()
             mjpeg = nil
+            usbCapture?.stop()
+            usbCapture = nil
+            previewView.setCaptureSession(nil)
             lastFrame = nil
             previewView.clearFrame()
             mirroring = false
@@ -1316,13 +1459,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     }
 
     func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
-        if item.action == #selector(takeScreenshot) { return lastFrame != nil }
+        if item.action == #selector(takeScreenshot) { return hasVideoFrame }
         if item.action == #selector(pressHome) { return health == .connected }
         return true
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        if menuItem.action == #selector(takeScreenshot) { return lastFrame != nil }
+        if menuItem.action == #selector(takeScreenshot) { return hasVideoFrame }
         if menuItem.action == #selector(pressHome) { return health == .connected }
         if menuItem.action == #selector(toggleControlFromMenu) {
             menuItem.state = controlEnabled ? .on : .off

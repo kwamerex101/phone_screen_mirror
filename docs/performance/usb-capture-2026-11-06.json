@@ -1,0 +1,20 @@
+{
+  "date_utc": "2026-11-06",
+  "scope": "One connected physical phone; observational samples, not a controlled benchmark",
+  "platform": {"macos": "27.2", "ios": "27.2"},
+  "mjpeg_baseline": {"frames": 116, "seconds": 22.08, "received_fps": 5.25},
+  "isolated_usb_probe": {
+    "frames": 773,
+    "seconds": 12.996512833313318,
+    "received_fps": 59.40054920125733,
+    "p95_frame_interval_ms": 18.435666686855257,
+    "delegate_reported_drops": 0
+  },
+  "integrated_app": {"frames": 8887, "approximate_seconds": 160, "cumulative_received_fps": 55.5},
+  "limits": [
+    "Measures received capture buffers, not end-to-end latency or display refresh",
+    "Not a guarantee of unique content changes in every frame",
+    "Rates vary during display transitions and phone activity",
+    "No sustained thermal or battery benchmark was performed"
+  ]
+}

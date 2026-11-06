@@ -18,7 +18,7 @@ Override target:  IMIRROR_WDA=http://127.0.0.1:8100
 """
 from __future__ import annotations
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 import atexit
 import base64
@@ -772,9 +772,15 @@ def _norm_source_json(d: dict) -> dict[str, Any] | None:
 def _fetch_source_json_tree() -> dict[str, Any] | None:
     """Probe WDA's JSON source once. Returns a normalized root node, or None if
     this WDA build doesn't support it (non-2xx, missing/non-dict `value`, or the
-    request itself blows up) so the caller falls back to XML. Never raises."""
+    request has a compatibility failure) so the caller falls back to XML.
+    Transport failures propagate: XML would queue another snapshot on the same
+    stalled or unreachable WDA service."""
     try:
         code, j = _req_tree("/source?format=json")
+    except MCPToolError as exc:
+        if exc.error_kind in (ErrorKind.WEDGED, ErrorKind.UNREACHABLE):
+            raise
+        return None
     except Exception:
         return None
     if code >= 400:

@@ -30,7 +30,8 @@ public enum RunnerInstallEvent: Equatable {
 /// iOS version; unknown text falls back to `.other` with the raw message.
 public func classifyInstallError(_ stderr: String) -> RunnerInstallError {
     let raw = trimmedRaw(stderr)
-    let s = raw.lowercased()
+    // Progress logs can exceed the display cap before the failure is printed.
+    let s = stderr.lowercased()
 
     // Locked first: a locked device is the most actionable and its wording is
     // distinct ("device locked", "please unlock", "passcode").

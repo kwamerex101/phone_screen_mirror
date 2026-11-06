@@ -28,7 +28,8 @@ final class WDAClient {
 
     let base: URL
     private(set) var sessionId: String?
-    private(set) var deviceSize: CGSize?   // logical points (portrait)
+    private(set) var deviceSize: CGSize?   // current display's logical points
+    private var geometryRevision = 0
 
     init(base: URL = URL(string: "http://127.0.0.1:8100")!) {
         precondition(base.host == "127.0.0.1" || base.host == "localhost",
@@ -81,21 +82,35 @@ final class WDAClient {
     private func applyMJPEGSettings(sid: String) {
         send("POST", "/session/\(sid)/appium/settings",
              ["settings": ["mjpegServerFramerate": 30,
+                           "mjpegFixOrientation": true,
                            "mjpegServerScreenshotQuality": 60,
                            "mjpegScalingFactor": 100]]) { _, _, _ in }
     }
 
     private func fetchWindowSize(completion: @escaping (Result<CGSize, Error>) -> Void) {
         guard let sid = sessionId else { completion(.failure(WDAError.notConnected)); return }
+        let revision = geometryRevision
         send("GET", "/session/\(sid)/window/size", nil) { [weak self] _, json, error in
+            guard let self, self.geometryRevision == revision, self.sessionId == sid else {
+                completion(.failure(WDAError.badResponse("display or session changed")))
+                return
+            }
             if let error { completion(.failure(error)); return }
             guard let size = WDAParse.windowSize(json) else {
                 completion(.failure(WDAError.badResponse("no window size")))
                 return
             }
-            self?.deviceSize = size
+            self.deviceSize = size
             completion(.success(size))
         }
+    }
+
+    /// A changed video surface invalidates cached touch coordinates, including
+    /// same-aspect changes where swapping width/height would be insufficient.
+    func refreshDisplayGeometry(completion: @escaping (Result<CGSize, Error>) -> Void = { _ in }) {
+        geometryRevision += 1
+        deviceSize = nil
+        fetchWindowSize(completion: completion)
     }
 
     // MARK: Health
@@ -105,11 +120,14 @@ final class WDAClient {
     /// from WDA being unreachable.
     func probe(completion: @escaping (Health) -> Void) {
         if let sid = sessionId {
+            let revision = geometryRevision
             send("GET", "/session/\(sid)/window/size", nil) { [weak self] code, json, error in
                 guard let self else { return }
                 if error == nil, let code, (200..<300).contains(code),
                    let size = WDAParse.windowSize(json) {
-                    self.deviceSize = size
+                    if self.geometryRevision == revision, self.sessionId == sid {
+                        self.deviceSize = size
+                    }
                     completion(.alive)
                 } else {
                     self.sessionId = nil                       // session gone

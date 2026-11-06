@@ -263,6 +263,22 @@ def test_req_tree_does_not_retry_on_connection_drop_error(mod, monkeypatch):
     assert calls == [("GET", "/source")]  # no probe attempted
 
 
+@pytest.mark.parametrize("kind", ["WEDGED", "UNREACHABLE"])
+def test_source_transport_failure_does_not_queue_xml_fallback(mod, monkeypatch, kind):
+    calls = []
+    failure = mod.MCPToolError("snapshot transport failed", kind=getattr(mod.ErrorKind, kind))
+
+    def failed_tree(path):
+        calls.append(path)
+        raise failure
+
+    monkeypatch.setattr(mod, "_req_tree", failed_tree)
+    with pytest.raises(mod.MCPToolError) as exc:
+        mod._fetch_source_json_tree()
+    assert exc.value is failure
+    assert calls == ["/source?format=json"]
+
+
 def test_http_reconnects_after_failure(mod, monkeypatch):
     """A connection-level error must poison the cached connection so the next
     call builds a fresh one rather than reusing a half-closed socket."""
