@@ -325,7 +325,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
 
     // Toolbar controls
     private let controlSwitch = NSSwitch()
-    private let automationSwitch = NSSwitch()
+    private enum ControlMode: String { case wired, wda }
+    private var controlMode = ControlMode(rawValue: UserDefaults.standard.string(forKey: "imirror.controlMode") ?? "") ?? .wired
+    private let modeCards = ControlModeCards(width: 382)
+    private let previewStatusLabel = NSTextField(labelWithString: "")
+    private let modeRequirementsLabel = NSTextField(wrappingLabelWithString: "")
+    private let wiredSetupButton = NSButton()
+    private var settingUpWired = false
+    private var wiredSetupError: String?
+    private let wiredControl = CoreDeviceControl()
+    private var wiredState = CoreDeviceControl.State.unavailable("Checking the USB connection…")
     private let settingsButton = NSButton()
     private let settingsPopover = NSPopover()
     private var settingsBuilt = false
@@ -466,17 +475,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
                 self.updateHealthDot()
             }
         }
-        updateHealthDot()        // grey — automation off
-        // Automation now drives the entire mirror (WDA-MJPEG frames replace camera
-        // capture), so it always starts on launch instead of waiting for an opt-in.
-        automationSwitch.state = .on
-        setAutomation(true)
+        applyControlMode()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
         automationEnabled = false
+        wiredControl.reset()
         automationCallbacks.invalidate()
         videoCallbacks.invalidate()
         devicePresence.reset()
@@ -604,19 +610,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         controlSwitch.isEnabled = false
         controlSwitch.setAccessibilityLabel("Control — drive the phone from the preview")
 
-        // Automation switch — starts/stops WebDriverAgent (and iOS's on-phone
-        // "Automation Running" overlay). Off by default: view-only until you opt in.
-        automationSwitch.target = self
-        automationSwitch.action = #selector(toggleAutomation)
-        automationSwitch.state = .off
-        automationSwitch.setAccessibilityLabel("Automation — start or stop WebDriverAgent")
+        modeCards.onSelection = { [weak self] mode in self?.controlModeChanged(mode) }
 
         // Health dot — colored status, click to force a re-check
         healthButton.isBordered = false
         healthButton.bezelStyle = .toolbar
         healthButton.imagePosition = .imageOnly
         healthButton.wantsLayer = true   // for the tint cross-fade + connecting pulse
-        healthButton.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "WDA status")
+        healthButton.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "iPhone control status")
         healthButton.contentTintColor = .systemGray
         healthButton.target = self
         healthButton.action = #selector(forceProbe)
@@ -740,8 +741,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
 
         case .health:
             let item = NSToolbarItem(itemIdentifier: .health)
-            item.label = "WDA"
-            item.toolTip = "WDA connection status"
+            item.label = "Connection"
+            item.toolTip = "iPhone connection status"
             item.view = healthButton
             return item
 
@@ -760,7 +761,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         case .settings:
             let item = NSToolbarItem(itemIdentifier: .settings)
             item.label = "Settings"
-            item.toolTip = "iMirror settings — automation (WDA), scroll speed, …"
+            item.toolTip = "iPhone mode, scroll speed, and agent settings"
             item.view = settingsButton
             let smenu = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: "")
             smenu.target = self
@@ -813,12 +814,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         }
     }
 
-    // MARK: Control (WDA)
+    // MARK: Preview input
 
     private func wireInput() {
         previewView.onTap = { [weak self] viewPoint in
             guard let self, self.controlEnabled, let p = self.devicePoint(fromViewPoint: viewPoint) else { return }
-            self.wda?.tap(at: p)
+            if let size = self.wiredInputSize {
+                self.sendWired([["tap"] + CoreDeviceControl.pointArguments(p, size: size)])
+            } else if self.automationEnabled {
+                self.wda?.tap(at: p)
+            }
             self.previewView.flashTap(at: viewPoint)   // local acknowledgment
         }
         previewView.onDrag = { [weak self] viewPath, flick in
@@ -826,11 +831,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             let devicePath = downsample(viewPath, max: 24)
                 .compactMap { self.devicePoint(fromViewPoint: $0) }
             guard devicePath.count >= 2 else { return }
-            self.wda?.drag(path: devicePath, flick: flick)
+            self.sendDrag(devicePath, flick: flick)
         }
         previewView.onScroll = { [weak self] viewPoint, viewDelta in
             guard let self, self.controlEnabled,
-                  let size = self.wda?.deviceSize,
+                  let size = self.inputSize,
                   let start = self.devicePoint(fromViewPoint: viewPoint) else { return }
             guard let frameSize = self.previewView.lastFrameSize else { return }
             let videoRect = self.previewView.captureVideoRect
@@ -850,11 +855,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             let moved = ((end.x - start.x) * (end.x - start.x)
                        + (end.y - start.y) * (end.y - start.y)).squareRoot()
             guard moved >= 20 else { return }          // skip imperceptible swipes
-            self.wda?.drag(path: [start, end], flick: true)
+            self.sendDrag([start, end], flick: true)
         }
         previewView.onType = { [weak self] text in
             guard let self, self.controlEnabled else { return }
-            self.wda?.typeText(text)
+            if self.controlMode == .wired {
+                self.sendWired(CoreDeviceControl.typing(text))
+            } else {
+                self.wda?.typeText(text)
+            }
+        }
+    }
+
+    private var wiredInputSize: CGSize? {
+        guard controlMode == .wired, mirroring, usbCapture?.hasFrame == true else { return nil }
+        return previewView.lastFrameSize
+    }
+
+    private var inputSize: CGSize? { controlMode == .wired ? wiredInputSize : wda?.deviceSize }
+
+    private func sendDrag(_ path: [CGPoint], flick: Bool) {
+        if let size = wiredInputSize, let first = path.first, let last = path.last {
+            let start = CoreDeviceControl.pointArguments(first, size: size)
+            let end = CoreDeviceControl.pointArguments(last, size: size)
+            sendWired([["swipe"] + start + end + [flick ? "0.18" : "0.3"]])
+        } else if automationEnabled {
+            wda?.drag(path: path, flick: flick)
+        }
+    }
+
+    private func sendWired(_ commands: [[String]]) {
+        guard let frameSize = wiredInputSize, case .ready(let id) = wiredState else { return }
+        wiredControl.send(commands, to: id, frameSize: frameSize) { [weak self] reason in
+            guard let self, self.controlMode == .wired else { return }
+            self.setWiredState(.unavailable(reason))
+            self.probeWired()
         }
     }
 
@@ -876,7 +911,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     /// latest MJPEG frame within the view handles letterboxing + orientation;
     /// mapToDevice (in iMirrorCore) does the normalize + y-flip and is unit-tested.
     private func devicePoint(fromViewPoint p: CGPoint) -> CGPoint? {
-        guard let size = wda?.deviceSize, let frameSize = previewView.lastFrameSize else { return nil }
+        guard let size = inputSize, let frameSize = previewView.lastFrameSize else { return nil }
         let videoRect: CGRect
         if let captureRect = previewView.captureVideoRect {
             // USB video can contain padding and non-square pixel metadata. Let
@@ -908,6 +943,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     /// changes nothing. In that state, a tap is the user explicitly asking to
     /// retry, so re-arm the ladder and kick a chain restart directly.
     @objc private func forceProbe() {
+        if controlMode == .wired { probeWired(); return }
         if waitingForDevice {
             devicePresence.sampleIfDue(force: true)
             return
@@ -1091,12 +1127,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     /// A foreground app can block window-size and input requests while video
     /// keeps flowing, so control health must never tear down this stream.
     private func startVideo() {
-        guard automationEnabled, usbCapture == nil else { return }
-        if ProcessInfo.processInfo.environment["IMIRROR_VIDEO_MODE"] == "mjpeg" {
+        guard usbCapture == nil else { return }
+        if automationEnabled, ProcessInfo.processInfo.environment["IMIRROR_VIDEO_MODE"] == "mjpeg" {
             startMJPEGVideo()
             return
         }
-        let capture = USBVideoCapture()
+        let capture = USBVideoCapture(wdaFallback: automationEnabled)
         usbCapture = capture
         previewView.setCaptureSession(capture.session)
         let deliverUSB = videoCallbacks.deliveringLatest { [weak self] (update: USBVideoUpdate) in
@@ -1106,8 +1142,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
                 self.previewView.clearFrame()
                 self.mirroring = false
                 self.screenshotItem?.isEnabled = false
-                self.setStatus(reason)
-                self.startMJPEGVideo()
+                self.updateRunnerStatusLabel()
+                if self.controlMode == .wired {
+                    self.wiredControl.reset()
+                    self.setWiredState(.unavailable(reason))
+                    self.emptyStateTitle.stringValue = "Waiting for USB video"
+                    self.emptyStateHint.stringValue = reason
+                    self.setEmptyState(hidden: false)
+                } else {
+                    self.setStatus(reason)
+                    self.startMJPEGVideo()
+                }
                 return
             }
             self.videoClock.receivedFrame(at: ProcessInfo.processInfo.systemUptime)
@@ -1117,6 +1162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             let previous = self.previewView.lastFrameSize
             self.previewView.showCaptureFrame(size: size)
             self.screenshotItem?.isEnabled = true
+            if !self.mirroring { self.updateRunnerStatusLabel() }
             self.mjpegEscalationCount = 0
             if previous != size {
                 self.wda?.refreshDisplayGeometry()
@@ -1126,7 +1172,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
                 self.mirroring = true
                 self.setEmptyState(hidden: true)
                 self.updateHealthDot()
-                self.setStatus("Mirroring via USB video — phone stays usable.")
+                if self.controlMode == .wired {
+                    self.probeWired()
+                } else {
+                    self.setStatus("Mirroring via USB video — phone stays usable.")
+                }
             }
         }
         capture.onFrame = { deliverUSB(.frame($0)) }
@@ -1147,6 +1197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
                 self.updateHealthDot()
                 self.lastFrame = nil
                 self.previewView.clearFrame()
+                self.updateRunnerStatusLabel()
                 self.screenshotItem?.isEnabled = false
                 self.setEmptyState(hidden: false)
                 // Keep installation progress and errors visible during retries.
@@ -1161,7 +1212,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             // count toward the two-strike give-up.
             self.mjpegEscalationCount = 0
             self.chainRecovery.reset()
+            let wasMirroring = self.mirroring
             self.lastFrame = cg
+            if !wasMirroring { self.updateRunnerStatusLabel() }
             self.screenshotItem?.isEnabled = true
             let previousSize = self.previewView.lastFrameSize
             self.previewView.setFrame(cg)
@@ -1218,6 +1271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         let changed = (new != health)
         health = new
         updateHealthDot()                       // dot colour is always instant
+        updateRunnerStatusLabel()
 
         switch new {
         case .connected:
@@ -1304,9 +1358,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     private var healthDotColor: NSColor?
 
     private func updateHealthDot() {
-        guard automationEnabled else {
-            setHealthDot(.systemGray, tip: "Automation off — flip Automation on to control the phone",
-                         a11y: "automation off", pulsing: false)
+        if controlMode == .wired {
+            let detail: String
+            switch wiredState {
+            case .unavailable(let reason): detail = reason
+            case .ready: detail = wiredReady ? "Wired Control ready" : "Waiting for the USB screen"
+            }
+            setHealthDot(wiredReady ? .systemGreen : .systemGray, tip: detail, a11y: detail, pulsing: false)
             return
         }
         if installingRunner {
@@ -1372,11 +1430,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
 
     @objc private func toggleControl() {
         // Only allow arming control when actually connected.
-        guard health == .connected else {
+        guard controlMode == .wired ? wiredReady : health == .connected else {
             controlSwitch.state = .off
             controlEnabled = false
             previewView.controlActive = false
-            setStatus("Can't enable control — WDA not connected (dot is not green).")
+            setStatus("Control is unavailable. Check the iPhone connection status.")
             return
         }
         controlEnabled = (controlSwitch.state == .on)
@@ -1387,68 +1445,149 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             : "Control off — mirror only.")
     }
 
-    /// Start or stop WebDriverAgent on demand. Off (default) = pure view-only
-    /// mirroring: no go-ios children, no XCUITest session, and no iOS "Automation
-    /// Running" overlay on the phone. On = bring the control channel up.
-    @objc private func toggleAutomation() { setAutomation(automationSwitch.state == .on) }
+    private func controlModeChanged(_ mode: ControlModeCards.Mode) {
+        let selected: ControlMode = mode == .webDriverAgent ? .wda : .wired
+        guard selected != controlMode else { return }
+        controlMode = selected
+        UserDefaults.standard.set(selected.rawValue, forKey: "imirror.controlMode")
+        applyControlMode()
+    }
 
-    /// Enable/disable the WDA control channel and remember the choice across launches.
-    private func setAutomation(_ on: Bool) {
+    private func disarmControl() {
+        controlEnabled = false
+        controlSwitch.state = .off
+        controlSwitch.isEnabled = false
+        previewView.controlActive = false
+        previewView.resetScroll()
+        homeItem?.isEnabled = false
+    }
+
+    private func applyControlMode() {
+        modeCards.showSelection(controlMode == .wired ? .directUSB : .webDriverAgent)
+        modeRequirementsLabel.stringValue = controlMode == .wired
+            ? "For Mac control, use macOS 27, Xcode 27, and iOS 27 or later. Connect by USB, unlock and trust the Mac, then enable Developer Mode on the iPhone."
+            : "Use a runner signed for this iPhone. iMirror starts it automatically and can install a compatible bundled runner. iOS may show an Automation Running overlay."
         automationCallbacks.invalidate()
-        videoCallbacks.invalidate()
+        wiredControl.reset()
+        disarmControl()
+        healthTimer?.invalidate()
+        healthTimer = nil
         devicePresence.reset()
         waitingForDevice = false
         hadSuccessfulConnection = false
         probing = false
         creatingSession = false
-        downStatusWorkItem?.cancel(); downStatusWorkItem = nil
-        automationEnabled = on
-        UserDefaults.standard.set(on, forKey: "imirror.automationEnabled")
-        // Fresh run: the ladder and the MJPEG watchdog start clean either way,
-        // whether we're arming automation or tearing it down.
+        installingRunner = false
+        downStatusWorkItem?.cancel()
+        downStatusWorkItem = nil
+        health = .down
+        downSince = nil
+        wda = nil
+        automationEnabled = controlMode == .wda
+        usbCapture?.setWDAFallback(automationEnabled)
         chainRecovery.reset()
         wdaHardStopped = false
         videoClock.clear()
         mjpegBounced = false
         mjpegEscalationCount = 0
-        if on {
-            setStatus("Automation ON — starting WebDriverAgent… "
-                    + "(iOS shows an \"Automation Running\" overlay on the phone).")
-            // Don't seed the recovery clock here: Transport.onRunwdaStarted
-            // seeds it once runwda actually starts, which is well after
-            // tunnel bring-up and the runner install — seeding it now would
-            // count that time against WDA's own boot grace.
-            transport.start()        // spawn tunnel + runwda + forward + relay
-            startVideo()             // video can work before XCTest is ready
-            startHealthMonitor()     // begin probing; dot goes yellow → green
+
+        if automationEnabled {
+            if ProcessInfo.processInfo.environment["IMIRROR_VIDEO_MODE"] == "mjpeg", let capture = usbCapture {
+                videoCallbacks.invalidate()
+                capture.stop()
+                usbCapture = nil
+                previewView.setCaptureSession(nil)
+                previewView.clearFrame()
+                screenshotItem?.isEnabled = false
+                mirroring = false
+            }
+            setStatus("Starting WebDriverAgent… iOS may show an Automation Running overlay.")
+            transport.start()
+            startVideo()
+            if usbCapture?.hasFrame != true { startMJPEGVideo() }
+            startHealthMonitor()
         } else {
-            // Tear everything down so nothing runs on the phone (the overlay clears).
-            controlEnabled = false
-            controlSwitch.state = .off
-            controlSwitch.isEnabled = false
-            previewView.controlActive = false
-            previewView.resetScroll()
-            homeItem?.isEnabled = false
-            healthTimer?.invalidate(); healthTimer = nil
-            installingRunner = false
-            wda = nil
             transport.stop()
             mjpeg?.stop()
             mjpeg = nil
-            usbCapture?.stop()
-            usbCapture = nil
-            previewView.setCaptureSession(nil)
             lastFrame = nil
-            previewView.clearFrame()
-            mirroring = false
-            health = .down; downSince = nil
-            screenshotItem?.isEnabled = false
-            emptyStateTitle.stringValue = "Mirroring paused"
-            emptyStateHint.stringValue = "Enable Automation in settings to connect."
-            setEmptyState(hidden: false)
-            updateHealthDot()        // grey — automation off
-            setStatus("Automation off — mirror only (no control, no on-phone overlay).")
+            if usbCapture?.hasFrame != true {
+                previewView.clearFrame()
+                mirroring = false
+                screenshotItem?.isEnabled = false
+                emptyStateTitle.stringValue = "Waiting for USB video"
+                emptyStateHint.stringValue = "Plug in one iPhone, unlock it, and tap Trust."
+                setEmptyState(hidden: false)
+            }
+            setWiredState(.unavailable("Checking Wired Control…"))
+            startVideo()
+            probeWired()
+            let timer = Timer(timeInterval: 4, repeats: true) { [weak self] _ in self?.probeWired() }
+            RunLoop.main.add(timer, forMode: .common)
+            healthTimer = timer
         }
+        updateRunnerStatusLabel()
+        updateHealthDot()
+        updateWiredSetupButton()
+    }
+
+    private func probeWired() {
+        guard controlMode == .wired, !settingUpWired else { return }
+        wiredControl.probe { [weak self] state in
+            guard let self, self.controlMode == .wired, !self.settingUpWired else { return }
+            let next = self.wiredSetupError.map(CoreDeviceControl.State.unavailable) ?? state
+            if next != self.wiredState || self.controlSwitch.isEnabled != self.wiredReady {
+                self.setWiredState(next)
+            }
+        }
+    }
+
+    private var wiredReady: Bool {
+        guard case .ready = wiredState else { return false }
+        return wiredInputSize != nil
+    }
+
+    private func setWiredState(_ state: CoreDeviceControl.State) {
+        if state != wiredState {
+            if case .ready = wiredState { wiredControl.reset() }
+            disarmControl()
+        }
+        wiredState = state
+        controlSwitch.isEnabled = wiredReady
+        homeItem?.isEnabled = wiredReady
+        updateHealthDot()
+        updateRunnerStatusLabel()
+        updateWiredSetupButton()
+        switch state {
+        case .unavailable(let reason): setStatus(reason)
+        case .ready:
+            setStatus(wiredReady ? "Wired Control ready. Turn on Control to drive the iPhone."
+                                 : "Wired input ready. Waiting for the USB screen.")
+        }
+    }
+
+    @objc private func setUpWiredControl() {
+        guard !settingUpWired, controlMode == .wired else { return }
+        settingUpWired = true
+        wiredSetupError = nil
+        updateWiredSetupButton()
+        setStatus("Downloading and building the Wired Control bridge…")
+        CoreDeviceControl.setup { [weak self] error in
+            guard let self else { return }
+            self.settingUpWired = false
+            self.wiredSetupError = error
+            self.updateWiredSetupButton()
+            guard self.controlMode == .wired else { return }
+            if let error { self.setWiredState(.unavailable(error)) }
+            else { self.probeWired() }
+        }
+    }
+
+    private func updateWiredSetupButton() {
+        wiredSetupButton.isHidden = controlMode != .wired || !CoreDeviceControl.supported
+            || CoreDeviceControl.executable != nil
+        wiredSetupButton.isEnabled = !settingUpWired
+        wiredSetupButton.title = settingUpWired ? "Setting Up…" : "Set Up Wired Control"
     }
 
     /// Drive the Control switch from its overflow-menu form (custom-view toolbar
@@ -1460,13 +1599,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
 
     func validateToolbarItem(_ item: NSToolbarItem) -> Bool {
         if item.action == #selector(takeScreenshot) { return hasVideoFrame }
-        if item.action == #selector(pressHome) { return health == .connected }
+        if item.action == #selector(pressHome) { return controlMode == .wired ? wiredReady : health == .connected }
         return true
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(takeScreenshot) { return hasVideoFrame }
-        if menuItem.action == #selector(pressHome) { return health == .connected }
+        if menuItem.action == #selector(pressHome) { return controlMode == .wired ? wiredReady : health == .connected }
         if menuItem.action == #selector(toggleControlFromMenu) {
             menuItem.state = controlEnabled ? .on : .off
             return controlSwitch.isEnabled          // only armable once WDA is connected
@@ -1489,6 +1628,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
 
     private func buildSettingsPopover() {
         let pad: CGFloat = 16
+        let panelWidth: CGFloat = 430
+        let columnWidth: CGFloat = 382
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -1496,23 +1637,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         stack.edgeInsets = NSEdgeInsets(top: pad, left: pad, bottom: pad, right: pad)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        let title = NSTextField(labelWithString: "iMirror Settings")
-        title.font = .boldSystemFont(ofSize: 14)
+        let title = NSTextField(labelWithString: "iPhone mode")
+        title.font = .systemFont(ofSize: 20, weight: .semibold)
         stack.addArrangedSubview(title)
 
-        let autoRow = NSStackView()
-        autoRow.orientation = .horizontal
-        autoRow.spacing = 8
-        autoRow.addArrangedSubview(NSTextField(labelWithString: "Automation (WebDriverAgent)"))
-        autoRow.addArrangedSubview(automationSwitch)
-        stack.addArrangedSubview(autoRow)
+        let intro = NSTextField(labelWithString: "Choose how iMirror connects and controls your iPhone.")
+        intro.font = .systemFont(ofSize: 12)
+        intro.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(intro)
+        stack.addArrangedSubview(modeCards)
 
-        let cap = NSTextField(wrappingLabelWithString:
-            "On starts mirroring and control; iOS shows an “Automation Running” overlay. Off stops the connection.")
-        cap.font = .systemFont(ofSize: 11)
-        cap.textColor = .secondaryLabelColor
-        cap.preferredMaxLayoutWidth = 260
-        stack.addArrangedSubview(cap)
+        for label in [previewStatusLabel, iosRunnerLabel, modeRequirementsLabel] {
+            label.font = .systemFont(ofSize: 12)
+            label.textColor = .secondaryLabelColor
+            label.lineBreakMode = .byWordWrapping
+            label.maximumNumberOfLines = 0
+            label.usesSingleLineMode = false
+            label.cell?.wraps = true
+            label.preferredMaxLayoutWidth = columnWidth
+        }
+        let details = NSStackView(views: [previewStatusView(width: columnWidth), iosRunnerLabel, modeRequirementsLabel])
+        details.orientation = .vertical
+        details.alignment = .leading
+        details.spacing = 5
+        stack.addArrangedSubview(details)
+
+        wiredSetupButton.bezelStyle = .rounded
+        wiredSetupButton.target = self
+        wiredSetupButton.action = #selector(setUpWiredControl)
+        wiredSetupButton.toolTip = "Downloads and builds the pinned ipb bridge. Requires internet on first setup."
+        stack.addArrangedSubview(wiredSetupButton)
+        updateWiredSetupButton()
+        updateRunnerStatusLabel()
 
         let scrollRow = NSStackView()
         scrollRow.orientation = .horizontal
@@ -1520,34 +1676,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         scrollRow.addArrangedSubview(NSTextField(labelWithString: "Scroll speed"))
         let slider = NSSlider(value: UserDefaults.standard.object(forKey: "imirror.scrollGain") as? Double ?? 3.5,
                               minValue: 0.5, maxValue: 6.0, target: self, action: #selector(scrollGainChanged(_:)))
+        slider.setAccessibilityLabel("Scroll speed")
         slider.widthAnchor.constraint(equalToConstant: 150).isActive = true
         scrollRow.addArrangedSubview(slider)
         stack.addArrangedSubview(scrollRow)
 
-        // iPhone section — whether the WebDriverAgent runner is on the device.
-        let devSep = NSBox(); devSep.boxType = .separator
-        devSep.translatesAutoresizingMaskIntoConstraints = false
-        devSep.widthAnchor.constraint(equalToConstant: 268).isActive = true
-        stack.addArrangedSubview(devSep)
-
-        let devTitle = NSTextField(labelWithString: "iPhone")
-        devTitle.font = .boldSystemFont(ofSize: 12)
-        stack.addArrangedSubview(devTitle)
-
-        iosRunnerLabel.font = .systemFont(ofSize: 11)
-        iosRunnerLabel.textColor = .secondaryLabelColor
-        iosRunnerLabel.preferredMaxLayoutWidth = 268
-        iosRunnerLabel.lineBreakMode = .byWordWrapping
-        iosRunnerLabel.maximumNumberOfLines = 0
-        iosRunnerLabel.usesSingleLineMode = false
-        iosRunnerLabel.cell?.wraps = true
-        stack.addArrangedSubview(iosRunnerLabel)
-        updateRunnerStatusLabel()
-
         // MCP server section — one-click register with Claude Code / Claude Desktop.
         let sep = NSBox(); sep.boxType = .separator
         sep.translatesAutoresizingMaskIntoConstraints = false
-        sep.widthAnchor.constraint(equalToConstant: 268).isActive = true
+        sep.widthAnchor.constraint(equalToConstant: columnWidth).isActive = true
         stack.addArrangedSubview(sep)
 
         let mcpTitle = NSTextField(labelWithString: "MCP server (AI control)")
@@ -1555,11 +1692,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         stack.addArrangedSubview(mcpTitle)
 
         let mcpCap = NSTextField(wrappingLabelWithString:
-            "Register the iMirror MCP server with Codex, Claude Code, and Claude Desktop so an "
-          + "agent can drive the phone. (Turn Automation on for it to connect.)")
+            "Register iMirror’s WebDriverAgent tools with Codex, Claude Code, and Claude Desktop. Select WebDriverAgent to use these tools.")
         mcpCap.font = .systemFont(ofSize: 11)
         mcpCap.textColor = .secondaryLabelColor
-        mcpCap.preferredMaxLayoutWidth = 268
+        mcpCap.preferredMaxLayoutWidth = columnWidth
         stack.addArrangedSubview(mcpCap)
 
         for v in deviceMCP.views() { stack.addArrangedSubview(v) }
@@ -1568,7 +1704,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         // iOS Simulator section — pick a sim, bring up WDA on :8201, install imirror-sim.
         let simSep = NSBox(); simSep.boxType = .separator
         simSep.translatesAutoresizingMaskIntoConstraints = false
-        simSep.widthAnchor.constraint(equalToConstant: 268).isActive = true
+        simSep.widthAnchor.constraint(equalToConstant: columnWidth).isActive = true
         stack.addArrangedSubview(simSep)
 
         let simTitle = NSTextField(labelWithString: "iOS Simulator")
@@ -1580,7 +1716,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
           + "on it (port 8201); view the sim in Apple's Simulator app. Requires Xcode.")
         simCap.font = .systemFont(ofSize: 11)
         simCap.textColor = .secondaryLabelColor
-        simCap.preferredMaxLayoutWidth = 268
+        simCap.preferredMaxLayoutWidth = columnWidth
         stack.addArrangedSubview(simCap)
 
         simPicker.target = self
@@ -1588,7 +1724,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         // Fixed to the column width so a long sim name truncates instead of
         // widening the popup past the popover's side margins.
         simPicker.translatesAutoresizingMaskIntoConstraints = false
-        simPicker.widthAnchor.constraint(equalToConstant: 268).isActive = true
+        simPicker.widthAnchor.constraint(equalToConstant: columnWidth).isActive = true
         (simPicker.cell as? NSPopUpButtonCell)?.lineBreakMode = .byTruncatingTail
         stack.addArrangedSubview(simPicker)
 
@@ -1600,7 +1736,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
 
         simStatusLabel.font = .systemFont(ofSize: 11)
         simStatusLabel.textColor = .secondaryLabelColor
-        simStatusLabel.preferredMaxLayoutWidth = 268
+        simStatusLabel.preferredMaxLayoutWidth = columnWidth
         simStatusLabel.maximumNumberOfLines = 0
         stack.addArrangedSubview(simStatusLabel)
 
@@ -1613,7 +1749,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         // Version footer.
         let verSep = NSBox(); verSep.boxType = .separator
         verSep.translatesAutoresizingMaskIntoConstraints = false
-        verSep.widthAnchor.constraint(equalToConstant: 268).isActive = true
+        verSep.widthAnchor.constraint(equalToConstant: columnWidth).isActive = true
         stack.addArrangedSubview(verSep)
 
         let info = Bundle.main.infoDictionary
@@ -1624,19 +1760,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         versionLabel.textColor = .tertiaryLabelColor
         stack.addArrangedSubview(versionLabel)
 
-        let container = NSView()
-        container.addSubview(stack)
+        let document = SettingsDocumentView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(stack)
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.documentView = document
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: container.topAnchor),
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            container.widthAnchor.constraint(equalToConstant: 300),
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            stack.topAnchor.constraint(equalTo: document.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor),
         ])
+
         let vc = NSViewController()
-        vc.view = container
+        vc.view = scroll
+        vc.preferredContentSize = NSSize(width: panelWidth, height: min(670, (window.screen?.visibleFrame.height ?? 850) - 90))
         settingsPopover.contentViewController = vc
         settingsPopover.behavior = .transient
+    }
+
+    private func previewStatusView(width: CGFloat) -> NSView {
+        guard #available(macOS 26, *), !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency else {
+            return previewStatusLabel
+        }
+        let glass = NSGlassEffectView()
+        glass.cornerRadius = 14
+        glass.style = .regular
+        let content = NSView()
+        glass.contentView = content
+        previewStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(previewStatusLabel)
+        NSLayoutConstraint.activate([
+            glass.widthAnchor.constraint(equalToConstant: width),
+            glass.heightAnchor.constraint(equalToConstant: 32),
+            previewStatusLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            previewStatusLabel.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+        ])
+        return glass
     }
 
     @objc private func scrollGainChanged(_ sender: NSSlider) {
@@ -1647,6 +1811,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     /// WDA connection is proof it's installed and running; otherwise fall back to
     /// the last install outcome, or a prompt to turn Automation on.
     private func updateRunnerStatusLabel() {
+        previewStatusLabel.stringValue = hasVideoFrame ? (usbCapture?.hasFrame == true
+            ? "Preview: live over USB" : "Preview: live via WebDriverAgent") : "Preview: waiting for video"
+        if controlMode == .wired {
+            switch wiredState {
+            case .unavailable(let reason): iosRunnerLabel.stringValue = "Control: " + reason
+            case .ready:
+                iosRunnerLabel.stringValue = wiredReady
+                    ? "Control: ready. Composed characters use paste and replace the iPhone clipboard."
+                    : "Control: waiting for the USB preview."
+            }
+            return
+        }
         let text: String
         if health == .connected {
             text = "WebDriverAgent app: installed and running ✓"
@@ -1665,7 +1841,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
             case nil:
                 text = automationEnabled
                     ? "WebDriverAgent app: checking…"
-                    : "WebDriverAgent app: turn Automation on to check / install"
+                    : "WebDriverAgent app: select WebDriverAgent to check or install"
             }
         }
         iosRunnerLabel.stringValue = text
@@ -1731,7 +1907,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
     }
 
     @objc private func pressHome() {
-        wda?.home()
+        if controlMode == .wired { sendWired([["home"]]) }
+        else { wda?.home() }
     }
 
     // MARK: Helpers
@@ -1769,11 +1946,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSToolbarDelegate, NST
         switch err {
         case .notProvisioned:
             return "Couldn’t install WebDriverAgent — it isn’t signed for this iPhone. "
-                 + "Re-sign it for this device, then turn Automation off and on: "
+                 + "Re-sign it for this device, then select WebDriverAgent again: "
                  + "WDA_DESTINATION=<your-udid> ./scripts/build-wda.sh"
         case .deviceLocked:
             return "Couldn’t install WebDriverAgent — unlock your iPhone, then turn "
-                 + "Automation off and on to retry."
+                 + "the status indicator to retry."
         case .other(let raw):
             return "WebDriverAgent install failed: \(raw)"
         }

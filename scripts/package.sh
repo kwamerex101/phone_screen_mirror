@@ -70,6 +70,9 @@ fi
 # Bundle the MCP server so the in-app one-click MCP install works from a DMG.
 mkdir -p "$APP/Contents/Resources/mcp-server"
 cp "$ROOT/mcp-server/imirror_mcp.py" "$ROOT/mcp-server/wda_bringup.py" "$APP/Contents/Resources/mcp-server/"
+mkdir -p "$APP/Contents/Resources/scripts"
+cp "$ROOT/scripts/setup-coredevice.sh" "$APP/Contents/Resources/scripts/"
+
 [[ -f "$ROOT/mcp-server/requirements.txt" ]] && \
     cp "$ROOT/mcp-server/requirements.txt" "$APP/Contents/Resources/mcp-server/" || true
 
@@ -128,6 +131,7 @@ echo "==> building DMG"
 rm -f "$DMG"
 STAGE="$(mktemp -d)"
 cp -R "$APP" "$STAGE/"
+cp "$ROOT/CHANGELOG.md" "$STAGE/CHANGELOG.md"
 ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname "iMirror" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGE"

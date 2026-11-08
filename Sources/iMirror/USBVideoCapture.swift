@@ -30,6 +30,17 @@ final class USBVideoCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
     private var lastStats: TimeInterval = 0
     private var captureStartedAt: TimeInterval = 0
 
+    private var wdaFallback: Bool
+
+    init(wdaFallback: Bool = true) {
+        self.wdaFallback = wdaFallback
+        super.init()
+    }
+
+    func setWDAFallback(_ enabled: Bool) {
+        queue.async { [self] in wdaFallback = enabled }
+    }
+
     var hasFrame: Bool { frames.hasFrame }
     func screenshot() -> CGImage? { frames.screenshot() }
 
@@ -77,25 +88,25 @@ final class USBVideoCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
         queue.async { [weak self] in
             guard let self else { return }
             guard devices.count <= 1 else {
-                self.notifyUnavailable("Multiple iPhones connected. Using WDA video to match the control target.")
+                self.notifyUnavailable(self.wdaFallback ? "Multiple iPhones connected. Using WDA video to match the control target." : "Disconnect other iPhones to use USB video.")
                 if self.input != nil { self.detach() }
                 return
             }
             if let input = self.input {
                 if !devices.contains(where: { $0.uniqueID == input.device.uniqueID }) {
-                    self.notifyUnavailable("USB video disconnected. Using WDA video while reconnecting.")
+                    self.notifyUnavailable(self.wdaFallback ? "USB video disconnected. Using WDA video while reconnecting." : "USB video disconnected. Reconnect and unlock the iPhone.")
                     self.detach()
                 } else if self.frames.age > 6 || (!self.frames.hasFrame &&
                              ProcessInfo.processInfo.systemUptime - self.captureStartedAt > 8) {
                     // Keep the WDA fallback usable instead of repeatedly cycling
                     // USB (which re-enumerates the device and disrupts control).
-                    self.notifyUnavailable("USB video paused. Using WDA video while waiting.")
+                    self.notifyUnavailable(self.wdaFallback ? "USB video paused. Using WDA video while waiting." : "USB video paused. Unlock the iPhone to resume.")
                 }
                 return
             }
             guard let device = devices.first else {
                 if ProcessInfo.processInfo.systemUptime - self.startedAt > 8 {
-                    self.notifyUnavailable("USB video unavailable. Using WDA video.")
+                    self.notifyUnavailable(self.wdaFallback ? "USB video unavailable. Using WDA video." : "USB video unavailable. Connect and unlock the iPhone, then tap Trust.")
                 }
                 return
             }
@@ -110,7 +121,7 @@ final class USBVideoCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDeleg
                 self.session.sessionPreset = .high
                 guard self.session.canAddInput(input), self.session.canAddOutput(output) else {
                     self.session.commitConfiguration()
-                    self.notifyUnavailable("Cannot open USB video. Using WDA video.")
+                    self.notifyUnavailable(self.wdaFallback ? "Cannot open USB video. Using WDA video." : "Cannot open USB video. Reconnect and unlock the iPhone.")
                     return
                 }
                 self.session.addInput(input)

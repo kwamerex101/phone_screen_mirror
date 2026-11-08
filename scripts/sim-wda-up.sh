@@ -37,8 +37,8 @@ set -euo pipefail
 
 # Emits a single "IPHONEOS_DEPLOYMENT_TARGET=<v>" build-setting arg on stdout,
 # or nothing. Additive: only overrides when the active SDK's own minimum
-# deployment target is above WebDriverAgent's pinned 15.0 floor, so older
-# Xcode (whose floor is <= 15.0) is left exactly as before. Set
+# deployment target meets WebDriverAgent's intended 15.0 floor, so older
+# Xcode (whose floor is < 15.0) is left exactly as before. Set
 # WDA_DEPLOYMENT_TARGET to force a specific value (e.g. 15.0 to opt out).
 wda_deployment_setting() {  # $1 = sdk name: iphonesimulator | iphoneos
     local sdk="$1" proj_floor="15.0" sdk_min sdkpath plist lowest
@@ -51,7 +51,8 @@ wda_deployment_setting() {  # $1 = sdk name: iphonesimulator | iphoneos
     sdk_min="$(/usr/libexec/PlistBuddy -c "Print :SupportedTargets:$sdk:MinimumDeploymentTarget" "$plist" 2>/dev/null)" || return 0
     [[ -n "$sdk_min" ]] || return 0
     lowest="$(printf '%s\n%s\n' "$proj_floor" "$sdk_min" | sort -V | head -1)"
-    if [[ "$sdk_min" != "$proj_floor" && "$lowest" == "$proj_floor" ]]; then
+    # Vendored targets may still default to 12.0, so enforce 15.0 at equality too.
+    if [[ "$lowest" == "$proj_floor" ]]; then
         echo "IPHONEOS_DEPLOYMENT_TARGET=$sdk_min"
     fi
     return 0
@@ -74,7 +75,7 @@ BUNDLE_ID="com.local.imirror.WebDriverAgentRunner"   # matches WDAIdentity in Tr
 DISPLAY_NAME="iMirror"
 
 # Additive Xcode-27 accommodation: only set when the simulator SDK's own
-# minimum deployment target exceeds WDA's pinned 15.0 (see
+# minimum deployment target meets WDA's intended 15.0 (see
 # wda_deployment_setting above). Empty on older Xcode, so nothing changes.
 depset=()
 dep_setting="$(wda_deployment_setting iphonesimulator)"
