@@ -32,22 +32,21 @@ Features:
   capture rates, not a guarantee for every device or workload. See the
   [measurement summary](docs/performance/usb-capture-2026-11-06.json).
   The preview follows screen-size and orientation changes and saves PNG screenshots.
-- **Audio routing.** Fast USB capture may route iPhone audio to the Mac. WDA's
-  slower MJPEG video remains the fallback when USB capture is unavailable.
-- **Toolbar** — Screenshot, a WDA health dot, Control, Settings, and Home.
+- **Audio routing.** Fast USB capture may route iPhone audio to the Mac.
+  WebDriverAgent mode can fall back to MJPEG when USB video is unavailable.
+- **Toolbar** — Screenshot, an input status dot, Control, Settings, and Home.
 - **Control** — tap, drag, two-finger trackpad scroll (with flick detection),
   type, Home, driven from the preview.
 - **Agent control + test reports** — a full set of `ios_*` MCP tools, opt-in run
   recording, cover/TOC/infographics HTML reports (see
   [MCP server](#mcp-server-drive-the-phone-from-claude)).
-- **Automation starts on launch.** The app starts WebDriverAgent for control
-  automatically when it connects to the phone, with a toolbar
-  health dot and automatic recovery. iOS shows the "Automation Running" overlay
-  while this runs; the phone stays unlocked. Control requires a runner signed
-  for the connected device. The Settings (⚙) popover has a
-  scroll-speed control, a one-click **MCP server install**, the on-device
-  **WebDriverAgent app status**, and the app version/build.
-- **Auto-installs the runner** — on connect, the app checks whether the
+- **Direct USB** opens live video by default. On an Apple silicon Mac with
+  macOS 27 and Xcode 27 or later, choose **Set Up Wired Control** in Settings to
+  control an iPhone running iOS 27 or later with Developer Mode enabled.
+- **WebDriverAgent** in Settings starts XCTest control and supports accessibility
+  tools. It needs a runner signed for the connected device. iOS may show the
+  "Automation Running" overlay.
+- **Auto-installs the runner** — in WebDriverAgent mode, the app checks whether the
   WebDriverAgent app is on the connected iPhone and installs the bundled build if
   it's missing or older than the bundled one, with progress and actionable errors
   (e.g. "not signed for this iPhone — re-sign for this device"). It never
@@ -93,9 +92,9 @@ no Go, and no `tools/` setup.
 1. Connect your iPhone by USB, unlock it, and tap **Trust**.
 2. Open iMirror and allow Camera access if prompted. macOS uses this permission
    for the phone's USB screen video. The phone stays unlocked; fast capture may
-   route its audio to the Mac. iMirror also starts WebDriverAgent for control.
-   The health dot goes green when control is ready; video can appear earlier.
-3. To control the phone, flip **Control** in the toolbar.
+   route its audio to the Mac.
+3. In **Settings**, set up Wired Control for **Direct USB** or select
+   **WebDriverAgent**. When the status dot turns green, flip **Control**.
 
 > **One Apple caveat:** the bundled runner is dev-signed for registered devices.
 > A brand-new iPhone that isn't in the signing profile can't be auto-installed —
@@ -177,8 +176,8 @@ Then install WebDriverAgent on the device once (Xcode):
 ./scripts/run.sh release    # optimized build
 ```
 
-On launch the app starts USB video and WebDriverAgent control independently.
-The phone stays unlocked. Fast USB capture may move its audio to the Mac;
+On launch the app starts USB video and restores the selected control mode.
+The phone stays unlocked. Fast USB capture may move its audio to the Mac.
 iOS shows the "Automation Running" overlay while WebDriverAgent runs.
 The mirror appears as soon as frames start arriving. **Screenshot**
 saves a PNG of the latest frame to `~/Pictures` and shows a thumbnail in the
@@ -199,7 +198,7 @@ The normal preview does not convert each frame to an image or JPEG. Screenshot
 conversion runs only when requested. Frame dimensions drive the window shape;
 touch mapping uses the capture layer's displayed rectangle.
 
-If USB capture is unavailable, the app uses WDA's MJPEG stream on device port
+In WebDriverAgent mode, if USB capture is unavailable, the app uses the MJPEG stream on device port
 9100, forwarded to localhost:9110. This fallback captures individual screenshots
 and can be much slower. Pending frame updates keep only the newest image so a
 busy UI does not replay a backlog. To force this backend for diagnostics:
@@ -208,9 +207,9 @@ busy UI does not replay a backlog. To force this backend for diagnostics:
 IMIRROR_VIDEO_MODE=mjpeg /Applications/iMirror.app/Contents/MacOS/iMirror
 ```
 
-**Control.** Clicks/keys on the preview are transformed to device points and sent
-to WebDriverAgent (XCUITest) as W3C pointer/key actions. Control is off by
-default and armed by the switch (only while the health dot is green).
+**Control.** The preview sends input through Apple’s CoreDevice in Direct USB
+mode or through XCTest in WebDriverAgent mode. Control starts off. Use the
+toolbar switch when the status dot is green.
 
 Scrolling is two-finger trackpad scroll (or click-drag): the gesture is mapped to
 a WDA swipe over the same path, respecting the system Natural-Scroll direction. A

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.0 - 2026-11-08
+
+- Redesign the Settings popover with glass styling and two control mode cards.
+- Default to Direct USB for live video. Set up Wired Control to tap, swipe, type,
+  and go Home without WebDriverAgent on supported Apple silicon Macs with
+  macOS 27, Xcode 27, and an iPhone on iOS 27 or later.
+- Keep WebDriverAgent available for XCTest control and accessibility tools.
+- Route wired touches to the active screen on devices with multiple displays.
+- Omit the experimental Bluetooth control option after pairing tests on the Duo.
+- Correct the runner build target for Xcode SDKs with a minimum of iOS 15.
+
 ## 0.8.0 - 2026-11-06
 
 - Add native USB video capture with direct AVFoundation preview. One tested
